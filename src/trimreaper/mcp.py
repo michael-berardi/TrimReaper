@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sqlite3
 import sys
 
@@ -54,6 +55,30 @@ TOOLS = [
      "inputSchema": {"type": "object", "required": ["path", "retention"], "additionalProperties": False, "properties": {
          "path": {"type": "string"}, "retention": {"type": "string", "enum": list(core.REAP_RETENTION_CLASSES)}}}},
 ]
+
+
+def check_arguments(schema: dict, args: dict) -> str | None:
+    """The tool's input schema, enforced: unknown or missing keys, wrong types, values outside an enum or pattern."""
+    unknown = sorted(set(args) - set(schema["properties"]))
+    missing = sorted(set(schema.get("required", ())) - set(args))
+    if unknown or missing:  # a misspelled `dryrun` must never be read as the default
+        return f"unknown arguments: {', '.join(unknown) or 'none'}; missing: {', '.join(missing) or 'none'}"
+    for key, value in args.items():
+        spec = schema["properties"][key]
+        kind = spec["type"]
+        ok = (kind == "string" and isinstance(value, str)) or (kind == "boolean" and isinstance(value, bool)) \
+            or (kind == "integer" and isinstance(value, int) and not isinstance(value, bool)) \
+            or (kind == "array" and isinstance(value, list) and all(isinstance(v, str) for v in value))
+        if not ok:
+            need = {"string": "a string", "boolean": "true or false", "integer": "a whole number", "array": "a list of strings"}[kind]
+            return f"{key} must be {need}, not {json.dumps(value)[:60]}"
+        if "enum" in spec and value not in spec["enum"]:
+            return f"{key} must be one of {', '.join(spec['enum'])}"
+        if "pattern" in spec and not re.match(spec["pattern"], value):
+            return f"{key} {value!r} does not look like {spec.get('description', spec['pattern'])}"
+        if "minimum" in spec and value < spec["minimum"]:
+            return f"{key} must be at least {spec['minimum']}"
+    return None
 
 
 def namespace(**values) -> argparse.Namespace:
@@ -107,6 +132,8 @@ def handle(message: dict) -> dict | None:
     def failure(code, text):
         return {"jsonrpc": "2.0", "id": ident, "error": {"code": code, "message": text}}
     params = message.get("params") or {}
+    if not isinstance(params, dict):
+        return failure(-32602, "params must be an object")
     if method == "initialize":
         asked = params.get("protocolVersion")
         return answer({"protocolVersion": asked if asked in PROTOCOL_VERSIONS else PROTOCOL_VERSIONS[0],
@@ -120,10 +147,13 @@ def handle(message: dict) -> dict | None:
         return answer({"tools": TOOLS})
     if method == "tools/call":
         name, args = params.get("name"), params.get("arguments") or {}
-        if name not in {tool["name"] for tool in TOOLS}:
+        if not isinstance(name, str) or name not in {tool["name"] for tool in TOOLS}:
             return failure(-32602, f"unknown tool: {name}")
         if not isinstance(args, dict):
             return failure(-32602, "arguments must be an object")
+        problem = check_arguments(next(tool["inputSchema"] for tool in TOOLS if tool["name"] == name), args)
+        if problem:
+            return answer(result({"error": problem}, True))
         cli.system_path()
         try:
             return answer(result(call(name, args)))
@@ -150,8 +180,14 @@ def serve(stdin=None, stdout=None) -> int:
         except ValueError as error:
             reply = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": f"parse error: {error}"}}
         else:
-            reply = handle(message) if isinstance(message, dict) else \
-                {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "a request must be a JSON object"}}
+            if not isinstance(message, dict):
+                reply = {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "a request must be a JSON object"}}
+            else:
+                try:
+                    reply = handle(message)
+                except Exception as error:  # the server outlives any one bad request, and says what broke
+                    reply = {"jsonrpc": "2.0", "id": message.get("id"),
+                             "error": {"code": -32603, "message": f"internal error: {error.__class__.__name__}: {error}"}}
         if reply is not None:
             stdout.write(json.dumps(reply) + "\n")
             stdout.flush()

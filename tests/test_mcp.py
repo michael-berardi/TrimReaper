@@ -60,8 +60,22 @@ class Server(Home):
         self.assertIn("J-0042", self.tool("job_add", id="J-42")["structuredContent"]["error"])
         self.assertTrue(self.tool("reap", target="scratch", job="J-0201")["isError"])
         self.assertTrue(self.tool("reap", job="J-0201", dryRun="no")["isError"])
+        misspelled = self.tool("reap", job="J-0201", dryrun=False)
+        self.assertTrue(misspelled["isError"])
+        self.assertIn("unknown arguments: dryrun", misspelled["structuredContent"]["error"])
+        self.assertIn("missing: id", self.tool("job_status", status="done")["structuredContent"]["error"])
         unknown = self.rpc({"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {"name": "owner_acknowledge", "arguments": {}}})[0]
         self.assertEqual(unknown["error"]["code"], -32602)
+        self.assertIn("list of strings", self.tool("job_add", id="J-0202", worktrees="~/dev/x")["structuredContent"]["error"])
+        self.assertIn("must be a whole number", self.tool("reap_status", limit="9")["structuredContent"]["error"])
+
+    def test_malformed_requests_never_stop_the_server(self):
+        replies = self.rpc({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": ["x"]},
+                           {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": ["job_list"]}},
+                           [1, 2],
+                           {"jsonrpc": "2.0", "id": 3, "method": "ping"})
+        self.assertEqual([r["error"]["code"] for r in replies[:3]], [-32602, -32602, -32600])
+        self.assertEqual(replies[3], {"jsonrpc": "2.0", "id": 3, "result": {}})
 
     def test_the_cli_serves_it_over_stdio(self):
         src = str(Path(mcp.__file__).parents[1])
