@@ -25,7 +25,7 @@ REAP_CLI = "trimreaper"
 # The single-owner cleanup journal lives below the reap home in these folders (created 0700 when absent).
 REAP_OWNER_DIRS = (".local", "state", "trimreaper", "cleanup")
 
-JOB_ID = re.compile(r"^J-\d{4,5}$")
+JOB_ID = re.compile(r"^J-(?:\d{4}|[1-9]\d{4})$")  # the form a folder name jNNNN maps to
 JOB_STATUSES = ("queued", "approved", "running", "blocked", "parked", "interrupted", "done", "failed", "cancelled")
 TITLE_LIMIT = 160
 
@@ -45,7 +45,6 @@ DEFAULT_POLICY = {
     "cloneProtectedCopies": "keep",
     # Disk pressure: at or above this used percent, idle (parked/interrupted) jobs lose their derived build output too.
     "diskWarnPercent": 85,
-    "diskHoldPercent": 92,
 }
 
 DEFAULT_CONFIG = {
@@ -95,19 +94,80 @@ def config() -> dict:
         if unknown:
             raise HostError(f"{path} has unknown keys: {', '.join(unknown)}", "see docs/CONFIGURATION.md for the keys")
         merged.update(stored)
+        check_config(merged, path)
     return merged
+
+
+def check_config(merged: dict, path: Path) -> None:
+    """Every value has the type its key needs; a wrong one is named instead of being read as something else."""
+    def bad(key, need):
+        raise HostError(f"{path}: {key} must be {need}, not {json.dumps(merged.get(key) if '.' not in key else None)}",
+                        "see docs/CONFIGURATION.md")
+    for key in ("stateDir", "cacheRoot", "archiveRoot"):
+        if not isinstance(merged[key], str) or not merged[key].strip():
+            bad(key, "a path")
+    for key in ("home", "scratchRoot", "releaseRoot", "releaseEvidenceRoot", "buildQueueStateDir", "diskVolume"):
+        if merged[key] is not None and (not isinstance(merged[key], str) or not merged[key].strip()):
+            bad(key, "a path or null")
+    bases = merged["cloneBases"]
+    if not isinstance(bases, list) or not all(isinstance(b, dict) for b in bases):
+        bad("cloneBases", 'a list of {"path": ..., "prefix": ...} objects')
+    for base in bases:
+        extra = sorted(set(base) - {"path", "prefix"})
+        if extra or not isinstance(base.get("path"), str):
+            raise HostError(f"{path}: cloneBases entry {json.dumps(base)} needs a \"path\" and may have a \"prefix\" (unknown: {', '.join(extra) or 'none'})")
+        if "prefix" in base and (not isinstance(base["prefix"], str) or not base["prefix"]):
+            raise HostError(f"{path}: cloneBases prefix must be a non-empty string, not {json.dumps(base['prefix'])}")
+    release = merged["release"]
+    if not isinstance(release, dict) or set(release) - {"installedApp", "rollbackApp"} \
+            or any(v is not None and not isinstance(v, str) for v in release.values()):
+        bad("release", '{"installedApp": path or null, "rollbackApp": path or null}')
+    if not isinstance(merged["policy"], dict):
+        bad("policy", "an object")
+    check_policy(merged["policy"])
+
+
+def check_policy(policy: dict) -> None:
+    """Policy values, checked before use: a string "false" is not off, "3" is not three days."""
+    unknown = sorted(set(policy) - set(DEFAULT_POLICY))
+    if unknown:
+        raise HostError(f"unknown policy keys: {', '.join(unknown)}", "see docs/CONFIGURATION.md for the policy keys")
+    merged = {**DEFAULT_POLICY, **policy}
+    if not isinstance(merged["autoReap"], bool):
+        raise HostError(f"policy autoReap must be true or false, not {json.dumps(merged['autoReap'])}")
+    for key in ("cloneExpiryDays", "evidenceExpiryDays", "archiveExpiryDays"):
+        value = merged[key]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise HostError(f"policy {key} must be a whole number of days (0 = never), not {json.dumps(value)}")
+    value = merged["diskWarnPercent"]
+    if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 100:
+        raise HostError(f"policy diskWarnPercent must be a whole number from 1 to 100, not {json.dumps(value)}")
+    if merged["cloneArchive"] not in ("archive", "keep"):
+        raise HostError(f'policy cloneArchive must be "archive" or "keep", not {json.dumps(merged["cloneArchive"])}')
+    if merged["cloneProtectedCopies"] not in ("keep", "remove"):
+        raise HostError(f'policy cloneProtectedCopies must be "keep" or "remove", not {json.dumps(merged["cloneProtectedCopies"])}')
+    if merged["cloneProtectedCopies"] == "remove" and merged["cloneArchive"] != "archive":
+        raise HostError('policy cloneProtectedCopies "remove" needs cloneArchive "archive": secret copies are archived before they go',
+                        'set cloneArchive to "archive", or cloneProtectedCopies to "keep"')
 
 
 def reap_home() -> Path:
     """The home whose folders the reaper may touch. TRIMREAPER_HOME (tests, a second instance) wins over the config file."""
     override = os.environ.get("TRIMREAPER_HOME") or config().get("home")
-    return Path(override).expanduser() if override else Path.home()
+    if not override:
+        return Path.home()
+    home = Path(override).expanduser()
+    if not home.is_absolute():
+        raise HostError(f"the reap home must be an absolute path, not {override!r}", "set TRIMREAPER_HOME or `home` to an absolute path")
+    return home
 
 
 def expand(value: str) -> Path:
     """A configured path: `~` is the reap home, never the HOME variable of whoever runs the command."""
     if not isinstance(value, str) or not value.strip():
         raise HostError(f"configured path must be a non-empty string, not {value!r}")
+    if ".." in Path(value).parts:
+        raise HostError(f"configured path {value!r} must not contain '..'", "name the folder directly")
     if value == "~" or value.startswith("~/"):
         return reap_home() / value[2:]
     path = Path(value)
@@ -133,18 +193,7 @@ def disabled_root(name: str) -> Path:
 # ---- folder layout the engine asks for ------------------------------------------------------------------------------
 
 def reap_clone_bases() -> list[tuple[Path, str | None]]:
-    bases = config().get("cloneBases") or []
-    if not isinstance(bases, list):
-        raise HostError("cloneBases must be a list of {\"path\": ..., \"prefix\": ...} objects")
-    found = []
-    for base in bases:
-        if not isinstance(base, dict) or "path" not in base:
-            raise HostError(f"cloneBases entry {base!r} needs a \"path\"")
-        prefix = base.get("prefix")
-        if prefix is not None and (not isinstance(prefix, str) or not prefix):
-            raise HostError(f"cloneBases prefix must be a non-empty string, not {prefix!r}")
-        found.append((expand(base["path"]), prefix))
-    return found
+    return [(expand(base["path"]), base.get("prefix")) for base in config()["cloneBases"]]
 
 
 def reap_cache_root() -> Path:
@@ -206,12 +255,9 @@ def iso(ts: float | None = None) -> str:
 
 
 def load_policy() -> dict:
-    stored = config().get("policy") or {}
-    if not isinstance(stored, dict):
-        raise HostError("policy must be a JSON object")
-    unknown = sorted(set(stored) - set(DEFAULT_POLICY))
-    if unknown:
-        raise HostError(f"unknown policy keys: {', '.join(unknown)}", "see docs/CONFIGURATION.md for the policy keys")
+    """Every key, always: the engine's own fallbacks for a missing key are not this host's defaults."""
+    stored = config()["policy"]
+    check_policy(stored)
     return {**DEFAULT_POLICY, **stored}
 
 
@@ -221,7 +267,9 @@ def disk_state() -> dict | None:
     for path in ((volume,) if volume else ("/System/Volumes/Data", "/")):
         try:
             usage = shutil.disk_usage(path)
-        except OSError:
+        except OSError as error:
+            if volume:
+                raise HostError(f"diskVolume {volume} cannot be measured: {error.__class__.__name__}", "fix diskVolume or remove it")
             continue
         total = usage.used + usage.free
         if total > 0:

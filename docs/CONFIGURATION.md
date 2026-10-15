@@ -8,14 +8,14 @@ Paths are absolute or start with `~/`. Here `~` is the reap home (`home`), not t
 | Key | Default | Meaning |
 |---|---|---|
 | `home` | your home folder | The home the reaper works below. `$TRIMREAPER_HOME` overrides it (tests, a second instance). |
-| `stateDir` | `~/.local/state/trimreaper` | The job store (`state.sqlite3`) and the receipts (`reaper/`). |
+| `stateDir` | `~/.local/state/trimreaper` | The job store (`state.sqlite3`) and the receipts (`reaper/`). The single-owner journal is always `~/.local/state/trimreaper/cleanup`, whatever `stateDir` says. |
 | `cloneBases` | `[{"path": "~/dev"}]` | Folders that hold job clones. A clone is a direct child whose name carries a job number (`app-j0042`, `j0042-app`). With `"prefix": ".j"` a base only counts children whose names start with the prefix. |
 | `cacheRoot` | `~/.cache/trimreaper/jobs` | Per-job scratch: `cacheRoot/J-0042/<anything>`. |
 | `archiveRoot` | `~/.cache/trimreaper/archive` | Where unsaved work is archived before an expired folder goes. Created owner-only (0700). |
 | `scratchRoot` | off | Agent scratch outside any job: `scratchRoot/<task>`. Each folder goes once nothing in it changed for `evidenceExpiryDays`. |
 | `releaseRoot` | off | Release candidates: `releaseRoot/<version>/...`. A Rust `target` folder of a version older than the installed one goes when it carries the `disposable` marker (a build queue writes it; `trimreaper mark <folder> disposable` by hand). |
 | `releaseEvidenceRoot` | off | Per-version release evidence: `releaseEvidenceRoot/<version>` for the app, `releaseEvidenceRoot/<product>-<version>` for its components. App versions older than the installed one go, except the rollback; each component keeps its newest two. |
-| `release.installedApp`, `release.rollbackApp` | unset | macOS app bundles whose versions are kept. While either is unknown, every release candidate and every app-version evidence folder is kept. |
+| `release.installedApp`, `release.rollbackApp` | unset | macOS app bundles whose versions are kept: the installed version, the single rollback, and anything newer than installed. While either is unknown, every release candidate and every app-version evidence folder is kept. |
 | `buildQueueStateDir` | `stateDir/build-queue` | The lock folder of a build queue. Before removing build output, the reaper takes `projects/<name>-<sha256(path)[:16]>.lock` for every enclosing project, so a build in progress keeps its output. |
 | `diskVolume` | `/System/Volumes/Data`, else `/` | The volume measured for disk pressure. |
 | `policy` | see below | Retention rules. |
@@ -25,13 +25,12 @@ Paths are absolute or start with `~/`. Here `~` is the reap home (`home`), not t
 | Key | Default | Meaning |
 |---|---|---|
 | `autoReap` | `true` | `trimreaper tick` reaps only while this is on. |
-| `cloneExpiryDays` | `3` | A whole clone goes this many days after every job named in it finished, and after any later job that worked in it finished. |
-| `evidenceExpiryDays` | `14` | Screenshots, recordings, traces and logs of a finished job expire after this many days. Also the idle time for scratch folders. `0` turns expiry off. |
-| `archiveExpiryDays` | `30` | An archive goes this many days after it became the only copy of its clone. |
+| `cloneExpiryDays` | `3` | A whole clone goes this many days after every job named in it finished, and after any later job that worked in it finished. `0`: clones never expire. |
+| `evidenceExpiryDays` | `14` | Screenshots, recordings, traces and logs of a finished job expire after this many days. Also the idle time for scratch folders. `0` turns both off. |
+| `archiveExpiryDays` | `30` | An archive goes this many days after it became the only copy of its clone. `0`: archives are kept. |
 | `cloneArchive` | `"archive"` | `"archive"` saves work no remote holds before an expired folder goes. Any other value keeps such folders. |
-| `cloneProtectedCopies` | `"keep"` | `"keep"` keeps every clone that holds `.env*`, `.dev.vars*`, `.wrangler` or `.vercel`. `"remove"` archives those owner-only (`protected.tar.gz`) and lets them go with the clone. |
-| `diskWarnPercent` | `85` | At or above this used percent, the build output of parked or interrupted jobs goes too. |
-| `diskHoldPercent` | `92` | Reported as the `hold` disk level. |
+| `cloneProtectedCopies` | `"keep"` | `"keep"` keeps every clone that holds `.env*`, `.dev.vars*`, `.wrangler` or `.vercel`. `"remove"` archives those owner-only (`protected.tar.gz`) and lets them go with the clone; it needs `cloneArchive` `"archive"`. Copies inside dependency or build folders (`node_modules/.env` ...) are not archived: they go with the folder. |
+| `diskWarnPercent` | `85` | At or above this used percent, the build output of parked or interrupted jobs goes too. Checked during a `tick` that has a finished job due. |
 
 ## Jobs
 
@@ -40,5 +39,8 @@ Paths are absolute or start with `~/`. Here `~` is the reap home (`home`), not t
 - `--cwd` and `--worktree` declare folders as the job's own. A declared linked git worktree inside a clone base is
   reaped with the job. While the job is unfinished, nothing inside a declared folder is touched.
 - `--waits-on` keeps the other job's artifacts while this job is unfinished.
-- Statuses: `queued`, `approved`, `running`, `blocked`, `parked`, `interrupted` (unfinished), and `done`, `failed`,
-  `cancelled` (finished). `trimreaper job status J-0042 done` records the finish time.
+- Statuses: `queued`, `approved`, `running`, `blocked` (unfinished), `parked` (set aside to resume later) and
+  `interrupted` (stopped part-way; also unfinished), and `done`, `failed`, `cancelled` (finished).
+  `trimreaper job status J-0042 done` records the finish time; setting an unfinished status reopens the job.
+- Job ids are `J-` and four digits, or five without a leading zero: the forms a folder name `j0042` or `j10042` maps to.
+- Events record who acted: `$TRIMREAPER_ACTOR`, else `cli`.

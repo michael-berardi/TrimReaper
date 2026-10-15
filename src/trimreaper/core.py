@@ -155,7 +155,7 @@ REAP_ARCHIVABLE = ("dirty", "unpushed", "stash-present", "unproved-tags", "unpro
 REAP_NONGIT = ("git-error", "git-unsafe-index", "git-untracked")
 AGENT_SCRATCH_OWNER = "agent-scratch"
 # <release-evidence root>/<version>: the host app keeps the installed version, the single rollback and anything newer than
-# installed; each component (steak-pi-0.9.9 ...) keeps its newest RELEASE_EVIDENCE_KEEP versions.
+# installed; each component (component-1.2.3 ...) keeps its newest RELEASE_EVIDENCE_KEEP versions.
 RELEASE_EVIDENCE_OWNER = "release-evidence"
 RELEASE_EVIDENCE_KEEP = 2
 RELEASE_EVIDENCE_NAME = re.compile(r"^(?:(?P<product>[a-z][a-z-]*?)-)?(?P<version>\d+\.\d+\.\d+)(?P<suffix>-[A-Za-z0-9.-]+)?$")
@@ -2553,7 +2553,7 @@ def reap_durable(fd: int) -> None:
 
 
 def reap_receipt_lock(fd: int) -> None:
-    """The receipt file's exclusive lock, with a bounded blocking wait. Two reaper runs (the tick and a manual CLI/MCP reap
+    """The receipt file's exclusive lock, with a bounded blocking wait. Two reaper runs (the tick and a manual reap
     of another job) append to the same day's file; the second one waits for the first record instead of failing, and only a
     wait longer than REAP_RECEIPT_LOCK_SECONDS is `receipt-unavailable:lock-timeout:<seconds>s`."""
     deadline = time.monotonic() + REAP_RECEIPT_LOCK_SECONDS
@@ -2645,8 +2645,9 @@ def reap_clone_roots() -> list[tuple[str, list[str]]]:
 
 
 def reap_clone_base_paths() -> list[str]:
-    """The canonical paths of the clone bases, for boundary comparisons."""
-    return [reap_canon(base) for base, _ in reap_clone_bases()]
+    """The clone bases for boundary comparisons: each base's parent canonical, its own name taken as written, so a base that
+    is itself a symlink never matches the canonical path of a clone found through it (such clones are kept)."""
+    return [os.path.join(reap_canon(Path(base).parent), Path(base).name) for base, _ in reap_clone_bases()]
 
 
 def reap_declared_paths(job: dict) -> list[str]:
@@ -2900,7 +2901,7 @@ def reap_authority(item: dict) -> dict:
         wait = job_wait(job)
         if wait and wait["job"] in ids:
             raise ReapRefused(f"awaited-by:{job['id']}({job['status']})")
-    return {"source": "overseer-jobs", "owner": item["owner"], "jobs": {job_id: jobs[job_id]["status"] for job_id in ids}, "claims": []}
+    return {"source": "host-jobs", "owner": item["owner"], "jobs": {job_id: jobs[job_id]["status"] for job_id in ids}, "claims": []}
 
 
 def reap_ownership_gate(item: dict) -> list[str]:
@@ -4178,7 +4179,7 @@ def evidence_expiry_owned(conn, days: int, due: list, actions: list, errors: lis
 
 
 def reap_note(conn, job_id: str, note: dict | None) -> None:
-    """The reaper's last word on a job lives on the job row (meta.reap), so job-get and the panel show why a clone stayed."""
+    """The reaper's last word on a job lives on the job row (meta.reap), so the host's job view can show why a clone stayed."""
     job = row(conn, "SELECT meta FROM jobs WHERE id=?", (job_id,))
     meta = job_meta(job)
     if note is None and "reap" not in meta:

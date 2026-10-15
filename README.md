@@ -5,14 +5,15 @@ writes screenshots and logs, and stages scratch folders. Run a few dozen agents 
 
 TrimReaper takes that space back without guessing. It removes a folder only when it can prove the folder is
 disposable: the job that made it has finished, git shows nothing would be lost, no process is using it, and it holds no
-secrets. When a folder still holds unsaved work, TrimReaper archives that work first and verifies the archive. Every
-removal is planned in a durable receipt before the first byte goes.
+secrets. When a folder still holds unsaved work, TrimReaper archives that work first and verifies the archive. Before it
+removes anything of yours, it writes the plan to a durable receipt.
 
-It is the reaper UltraTerm runs for its agent fleet: the same code, released here.
+It is the reaper engine of UltraTerm, released on its own so any agent setup can use it.
 
 ## Install
 
-Requires macOS, Python 3.10 or newer, and `git`, `lsof` and `ps` on the `PATH`.
+Requires macOS, Python 3.10 or newer, and `git`, `lsof` and `ps`. The `python3` that ships with macOS is 3.9; a
+newer one comes from [python.org](https://www.python.org/downloads/) or Homebrew (`brew install python`).
 
 ```sh
 pipx install "git+https://github.com/michael-berardi/TrimReaper@v0.1.0"
@@ -36,7 +37,7 @@ trimreaper job status J-0042 done
 # See what would go, what stays, and why. Deletes nothing:
 trimreaper status --items
 
-# Reap one job. Try it with --dry-run first:
+# 15 minutes after the job finished (in case it is resumed), reap it. Try --dry-run first:
 trimreaper reap --job J-0042 --dry-run
 trimreaper reap --job J-0042
 
@@ -44,10 +45,14 @@ trimreaper reap --job J-0042
 trimreaper tick
 ```
 
-`tick` runs once and exits. To run it on a schedule, call it from your own cron job or agent loop.
+`tick` runs once and exits. To run it on a schedule, call it from your own cron job, launchd agent or agent loop.
 
-Every command prints one JSON document. A refusal exits with status 2 and names its cause, for example
-`{"error": "J-0042 is not reapable: job-running"}`.
+Every command prints one JSON document on stdout. Exit status:
+
+- `0`: done. Folders that were kept are listed with their reason (`"deleted": 0` is not an error).
+- `2`: refused or failed. A JSON `error` naming the cause, and a `hint`, go to stderr. Example:
+  `{"error": "J-0042 is not reapable: job-running", "hint": "..."}`.
+- `3`: the pass ran but reported `errors` or stopped part-way (both named in the JSON).
 
 ## What it removes
 
@@ -56,23 +61,28 @@ Every command prints one JSON document. A refusal exits with status 2 and names 
 | `node_modules`, `.next`, `.open-next`, `.turbo`, `.astro`, `target` in a job's clone | 15 minutes after the job finishes, when git ignores the folder and the clone is clean and pushed |
 | `dist` in a job's clone | Once the clone itself expires (`dist` can hold a release) |
 | The whole clone | `cloneExpiryDays` (3) after every job named in it finished. Unsaved work is archived first |
-| Per-job scratch folders (`cacheRoot/J-NNNN/*`) | Tool caches (with a `CACHEDIR.TAG`) once the job finishes; anything else after `evidenceExpiryDays` (14) |
-| Screenshots, recordings, traces and logs in a job's scratch | `evidenceExpiryDays` (14) after the job finished. Each file's name and SHA-256 are logged first |
-| Agent scratch folders (`scratchRoot/*`, off until configured) | Once nothing in them changed for `evidenceExpiryDays` |
+| Per-job scratch folders (`cacheRoot/J-NNNN/*`) | Tool caches (with a `CACHEDIR.TAG`) once the job finishes; anything else `evidenceExpiryDays` (14) after it finished |
+| Screenshots, recordings, traces and logs in a job's scratch | `evidenceExpiryDays` after the job finished. Each file's name and SHA-256 are logged first |
+| Agent scratch folders (`scratchRoot/*`) | Once nothing in them changed for `evidenceExpiryDays`. Off until you set `scratchRoot` |
 | Its own archives | `archiveExpiryDays` (30) after the archive became the only copy |
+| Old release builds and release evidence | Off until configured: [docs/CONFIGURATION.md](docs/CONFIGURATION.md) |
 
-Under disk pressure (at or above `diskWarnPercent`, 85%), the build output of parked or interrupted jobs goes too.
-Those jobs rebuild it when they resume.
+Under disk pressure (at or above `diskWarnPercent`, 85%), the build output of parked or interrupted jobs goes too;
+they rebuild it when they resume. The pressure check runs during a `tick` that has at least one finished job due.
 
 ## What it never removes
 
-- Anything of a job that is queued, approved, running or blocked, or that another job is waiting on.
-- `.env*`, `.dev.vars*`, `.wrangler` and `.vercel`. TrimReaper never enters, reads or deletes them. A clone that holds one
-  is kept whole (unless you set `cloneProtectedCopies` to `"remove"`, which archives them owner-only first).
-- A folder carrying a retention marker other than `disposable`. Mark one with `trimreaper mark <folder> evidence`
-  (classes: `disposable`, `evidence`, `customer`, `release-runtime-rollback`).
+- Anything of a job that is queued, approved, running, blocked, parked or interrupted, or that another job waits on
+  (`job add ... --waits-on`). The one exception is the disk-pressure rule above.
+- `.env*`, `.dev.vars*`, `.wrangler` and `.vercel` local files. TrimReaper never enters or reads them, and a clone
+  that holds one is kept whole. Two exceptions: env *templates* that git tracks (`.env.example`, `.env.sample`,
+  `.dev.vars.template` ...) go with an expired clone, since the remote holds the same file; and with
+  `cloneProtectedCopies` set to `"remove"`, the local copies are archived owner-only, then go with the clone.
+- A folder that carries a retention marker other than `disposable`: a file named `.ut-retention-<class>` at its top
+  level. Write one with `trimreaper mark <folder> evidence` (classes: `disposable`, `evidence`, `customer`,
+  `release-runtime-rollback`).
 - Anything a process has open, uses as its working directory, or names on its command line.
-- Anything reached through a symlink, on another volume, owned by another user, or outside the configured roots.
+- Anything reached through a symlink, on another volume, owned by another user, or outside the configured folders.
 - Your home folder or a system folder as a root, even if the configuration says so.
 
 ## Archive before delete
@@ -80,28 +90,33 @@ Those jobs rebuild it when they resume.
 An expired clone with uncommitted changes, untracked files, stashes or commits no remote holds is not deleted outright.
 TrimReaper first writes an archive to `archiveRoot/J-NNNN/<folder>-<time>-<run>/`:
 
-- `repo-0.bundle`: a self-contained git bundle of every commit no remote holds, verified in an empty repository;
-- `files.tar.gz`: every file git does not hold unchanged, each checked against its SHA-256;
+- `repo-0.bundle` (when there are commits no remote holds): a self-contained git bundle, verified in an empty repository;
+- `files.tar.gz`: the files git does not hold unchanged, each checked against its SHA-256. Dependency and build folders
+  (`node_modules`, `target`, `.venv` ...) and evidence files past `evidenceExpiryDays` are left out and listed;
 - `manifest.json`: what was saved, what was left out and why, and how to restore it.
 
-Only after the archive verifies, and a final check finds the folder unchanged, does the folder go. To restore:
+The folder goes only after the archive verifies and a final check finds the folder unchanged. An archive larger than
+4 GiB or 200,000 files is refused, and the folder is kept. To restore:
 
 ```sh
 git init restored && cd restored
 git fetch <archive>/repo-0.bundle 'refs/*:refs/restored/*'
+git checkout <the branch or commit named in manifest.json>
 tar -xzf <archive>/files.tar.gz
 ```
 
 ## Receipts and one owner at a time
 
-Each removal writes a plan record before it starts and a result record after it ends, both to
-`stateDir/reaper/receipts-YYYYMMDD.jsonl` (private, append-only). Only one reaper process deletes at a time. If a run
-stops part-way, the next run refuses until someone reviews the receipts and acknowledges them with
-`trimreaper owner status` and `trimreaper owner acknowledge`.
+Each removal writes a plan record before it starts and a result record after it ends, to
+`stateDir/reaper/receipts-YYYYMMDD.jsonl` (private, append-only). Only one TrimReaper process removes things at a time.
+If a run stops part-way (a crash, a full disk, a folder that changed during removal), every later run refuses until
+someone reviews the receipts and acknowledges them: `trimreaper owner status`, then `trimreaper owner acknowledge`
+([docs/SAFETY.md](docs/SAFETY.md#acknowledging-a-stopped-run)).
 
 ## Configuration
 
-`~/.config/trimreaper/config.json` (or `$TRIMREAPER_CONFIG`). Every key is optional:
+`~/.config/trimreaper/config.json` (or `$TRIMREAPER_CONFIG`). Every key is optional, and a wrong key or value is an
+error that names it:
 
 ```json
 {
@@ -111,28 +126,27 @@ stops part-way, the next run refuses until someone reviews the receipts and ackn
 }
 ```
 
-All keys and defaults: [docs/CONFIGURATION.md](docs/CONFIGURATION.md). `trimreaper config` prints the effective
-configuration.
+`trimreaper policy-set evidenceExpiryDays=7` changes one policy value. All keys and defaults:
+[docs/CONFIGURATION.md](docs/CONFIGURATION.md). `trimreaper config` prints the effective configuration.
 
 ## For agents
 
-- Record the job when it starts (`job add`) and its end (`job status <id> done|failed|cancelled`). Name clone folders
-  with the job number.
-- Read `trimreaper status --items` before asking a person why disk is full. `summary.reasonActions` says what would
+- Record the job when it starts (`job add`) and when it ends (`job status <id> done|failed|cancelled`). Name clone
+  folders with the job number.
+- Read `trimreaper status --items` before asking a person why the disk is full. `summary.reasonActions` says what would
   free each kept folder.
 - Never delete agent output with `rm -rf`. Mark folders you need to keep (`trimreaper mark <folder> evidence`).
 
 ## Embedding
 
 The engine (`src/trimreaper/core.py`) runs either with the standalone host in this package or vendored byte for byte
-into another program that supplies its own job store and folder layout. UltraTerm runs it that way.
-See [docs/EMBEDDING.md](docs/EMBEDDING.md).
+into another program that supplies its own job store and folder layout. See [docs/EMBEDDING.md](docs/EMBEDDING.md).
 
 ## More
 
 - [docs/SAFETY.md](docs/SAFETY.md): every gate a removal passes, and the limits of what it can detect.
 - [SECURITY.md](SECURITY.md): reporting a vulnerability.
-- [CONTRIBUTING.md](CONTRIBUTING.md): tests and how changes reach UltraTerm.
+- [CONTRIBUTING.md](CONTRIBUTING.md): running the tests and changing the engine.
 
 ## License
 

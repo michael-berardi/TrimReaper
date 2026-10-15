@@ -29,7 +29,7 @@ edit an embedded copy.
 | `row(conn, sql, args)`, `rows(conn, sql, args)` | One row as a dict (or `None`); every row as dicts. |
 | `txn(conn)` | Context manager: `BEGIN IMMEDIATE` ... `COMMIT`, `ROLLBACK` on error. |
 | `log_event(conn, kind, subject, actor, data)` | Append an event. |
-| `load_policy()` | The policy dict (keys in CONFIGURATION.md). |
+| `load_policy()` | The policy dict with **every** key in CONFIGURATION.md present. The engine's fallbacks for a missing key are not the standalone defaults (a missing `cloneProtectedCopies` reads as `"remove"`). |
 | `require(params, key)`, `actor_of(params)` | Parameter helpers for the `tool_*` entry points. |
 | `job_meta(job)`, `job_wait(job)` | A job's meta dict; the `{"job": id}` it waits on, or `None`. |
 | `whole_title(text)` | A job title shortened for display. |
@@ -54,7 +54,14 @@ CREATE TABLE cleanup_records (terminal_id TEXT PRIMARY KEY, status TEXT NOT NULL
 ```
 
 plus whatever `log_event` writes to. Job ids are `J-` and four or five digits. Finished statuses are `done`, `failed` and
-`cancelled`. The engine keeps its own state in `meta` under keys starting `reaper:`, `reap:` and `evidence-expiry:`.
+`cancelled`.
+
+The engine reads and writes:
+
+- `meta` keys starting `reaper:`, `reap:` and `evidence-expiry:` (its own pacing and audit state);
+- `meta` keys `cleanup:successor:<job>` (read: a JSON `{"job", "successor"}` handing a finished job's folders to a
+  successor job, which keeps them while it is unfinished) and `cleanup:released:<job>` (written when that chain ends);
+- `jobs.meta` JSON: reads `worktrees` (declared folders) and `waitingOn`, writes `reap` (its last word on the job).
 
 ## Entry points
 

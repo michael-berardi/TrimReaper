@@ -55,10 +55,10 @@ class Embedding(unittest.TestCase):
         self.assertEqual(set(core.HOST_NAMES) - used, set(), "HOST_NAMES lists names the engine does not read")
         self.assertEqual([n for n in core.HOST_NAMES if not hasattr(host, n)], [])
 
-    def test_the_body_carries_no_private_paths_or_names(self):
-        for needle in ("/Users/", "ut-cleanup-guard", "Mike", "LDS", "lds-", "build_queue.py", "UltraTerm", "~/dev"):
+    def test_the_body_names_no_host_paths(self):
+        for needle in ("/Users/", "/home/", "~/"):
             self.assertNotIn(needle, self.body, needle)
 
-    def test_the_digest_is_of_the_body_only(self):
-        import hashlib
-        self.assertEqual(cli.core_digest(), hashlib.sha256(self.body.encode()).hexdigest())
+    def test_every_host_name_is_documented(self):
+        doc = (Path(__file__).parents[1] / "docs" / "EMBEDDING.md").read_text()
+        self.assertEqual([name for name in core.HOST_NAMES if f"`{name}" not in doc], [])

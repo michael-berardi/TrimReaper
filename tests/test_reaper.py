@@ -101,8 +101,9 @@ class FinishedJobOutput(Home):
         os.symlink(outside, repo / "node_modules")
         self.add_job("J-0007", repo)
 
-        self.cli("reap", "--job", "J-0007")
+        out = self.cli("reap", "--job", "J-0007")
 
+        self.assertEqual(out["items"], [], "a symlink is never offered as an item")
         self.assertTrue((outside / "precious.txt").exists())
         self.assertTrue(os.path.islink(repo / "node_modules"))
 
@@ -191,6 +192,22 @@ class Boundaries(Home):
         self.assertEqual(out["deleted"], 0)
         self.assertIn("allowed-root-too-broad", out["items"][0]["reason"])
         self.assertTrue((moved / "node_modules").exists())
+
+    def test_a_clone_base_that_is_a_symlink_is_not_followed(self):
+        real = self.tmp / "elsewhere"
+        real.mkdir()
+        os.symlink(real, self.home / "linked")
+        self.write_config({"cloneBases": [{"path": "~/linked"}]})
+        repo = self.clone("app-j0022")
+        os.rename(repo, real / "app-j0022")
+        node = self.put(real / "app-j0022", "node_modules/pkg/index.js")
+        self.add_job("J-0022", self.home / "linked" / "app-j0022")
+
+        out = self.cli("reap", "--job", "J-0022")
+
+        self.assertEqual(out["deleted"], 0, out)
+        self.assertEqual([i["reason"] for i in out["items"]], ["outside-allowed-roots"], out)
+        self.assertTrue(node.exists())
 
     def test_a_folder_not_named_for_the_job_is_not_touched(self):
         repo = self.clone("unrelated-app")
