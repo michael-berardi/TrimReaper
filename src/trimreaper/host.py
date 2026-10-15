@@ -125,6 +125,25 @@ def check_config(merged: dict, path: Path) -> None:
     if not isinstance(merged["policy"], dict):
         bad("policy", "an object")
     check_policy(merged["policy"])
+    # Every path is checked now, at load: a bad one found later would fail inside a sweep and stop it.
+    paths = [merged[k] for k in ("stateDir", "cacheRoot", "archiveRoot", "scratchRoot", "releaseRoot", "releaseEvidenceRoot",
+                                 "buildQueueStateDir", "diskVolume") if merged[k] is not None]
+    paths += [b["path"] for b in bases] + [v for v in release.values() if v is not None]
+    for value in paths:
+        path_form(value)
+    if merged["home"] is not None and not Path(merged["home"]).expanduser().is_absolute():
+        bad("home", "an absolute path")
+    if merged["diskVolume"] is not None and not os.path.isdir(merged["diskVolume"]):
+        raise HostError(f"{path}: diskVolume {merged['diskVolume']} is not a folder that can be measured", "fix diskVolume or remove it")
+
+
+def path_form(value: str) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise HostError(f"configured path must be a non-empty string, not {value!r}")
+    if ".." in Path(value).parts:
+        raise HostError(f"configured path {value!r} must not contain '..'", "name the folder directly")
+    if not (value == "~" or value.startswith("~/") or Path(value).is_absolute()):
+        raise HostError(f"configured path {value!r} must be absolute or start with ~/")
 
 
 def check_policy(policy: dict) -> None:
@@ -164,16 +183,10 @@ def reap_home() -> Path:
 
 def expand(value: str) -> Path:
     """A configured path: `~` is the reap home, never the HOME variable of whoever runs the command."""
-    if not isinstance(value, str) or not value.strip():
-        raise HostError(f"configured path must be a non-empty string, not {value!r}")
-    if ".." in Path(value).parts:
-        raise HostError(f"configured path {value!r} must not contain '..'", "name the folder directly")
+    path_form(value)
     if value == "~" or value.startswith("~/"):
         return reap_home() / value[2:]
-    path = Path(value)
-    if not path.is_absolute():
-        raise HostError(f"configured path {value!r} must be absolute or start with ~/")
-    return path
+    return Path(value)
 
 
 def configured(key: str) -> Path | None:
@@ -278,11 +291,10 @@ def disk_state() -> dict | None:
 
 
 def disk_level(policy: dict, disk: dict | None) -> str:
+    """"warn" at or above diskWarnPercent (the engine treats anything but "ok" as disk pressure), else "ok"."""
     if not disk:
         return "ok"
-    if disk["usedPercent"] >= policy.get("diskHoldPercent", 92):
-        return "hold"
-    return "warn" if disk["usedPercent"] >= policy.get("diskWarnPercent", 85) else "ok"
+    return "warn" if disk["usedPercent"] >= policy["diskWarnPercent"] else "ok"
 
 
 def live_all() -> list[dict]:

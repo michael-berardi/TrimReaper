@@ -24,6 +24,9 @@ finishes, in case it is resumed. A **build queue** is any tool that takes a per-
 6. **Producer locks.** A build queue's per-project locks and Cargo's build locks are taken and held through the removal.
 7. **Protected scan.** A names-only walk refuses on `.env*`, `.dev.vars*`, `.wrangler`, `.vercel`, a nested repository,
    a bare git folder, a second retention marker or another volume. Protected entries are never stat'ed, opened or entered.
+   Two exceptions, both for a whole expired clone: env templates git tracks (`.env.example` ...), which the remote also
+   holds, go with it; and under `cloneProtectedCopies: "remove"` the protected copies are read once into an owner-only
+   archive (`protected.tar.gz`), then go with it.
 8. **Git proofs.** For build output: git ignores it, tracks nothing in it, and the clone is clean, stash-free and pushed.
    For a whole clone: every branch, reflog entry and unreachable commit is on a remote, there are no tags or other refs,
    no linked worktree depends on it, and every ignored file is known build output. Git runs with hooks, fsmonitor,
@@ -57,7 +60,8 @@ These also remove files, each with its own checks:
 ## What it cannot detect
 
 - A protected file's identity is its own metadata (type, device, inode, mode, links, size, times). TrimReaper never reads
-  inside a protected folder, so a change deep inside one is not seen. Nothing inside it is ever removed either.
+  inside a protected folder next to the item it removes, so a change deep inside one is not seen; nothing inside it is
+  removed either (the two whole-clone exceptions above aside).
 - Git config is checked before and after each git call. A config rewritten during a call is detected afterwards, and that
   answer is thrown away, but git may already have read it.
 - In-use detection is a snapshot. A process that starts working in a folder after the final probe and before the
@@ -68,11 +72,12 @@ These also remove files, each with its own checks:
 ## Acknowledging a stopped run
 
 `trimreaper owner status` shows the last run's `phase` and its token, `expectedRun`. Phases `none`, `finished` and
-`acknowledged` need nothing. Any other phase (`started` with no end, `interrupted`, `stopped`, or a damaged journal)
-blocks every later run until it is acknowledged:
+`acknowledged` need nothing. Any other phase blocks every later run until it is acknowledged: `started` (a run that
+never ended), `interrupted`, `stopped`, or a damaged journal (`fragment`, `invalid`, `compaction-incomplete`):
 
 1. Read that run's receipts in `stateDir/reaper/`.
-2. Write a report file: a regular file you own, mode `0600`, one link, at most 64 KiB, containing these lines:
+2. Write a report file: a regular file you own, mode `0600`, one link, at most 64 KiB, at an absolute path with no `..`,
+   no symlink and no protected name in it, containing these lines:
 
 ```
 Cleanup owner run: <expectedRun>

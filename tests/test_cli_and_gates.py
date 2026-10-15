@@ -77,7 +77,8 @@ class ConfigCommands(Home):
         printed = io.StringIO()
         with contextlib.redirect_stdout(printed), self.assertRaises(SystemExit):
             cli.main(["--version"])
-        self.assertIn(core.__name__.split(".")[0], printed.getvalue())
+        from trimreaper import __version__
+        self.assertEqual(printed.getvalue().strip(), f"trimreaper {__version__}")
 
 
 class OwnerHandoff(Home):
@@ -128,7 +129,9 @@ class NeverRemoved(Home):
                 repo = self.clone(f"app-j0{number}", ignored=(".dev.vars*", ".wrangler/", ".vercel/", ".env*"))
                 self.put(repo, name, b"local state\n")
                 self.add_job(f"J-0{number}", repo, finished_ago=4 * DAY)
-                self.cli("reap", "--job", f"J-0{number}")
+                out = self.cli("reap", "--job", f"J-0{number}")
+                self.assertEqual(out["deleted"], 0, out)
+                self.assertTrue(any(i["reason"].startswith(("protected-leaf", "git-unsafe-index:protected")) for i in out["items"]), out)
                 self.assertEqual((repo / name).read_bytes(), b"local state\n")
 
     def test_unfinished_statuses_and_waiting_jobs_keep_everything(self):
@@ -150,12 +153,14 @@ class NeverRemoved(Home):
         repo = self.clone("app-j0150")
         held = self.put(repo, "node_modules/pkg/index.js")
         self.add_job("J-0150", repo)
-        holder = subprocess.Popen([sys.executable, "-c", "import sys,time; f=open(sys.argv[1]); time.sleep(60)", str(held)], cwd="/")
+        holder = subprocess.Popen([sys.executable, "-c", "import os,time; f=open(os.environ['HELD']); time.sleep(60)"], cwd="/",
+                                  env={**os.environ, "HELD": str(held)})  # the path is in no command line: only the open file names it
         self.addCleanup(holder.wait)
         self.addCleanup(holder.kill)
         time.sleep(0.5)
         out = self.cli("reap", "--job", "J-0150")
         self.assertTrue(out["items"][0]["reason"].startswith("in-use:"), out["items"][0])
+        self.assertNotIn("command-line", out["items"][0]["reason"])
         holder.kill()
         holder.wait()
         naming = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", str(held.parent.parent)], cwd="/")
@@ -170,7 +175,8 @@ class NeverRemoved(Home):
         repo = self.clone("app-j0160", ignored=(".ut-retention-*",))
         self.cli("mark", str(repo), "customer")
         self.add_job("J-0160", repo, finished_ago=4 * DAY)
-        self.cli("reap", "--job", "J-0160")
+        out = self.cli("reap", "--job", "J-0160")
+        self.assertEqual(out["items"], [], "a clone marked customer is not offered as an item")
         self.assertTrue((repo / "README.md").exists())
 
 
@@ -206,3 +212,62 @@ class ProtectedCopiesAndArchives(Home):
 
         self.assertEqual(self.cli("reap", "--archives")["deleted"], 1)
         self.assertFalse(archive.exists())
+
+
+class MoreGates(Home):
+    def test_a_tracked_env_template_goes_with_its_expired_clone(self):
+        repo = self.clone("app-j0180", ignored=("node_modules/",), tracked={"README.md": "hi\n", ".env.example": "KEY=\n"})
+        self.assertIn(".env.example", self.git(repo, "ls-files"))
+        self.add_job("J-0180", repo, finished_ago=4 * DAY)
+        out = self.cli("reap", "--job", "J-0180")
+        self.assertFalse(repo.exists(), out)
+
+    def test_disk_pressure_takes_build_output_of_parked_jobs_only(self):
+        self.write_config({"policy": {"diskWarnPercent": 1}})  # every disk is "full"
+        parked = self.clone("app-j0190")
+        parked_output = self.put(parked, "node_modules/pkg/index.js").parent.parent
+        self.put(parked, "dist/out.js")
+        self.add_job("J-0190", parked, status="parked")
+        running = self.clone("app-j0191")
+        running_output = self.put(running, "node_modules/pkg/index.js").parent.parent
+        self.add_job("J-0191", running, status="running")
+        due = self.clone("app-j0192")
+        self.put(due, "node_modules/pkg/index.js")
+        self.add_job("J-0192", due)  # the pressure pass rides on a tick with a finished job due
+
+        out = self.cli("tick")
+
+        self.assertIn("reaped-under-pressure", [a["did"] for a in out["actions"]], out)
+        self.assertFalse(parked_output.exists())
+        self.assertTrue((parked / "dist" / "out.js").exists(), "dist is never taken under pressure")
+        self.assertTrue(running_output.exists())
+
+    def test_disk_volume_and_release_paths_are_checked_at_load(self):
+        self.write_config({"diskVolume": "/no/such/volume"})
+        self.assertIn("diskVolume", self.cli("config", expect=2)["error"])
+        self.write_config({"release": {"installedApp": "Applications/X.app"}})
+        self.assertIn("must be absolute", self.cli("config", expect=2)["error"])
+        self.write_config({"home": "relative/home"})
+        self.assertIn("home", self.cli("config", expect=2)["error"])
+
+    def test_usage_errors_are_json(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as raised:
+            cli.main(["reap"])
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("usage:", json.loads(err.getvalue())["error"])
+
+
+class OwnerCompact(Home):
+    def test_compact_needs_the_current_token_of_a_settled_journal(self):
+        self.assertTrue(self.cli("owner", "status")["phase"] == "none")
+        repo = self.clone("app-j0195")
+        self.put(repo, "node_modules/pkg/index.js")
+        self.add_job("J-0195", repo)
+        self.cli("reap", "--job", "J-0195")  # a real run writes the journal
+        status = self.cli("owner", "status")
+        self.assertEqual(status["phase"], "finished")
+        self.assertIn("stale", self.cli("owner", "compact", "--run", "000000000000", expect=2)["error"])
+        out = self.cli("owner", "compact", "--run", status["expectedRun"])
+        self.assertTrue(out["compacted"])
+        self.assertTrue(Path(out["archive"]).exists())

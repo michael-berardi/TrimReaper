@@ -74,13 +74,14 @@ they rebuild it when they resume. The pressure check runs during a `tick` that h
 
 - Anything of a job that is queued, approved, running, blocked, parked or interrupted, or that another job waits on
   (`job add ... --waits-on`). The one exception is the disk-pressure rule above.
-- `.env*`, `.dev.vars*`, `.wrangler` and `.vercel` local files. TrimReaper never enters or reads them, and a clone
-  that holds one is kept whole. Two exceptions: env *templates* that git tracks (`.env.example`, `.env.sample`,
+- `.env*`, `.dev.vars*`, `.wrangler` and `.vercel` local files. A clone that holds one is kept whole, and TrimReaper
+  does not enter or read them. Two exceptions: env *templates* that git tracks (`.env.example`, `.env.sample`,
   `.dev.vars.template` ...) go with an expired clone, since the remote holds the same file; and with
   `cloneProtectedCopies` set to `"remove"`, the local copies are archived owner-only, then go with the clone.
 - A folder that carries a retention marker other than `disposable`: a file named `.ut-retention-<class>` at its top
-  level. Write one with `trimreaper mark <folder> evidence` (classes: `disposable`, `evidence`, `customer`,
-  `release-runtime-rollback`).
+  level (`ut` is from UltraTerm, where the format started). Write one with `trimreaper mark <folder> <class>`:
+  `evidence` (proof of work you want kept), `customer` (customer data), `release-runtime-rollback` (what a release or
+  its rollback needs). `disposable` is the opposite: it allows removal, still subject to every other check.
 - Anything a process has open, uses as its working directory, or names on its command line.
 - Anything reached through a symlink, on another volume, owned by another user, or outside the configured folders.
 - Your home folder or a system folder as a root, even if the configuration says so.
@@ -100,8 +101,8 @@ The folder goes only after the archive verifies and a final check finds the fold
 
 ```sh
 git init restored && cd restored
-git fetch <archive>/repo-0.bundle 'refs/*:refs/restored/*'
-git checkout <the branch or commit named in manifest.json>
+git fetch <archive>/repo-0.bundle 'refs/heads/*:refs/heads/*'
+git checkout ut-archive/<n>   # manifest.json: repositories[].bundle.refs maps each saved branch to where it came from ("HEAD", ...)
 tar -xzf <archive>/files.tar.gz
 ```
 
@@ -133,9 +134,28 @@ error that names it:
 
 - Record the job when it starts (`job add`) and when it ends (`job status <id> done|failed|cancelled`). Name clone
   folders with the job number.
+- Prefer the MCP tools when your client has them (below); the command line works the same way.
 - Read `trimreaper status --items` before asking a person why the disk is full. `summary.reasonActions` says what would
   free each kept folder.
 - Never delete agent output with `rm -rf`. Mark folders you need to keep (`trimreaper mark <folder> evidence`).
+
+## MCP server
+
+`trimreaper mcp` serves the same commands as tools to any MCP client over stdio: `job_add`, `job_status`, `job_list`,
+`reap_status` (read-only), `reap` and `mark`. `reap` is a dry run unless the call passes `"dryRun": false`, and every
+check above still applies. Acknowledging a stopped run and changing the policy stay on the command line, with a person.
+
+Claude Code:
+
+```sh
+claude mcp add trimreaper -- trimreaper mcp
+```
+
+Other clients (Claude Desktop, Cursor and similar), in their MCP config:
+
+```json
+{"mcpServers": {"trimreaper": {"command": "trimreaper", "args": ["mcp"]}}}
+```
 
 ## Embedding
 

@@ -22,6 +22,14 @@ BEGIN, END = "# >>> trimreaper core >>>\n", "# <<< trimreaper core <<<\n"
 SYSTEM_PATH = ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
 
 
+class Parser(argparse.ArgumentParser):
+    """Usage errors are JSON on stderr with exit 2, like every other refusal."""
+
+    def error(self, message):
+        print(json.dumps({"error": f"usage: {message}", "hint": f"{self.prog} --help"}), file=sys.stderr)
+        raise SystemExit(2)
+
+
 def core_body() -> str:
     """The engine exactly as an embedding host vendors it: the text between the markers of core.py."""
     text = Path(core.__file__).read_text(encoding="utf-8")
@@ -80,11 +88,16 @@ def cmd_job_status(args) -> dict:
     with host.db() as conn:
         job = find_job(conn, args.id)
         finished = (job["finished_at"] or host.now()) if args.status in core.REAP_TERMINAL else None
-        conn.execute("UPDATE jobs SET status=?, finished_at=? WHERE id=?", (args.status, finished, args.id))
-        if finished is None:
-            # a reopened job starts over: the reaper's pacing state for it (a finished pass, a backoff) no longer applies
-            conn.execute("DELETE FROM meta WHERE key IN (?,?)", ("reaper:" + args.id, "evidence-expiry:" + args.id))
-        host.log_event(conn, "job.status", args.id, host.actor_of({}), {"from": job["status"], "to": args.status})
+        with host.txn(conn):
+            conn.execute("UPDATE jobs SET status=?, finished_at=? WHERE id=?", (args.status, finished, args.id))
+            if finished is None and job["status"] in core.REAP_TERMINAL:
+                # a reopened job starts over: the reaper's pacing state and last note for it no longer apply
+                conn.execute("DELETE FROM meta WHERE key IN (?,?,?)",
+                             ("reaper:" + args.id, "evidence-expiry:" + args.id, "reap:pressure:" + args.id))
+                meta = host.job_meta(job)
+                if meta.pop("reap", None) is not None:
+                    conn.execute("UPDATE jobs SET meta=? WHERE id=?", (json.dumps(meta, sort_keys=True) if meta else None, args.id))
+            host.log_event(conn, "job.status", args.id, host.actor_of({}), {"from": job["status"], "to": args.status})
         return find_job(conn, args.id)
 
 
@@ -159,6 +172,8 @@ def cmd_mark(args) -> dict:
 def cmd_policy_set(args) -> dict:
     """Set policy keys in the config file: `trimreaper policy-set evidenceExpiryDays=14 autoReap=false`."""
     path = host.config_path()
+    if path.is_symlink():
+        raise host.HostError(f"{path} is a symlink; policy-set writes a regular file", "edit the file it points to by hand")
     stored = {}
     if path.exists():
         stored = json.loads(path.read_text())
@@ -173,8 +188,11 @@ def cmd_policy_set(args) -> dict:
             policy[key] = json.loads(raw)
         except ValueError:
             policy[key] = raw
-    host.check_policy(policy)  # refuses before anything is written
     stored["policy"] = policy
+    unknown = sorted(set(stored) - set(host.DEFAULT_CONFIG))
+    if unknown:
+        raise host.HostError(f"{path} has unknown keys: {', '.join(unknown)}", "fix the file before changing the policy")
+    host.check_config({**json.loads(json.dumps(host.DEFAULT_CONFIG)), **stored}, path)  # the whole result, before anything is written
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=".config-", suffix=".json")
     with os.fdopen(fd, "w") as handle:
@@ -203,7 +221,7 @@ def cmd_core_digest(args) -> dict:
 
 
 def parser() -> argparse.ArgumentParser:
-    top = argparse.ArgumentParser(prog="trimreaper", description="Reclaim disk that agent jobs left behind, through one guarded deletion path.")
+    top = Parser(prog="trimreaper", description="Reclaim the disk that agent jobs left behind, removing only what it can prove is disposable.")
     top.add_argument("--version", action="version", version=f"trimreaper {__version__}")
     sub = top.add_subparsers(dest="command", required=True)
 
@@ -265,6 +283,7 @@ def parser() -> argparse.ArgumentParser:
     policy.add_argument("pairs", nargs="+", metavar="KEY=VALUE")
     policy.set_defaults(func=cmd_policy_set)
 
+    sub.add_parser("mcp", help="serve these commands as MCP tools over stdio (for agent clients)").set_defaults(func=None)
     sub.add_parser("config", help="the effective configuration and folder layout").set_defaults(func=cmd_config)
     sub.add_parser("core-digest", help="SHA-256 of the engine an embedding host must vendor byte for byte").set_defaults(func=cmd_core_digest)
     return top
@@ -285,6 +304,9 @@ def fail(message: str, hint: str | None = None) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     system_path()
+    if args.command == "mcp":
+        from . import mcp
+        return mcp.serve()
     try:
         out = args.func(args)
     except host.HostError as error:

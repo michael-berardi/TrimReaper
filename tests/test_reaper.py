@@ -159,14 +159,18 @@ class ExpiredClones(Home):
         self.assertEqual(stat.S_IMODE(archive.parent.stat().st_mode), 0o700)
         manifest = json.loads((archive / "manifest.json").read_text())
         self.assertEqual(manifest["path"], str(repo))
+        # the README's restore recipe, step by step
         restored = self.tmp / "restored"
         subprocess.run(["git", "init", "-q", str(restored)], check=True, capture_output=True)
-        self.git(restored, "fetch", "-q", str(archive / "repo-0.bundle"), "refs/*:refs/restored/*")
-        self.assertIn(unpushed, self.git(restored, "log", "--all", "--format=%H"))
+        self.git(restored, "fetch", "-q", str(archive / "repo-0.bundle"), "refs/heads/*:refs/heads/*")
+        refs = manifest["repositories"][0]["bundle"]["refs"]
+        head = next(ref for ref, saved in refs.items() if "HEAD" in saved["from"])
+        self.git(restored, "checkout", "-q", head.removeprefix("refs/heads/"))
+        self.assertEqual(self.git(restored, "rev-parse", "HEAD").strip(), unpushed)
         with tarfile.open(archive / "files.tar.gz") as tar:
-            names = set(tar.getnames())
-        self.assertIn("README.md", names)
-        self.assertIn("notes.txt", names)
+            tar.extractall(restored, filter="data")
+        self.assertEqual((restored / "README.md").read_text(), "edited, never committed\n")
+        self.assertEqual((restored / "notes.txt").read_text(), "untracked notes\n")
         self.assertIsNotNone(json.loads((archive / "sole-copy-since.json").read_text())["soleCopySince"])
 
     def test_a_clone_inside_its_expiry_window_stays(self):

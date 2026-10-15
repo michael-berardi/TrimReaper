@@ -4,7 +4,7 @@ Everything between the `trimreaper core` markers below is the engine itself. A h
 
   * as this module, with the standalone host (`trimreaper.host`) supplying the names listed in HOST_NAMES;
   * embedded byte for byte in the host's own source, after the host has defined those names itself
-    (see docs/EMBEDDING.md). UltraTerm runs it that way.
+    (see docs/EMBEDDING.md), the way UltraTerm vendors it.
 
 Do not edit the engine in an embedding host: change it here, release, and re-vendor. `trimreaper core-digest`
 prints the SHA-256 an embedded copy must match.
@@ -2742,10 +2742,6 @@ def reap_vet_root(root: str) -> None:
         homes.append(reap_canon(pwd.getpwuid(os.getuid()).pw_dir))
     except KeyError:
         pass
-    try:
-        homes.append(reap_canon(reap_home()))  # the home the host reaps below (a test or second instance moves it)
-    except HostError:
-        raise ReapRefused("allowed-root-unverified:reap-home-unknown")
     if root == "/" or any(reap_inside_folded(home, root) for home in homes):
         raise ReapRefused("allowed-root-too-broad")
     for system in REAP_SYSTEM_ROOTS + REAP_SYSTEM_PARENTS:
@@ -2754,6 +2750,12 @@ def reap_vet_root(root: str) -> None:
     for system in REAP_SYSTEM_ROOTS:
         if reap_inside_folded(root, system) or reap_inside_folded(root, reap_canon(system)):
             raise ReapRefused("allowed-root-inside-system-root")
+    try:
+        reap_root = reap_canon(reap_home())  # the home the host reaps below (a test or second instance moves it)
+    except HostError:
+        raise ReapRefused("allowed-root-unverified:reap-home-unknown")
+    if reap_inside_folded(reap_root, root):
+        raise ReapRefused("allowed-root-too-broad")
 
 
 def reap_boundary(item: dict) -> str:
@@ -3318,7 +3320,8 @@ def reap_worktree_forget(common: str, gitdir: str | None, removed: str) -> str:
 
 
 def reap_item(item: dict, mode: str = "delete", ctx: dict | None = None) -> dict:
-    """Gate, then (in "delete" mode) remove, one regenerable directory. The ONLY function that deletes artifacts.
+    """Gate, then (in "delete" mode) remove, one directory. The only function that removes a host's artifacts (the reaper's own
+    housekeeping and evidence-file expiry are listed in docs/SAFETY.md).
     mode: "delete" removes it; "dry-run" runs every fresh gate but removes and writes nothing; "audit" is a dry run
     that shares one process snapshot (ctx) and takes no locks it would have to create.
 
@@ -3572,7 +3575,7 @@ def reap_terminal_handoff(job: dict, state: str) -> dict:
     if state == "verified":
         step = "verified: the guarded cleanup closes it after closeGraceSeconds, then this job's artifacts are reaped on the next tick"
     elif state == "awaiting-verification":
-        step = "a verifier job (verifier_tick) checks it; or review the report and run `" + REAP_CLI + " cleanup-record` for this terminal"
+        step = "a verifier job checks it; or review the report and run `" + REAP_CLI + " cleanup-record` for this terminal"
     elif state in ("closing", "awaiting-final-reply", "unknown"):
         step = f"cleanup is {state}: see `{REAP_CLI} cleanup-status`; the reaper waits for it"
     else:

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "trimreaper"
 dynamic = ["version"]
-description = "Reclaims the disk that AI agent swarms leave behind (clones, build output, scratch, evidence) through one guarded deletion path."
+description = "Reclaims the disk that AI agent swarms leave behind (clones, build output, scratch, evidence), removing only what it can prove is disposable."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]

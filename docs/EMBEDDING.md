@@ -2,7 +2,7 @@
 
 The engine is the text between `# >>> trimreaper core >>>` and `# <<< trimreaper core <<<` in
 `src/trimreaper/core.py`. It imports nothing. It reads the standard-library modules and the host names below as globals,
-so a host can paste it, byte for byte, into its own module after defining them. That is how UltraTerm runs it.
+so a host can paste it, byte for byte, into its own module after defining them. That is how UltraTerm vendors it.
 
 `trimreaper core-digest` prints the SHA-256 of that text. An embedding host should record the version and digest next to
 its copy and fail its tests when the copy no longer matches. Change the engine here, release it, then re-vendor; never
@@ -33,8 +33,8 @@ edit an embedded copy.
 | `require(params, key)`, `actor_of(params)` | Parameter helpers for the `tool_*` entry points. |
 | `job_meta(job)`, `job_wait(job)` | A job's meta dict; the `{"job": id}` it waits on, or `None`. |
 | `whole_title(text)` | A job title shortened for display. |
-| `live_all()` | Live terminals as dicts with an `"id"`; a job whose `terminal_id` is live is not reaped. |
-| `disk_state()`, `disk_level(policy, disk)` | Used percent and free bytes; `"ok"`, `"warn"` or `"hold"`. |
+| `live_all()` | Live terminals as dicts with an `"id"`. A host that runs agents in terminals records a job's `terminal_id`; while that terminal is live, or its `cleanup_records` row is not settled, the job is not reaped, and the hints name `<REAP_CLI> cleanup-status` and `cleanup-record`. The standalone host runs no terminals. |
+| `disk_state()`, `disk_level(policy, disk)` | Used percent and free bytes; `"ok"`, or any other word for disk pressure. |
 | `reap_home()` | The home the reaper works below. |
 | `reap_clone_bases()` | `[(Path, prefix or None), ...]`: folders holding job clones. |
 | `reap_cache_root()`, `reap_archive_root()`, `reap_agent_scratch_root()` | Per-job scratch, archives, agent scratch. |
@@ -61,7 +61,7 @@ The engine reads and writes:
 - `meta` keys starting `reaper:`, `reap:` and `evidence-expiry:` (its own pacing and audit state);
 - `meta` keys `cleanup:successor:<job>` (read: a JSON `{"job", "successor"}` handing a finished job's folders to a
   successor job, which keeps them while it is unfinished) and `cleanup:released:<job>` (written when that chain ends);
-- `jobs.meta` JSON: reads `worktrees` (declared folders) and `waitingOn`, writes `reap` (its last word on the job).
+- `jobs.cwd` and the `jobs.meta` JSON: reads `cwd` and `worktrees` (declared folders) and `waitingOn`, writes `reap` (its last word on the job).
 
 ## Entry points
 

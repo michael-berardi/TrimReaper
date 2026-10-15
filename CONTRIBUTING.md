@@ -11,7 +11,7 @@ written. They need `git`, `lsof` and `ps`.
 
 ## Changing the engine
 
-The engine between the markers in `src/trimreaper/core.py` is also vendored, byte for byte, into UltraTerm. A change
+The engine between the markers in `src/trimreaper/core.py` is vendored, byte for byte, into UltraTerm. A change
 there:
 
 1. keeps every gate in [docs/SAFETY.md](docs/SAFETY.md) fail-closed: an unknown, an error or a timeout keeps the folder;
