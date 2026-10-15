@@ -11,7 +11,7 @@ import re
 import sqlite3
 import sys
 
-from . import __version__, cli, core, host
+from . import __version__, clean, cli, core, host
 
 PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 JOB = {"type": "string", "pattern": host.JOB_ID.pattern, "description": "Job id, J-0042 (the folder name carries j0042)"}
@@ -49,6 +49,18 @@ TOOLS = [
          "target": {"type": "string", "enum": ["job", "scratch", "archives", "release-evidence", "releases"], "default": "job"},
          "expireEvidence": {"type": "boolean", "default": False, "description": "With job: expire old screenshots, recordings and logs instead"},
          "dryRun": {"type": "boolean", "default": True}}}},
+    {"name": "clean",
+     "description": "Free space outside agent jobs: tool caches through each tool's own cleaner (npm, pnpm, yarn, bun, uv, pip, "
+                    "go, homebrew, simulators, docker build cache), Cargo's registry and Xcode's DerivedData, and idle agent "
+                    "worktrees (clean, unlocked, every commit still on a branch, tag or remote). Reports local models, browser "
+                    "builds, Docker's disk image and local snapshots without touching them. A dry run (the default) plans and "
+                    "sizes; pass dryRun false to clean. Kept items carry the reason.",
+     "annotations": {"destructiveHint": True},
+     "inputSchema": {"type": "object", "additionalProperties": False, "properties": {
+         "dryRun": {"type": "boolean", "default": True},
+         "deep": {"type": "boolean", "default": False, "description": "Also the Go module cache and unused Docker images"},
+         "only": {"type": "array", "items": {"type": "string", "enum": list(clean.CLEAN_NAMES)}, "description": "Limit to these targets"},
+         "report": {"type": "boolean", "default": True, "description": "Include the models/browsers/disk-image report"}}}},
     {"name": "mark",
      "description": "Give a folder a retention class. evidence, customer or release-runtime-rollback keep it whatever else "
                     "is true; disposable allows removal, still subject to every other check.",
@@ -72,6 +84,8 @@ def check_arguments(schema: dict, args: dict) -> str | None:
         if not ok:
             need = {"string": "a string", "boolean": "true or false", "integer": "a whole number", "array": "a list of strings"}[kind]
             return f"{key} must be {need}, not {json.dumps(value)[:60]}"
+        if kind == "array" and "enum" in spec["items"] and not all(v in spec["items"]["enum"] for v in value):
+            return f"{key} entries must be among {', '.join(spec['items']['enum'])}"
         if "enum" in spec and value not in spec["enum"]:
             return f"{key} must be one of {', '.join(spec['enum'])}"
         if "pattern" in spec and not re.match(spec["pattern"], value):
@@ -111,6 +125,9 @@ def call(name: str, args: dict) -> dict:
         return cli.cmd_reap(namespace(job=cli.job_id(args["job"]) if target == "job" else None, scratch=target == "scratch",
                                       archives=target == "archives", release_evidence=target == "release-evidence",
                                       releases=target == "releases", expire_evidence=bool(args.get("expireEvidence")), dry_run=dry_run))
+    if name == "clean":
+        dry_run = args.get("dryRun", True)
+        return cli.cmd_clean(namespace(dry_run=dry_run, deep=bool(args.get("deep")), only=args.get("only"), no_report=not args.get("report", True)))
     if name == "mark":
         if args["retention"] not in core.REAP_RETENTION_CLASSES:
             raise host.HostError(f"retention must be one of {', '.join(core.REAP_RETENTION_CLASSES)}")
@@ -140,7 +157,8 @@ def handle(message: dict) -> dict | None:
                        "capabilities": {"tools": {"listChanged": False}},
                        "serverInfo": {"name": "trimreaper", "version": __version__},
                        "instructions": "Record each agent job (job_add) and its end (job_status done). Read reap_status before "
-                                       "asking why disk is full. reap is a dry run unless dryRun is false."})
+                                       "asking why disk is full. clean frees tool caches and idle agent worktrees. reap and clean are dry "
+                                       "runs unless dryRun is false."})
     if method == "ping":
         return answer({})
     if method == "tools/list":

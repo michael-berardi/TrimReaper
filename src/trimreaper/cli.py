@@ -9,15 +9,18 @@ import argparse
 import hashlib
 import json
 import os
+import plistlib
 import sqlite3
 import stat
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
-from . import __version__, core, host
+from . import __version__, clean, core, host
 
 BEGIN, END = "# >>> trimreaper core >>>\n", "# <<< trimreaper core <<<\n"
+CLEAN_BEGIN, CLEAN_END = "# >>> trimreaper clean >>>\n", "# <<< trimreaper clean <<<\n"
 # lsof lives in /usr/sbin, which cron and launchd leave off PATH; without it every item is kept as probe-unavailable.
 SYSTEM_PATH = ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
 
@@ -30,11 +33,19 @@ class Parser(argparse.ArgumentParser):
         raise SystemExit(2)
 
 
+def section(module, begin: str, end: str) -> str:
+    text = Path(module.__file__).read_text(encoding="utf-8")
+    return text[text.index(begin) + len(begin):text.index(end)]
+
+
 def core_body() -> str:
     """The engine exactly as an embedding host vendors it: the text between the markers of core.py."""
-    text = Path(core.__file__).read_text(encoding="utf-8")
-    start, end = text.index(BEGIN) + len(BEGIN), text.index(END)
-    return text[start:end]
+    return section(core, BEGIN, END)
+
+
+def clean_body() -> str:
+    """The clean pass as an embedding host vendors it, after the engine: the text between the markers of clean.py."""
+    return section(clean, CLEAN_BEGIN, CLEAN_END)
 
 
 def core_digest() -> str:
@@ -137,7 +148,69 @@ def cmd_tick(args) -> dict:
         policy = host.load_policy()
         core.reap_tick(conn, policy, [], actions, errors)
         core.evidence_expiry_tick(conn, policy, [], actions, errors)
-    return {"actions": actions, "errors": errors}
+        clean.clean_auto(conn, policy, actions, errors)
+    out = {"at": host.iso(), "actions": actions, "errors": errors}
+    if args.record:
+        write_private(host.state_dir() / "last-tick.json", json.dumps(out, indent=2, sort_keys=True, default=str) + "\n")
+    return out
+
+
+def cmd_clean(args) -> dict:
+    only = None if args.only is None else [name.strip() for part in args.only for name in part.split(",") if name.strip()]
+    return clean.clean_pass(args.dry_run, args.deep, only, report=not args.no_report)
+
+
+def write_private(path: Path, text: str, mode: int = 0o600) -> None:
+    """Replace a file atomically: a reader sees the old file or the new one, never half of one."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, temporary = tempfile.mkstemp(dir=path.parent, prefix="." + path.name + "-")
+    with os.fdopen(fd, "w") as handle:
+        handle.write(text)
+    os.chmod(temporary, mode)
+    os.replace(temporary, path)
+
+
+SCHEDULE_LABEL = "io.github.trimreaper.tick"
+
+
+def launchctl(*args: str) -> tuple[int, str]:
+    done = subprocess.run(["launchctl", *args], capture_output=True, text=True, errors="replace", timeout=60)
+    return done.returncode, (done.stderr or done.stdout).strip()
+
+
+def cmd_schedule(args) -> dict:
+    """A launchd agent that runs `trimreaper tick` every few minutes: due jobs, scratch, evidence, and `clean` at cleanAtPercent."""
+    plist = Path.home() / "Library" / "LaunchAgents" / f"{SCHEDULE_LABEL}.plist"  # where launchd looks at login
+    domain = f"gui/{os.getuid()}"
+    tick = [sys.executable, "-m", "trimreaper", "tick", "--record"]
+    if sys.platform != "darwin":
+        when = f"*/{args.minutes} * * * *" if args.minutes < 60 else f"0 */{max(1, args.minutes // 60)} * * *"
+        raise host.HostError("schedule uses launchd, which is macOS only", f"run it from cron instead: {when} {' '.join(tick)}")
+    if args.action == "install":
+        env = {"PATH": os.environ.get("PATH", ""), "PYTHONPATH": str(Path(__file__).resolve().parent.parent)}
+        env.update({k: os.environ[k] for k in ("TRIMREAPER_CONFIG", "TRIMREAPER_HOME") if os.environ.get(k)})
+        spec = {"Label": SCHEDULE_LABEL, "ProgramArguments": tick, "StartInterval": args.minutes * 60, "RunAtLoad": True,
+                "ProcessType": "Background", "LowPriorityIO": True, "Nice": 10, "EnvironmentVariables": env,
+                "StandardOutPath": os.devnull, "StandardErrorPath": str(host.state_dir() / "schedule-errors.log")}
+        host.state_dir().mkdir(parents=True, exist_ok=True, mode=0o700)  # launchd does not create the error log's folder
+        write_private(plist, plistlib.dumps(spec).decode(), 0o644)
+        launchctl("bootout", f"{domain}/{SCHEDULE_LABEL}")  # an older copy, if any; absent is fine
+        code, text = launchctl("bootstrap", domain, str(plist))
+        if code != 0:
+            raise host.HostError(f"launchctl bootstrap failed ({code}): {text}", f"the agent file is {plist}; `trimreaper schedule remove` undoes it")
+    elif args.action == "remove":
+        code, text = launchctl("bootout", f"{domain}/{SCHEDULE_LABEL}")
+        if plist.exists():
+            plist.unlink()
+    loaded = launchctl("print", f"{domain}/{SCHEDULE_LABEL}")[0] == 0
+    last = host.state_dir() / "last-tick.json"
+    try:
+        last_tick = json.loads(last.read_text())
+    except (OSError, ValueError):
+        last_tick = None
+    return {"label": SCHEDULE_LABEL, "agentFile": str(plist), "installed": plist.exists(), "loaded": loaded,
+            "every": f"{plistlib.loads(plist.read_bytes()).get('StartInterval', 0) // 60} min" if plist.exists() else None,
+            "lastTick": last_tick, "errorsLog": str(host.state_dir() / "schedule-errors.log")}
 
 
 def cmd_owner_status(args) -> dict:
@@ -213,11 +286,14 @@ def cmd_config(args) -> dict:
             "scratchRoot": root("scratchRoot", host.reap_agent_scratch_root()),
             "releaseRoot": root("releaseRoot", host.reap_release_root()),
             "releaseEvidenceRoot": root("releaseEvidenceRoot", host.reap_release_evidence_root()),
-            "buildQueueStateDir": str(host.reap_queue_state()), "disk": host.disk_state(), "release": host.reap_release_marks()}
+            "buildQueueStateDir": str(host.reap_queue_state()), "disk": host.disk_state(), "release": host.reap_release_marks(),
+            "worktreeHomes": clean.clean_worktree_homes()}
 
 
 def cmd_core_digest(args) -> dict:
-    return {"version": __version__, "sha256": core_digest(), "lines": core_body().count("\n")}
+    body = clean_body()
+    return {"version": __version__, "sha256": core_digest(), "lines": core_body().count("\n"),
+            "clean": {"sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(), "lines": body.count("\n")}}
 
 
 def parser() -> argparse.ArgumentParser:
@@ -260,7 +336,21 @@ def parser() -> argparse.ArgumentParser:
     reap.add_argument("--dry-run", action="store_true", help="run every gate, remove and write nothing")
     reap.set_defaults(func=cmd_reap)
 
-    sub.add_parser("tick", help="one scheduled pass: every due job, scratch, archives and evidence expiry").set_defaults(func=cmd_tick)
+    tick = sub.add_parser("tick", help="one scheduled pass: due jobs, scratch, archives, evidence expiry, and clean at cleanAtPercent")
+    tick.add_argument("--record", action="store_true", help="also write the result to <stateDir>/last-tick.json")
+    tick.set_defaults(func=cmd_tick)
+
+    tidy = sub.add_parser("clean", help="free space outside jobs: tool caches, idle agent worktrees; reports models and the rest")
+    tidy.add_argument("--dry-run", action="store_true", help="plan, size and report; remove nothing")
+    tidy.add_argument("--deep", action="store_true", help="also the deep tier (Go module cache, unused Docker images)")
+    tidy.add_argument("--only", action="append", metavar="NAMES", help="comma-separated targets: " + ",".join(clean.CLEAN_NAMES))
+    tidy.add_argument("--no-report", action="store_true", help="skip the models/browsers/disk-image report")
+    tidy.set_defaults(func=cmd_clean)
+
+    schedule = sub.add_parser("schedule", help="run `tick` on a schedule with launchd (macOS)")
+    schedule.add_argument("action", choices=("install", "remove", "status"))
+    schedule.add_argument("--minutes", type=int, default=30, choices=range(5, 1441), metavar="5-1440", help="interval (default 30)")
+    schedule.set_defaults(func=cmd_schedule)
 
     owner = sub.add_parser("owner", help="the single-owner cleanup handoff").add_subparsers(dest="owner_command", required=True)
     owner.add_parser("status", help="the last run's phase and its token (expectedRun)").set_defaults(func=cmd_owner_status)
@@ -285,7 +375,7 @@ def parser() -> argparse.ArgumentParser:
 
     sub.add_parser("mcp", help="serve these commands as MCP tools over stdio (for agent clients)").set_defaults(func=None)
     sub.add_parser("config", help="the effective configuration and folder layout").set_defaults(func=cmd_config)
-    sub.add_parser("core-digest", help="SHA-256 of the engine an embedding host must vendor byte for byte").set_defaults(func=cmd_core_digest)
+    sub.add_parser("core-digest", help="SHA-256 of the engine (and of the clean pass) an embedding host must vendor byte for byte").set_defaults(func=cmd_core_digest)
     return top
 
 

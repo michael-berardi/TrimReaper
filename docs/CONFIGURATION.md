@@ -17,7 +17,8 @@ Paths are absolute or start with `~/`. Here `~` is the reap home (`home`), not t
 | `releaseEvidenceRoot` | off | Per-version release evidence: `releaseEvidenceRoot/<version>` for the app, `releaseEvidenceRoot/<product>-<version>` for its components. App versions older than the installed one go, except the rollback; each component keeps its newest two. |
 | `release.installedApp`, `release.rollbackApp` | unset | macOS app bundles whose versions are kept: the installed version, the single rollback, and anything newer than installed. While either is unknown, every release candidate and every app-version evidence folder is kept. |
 | `buildQueueStateDir` | `stateDir/build-queue` | The lock folder of a build queue. Before removing build output, the reaper takes `projects/<name>-<sha256(path)[:16]>.lock` for every enclosing project, so a build in progress keeps its output. |
-| `diskVolume` | `/System/Volumes/Data`, else `/` | The volume measured for disk pressure. |
+| `diskVolume` | `/System/Volumes/Data`, else `/` | The volume measured for disk pressure and for what `clean` freed. |
+| `worktreeHomes` | the known agent folders | Folders where agent tools keep worktrees outside the repository, searched three levels deep for worktrees whose repository is then listed with `git worktree list`. Default: `$CODEX_HOME/worktrees` (or `~/.codex/worktrees`), `~/.cursor/worktrees`, `~/conductor/workspaces`, `~/.superset/worktrees`, `~/.claude-squad/worktrees`, `$TMPDIR/vibe-kanban/worktrees`. `[]` searches only the repositories in `cloneBases`. |
 | `policy` | see below | Retention rules. |
 
 ## Policy
@@ -31,6 +32,8 @@ Paths are absolute or start with `~/`. Here `~` is the reap home (`home`), not t
 | `cloneArchive` | `"archive"` | `"archive"` saves work no remote holds before an expired folder goes. Any other value keeps such folders. |
 | `cloneProtectedCopies` | `"keep"` | `"keep"` keeps every clone that holds `.env*`, `.dev.vars*`, `.wrangler` or `.vercel`. `"remove"` archives those owner-only (`protected.tar.gz`) and lets them go with the clone; it needs `cloneArchive` `"archive"`. Copies inside dependency or build folders (`node_modules/.env` ...) are not archived: they go with the folder. |
 | `diskWarnPercent` | `85` | At or above this used percent, the build output of parked or interrupted jobs goes too. Checked during a `tick` that has a finished job due. |
+| `cleanAtPercent` | `95` | At or above this used percent, `tick` runs `trimreaper clean` (the safe tier, no report), at most once an hour. `0` turns it off. |
+| `worktreeIdleDays` | `7` | A linked git worktree no job owns is removed by `clean` after this many days without a change, and every other check. `0` keeps them all. |
 
 ## Jobs
 

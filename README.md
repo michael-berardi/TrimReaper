@@ -8,6 +8,10 @@ disposable: the job that made it has finished, git shows nothing would be lost, 
 secrets. When a folder still holds unsaved work, TrimReaper archives that work first and verifies the archive. Before it
 removes anything of yours, it writes the plan to a durable receipt.
 
+It also cleans the rest of a developer machine the same careful way: tool caches through each tool's own cleaner,
+and the worktrees that Claude Code, Codex, Cursor and other agents leave behind. It can run by itself when the disk
+fills up. It reads names, sizes and times, never the contents of your files.
+
 It is the reaper engine of UltraTerm, released on its own so any agent setup can use it.
 
 ## Install
@@ -16,7 +20,7 @@ Requires macOS, Python 3.10 or newer, and `git`, `lsof` and `ps`. The `python3` 
 newer one comes from [python.org](https://www.python.org/downloads/) or Homebrew (`brew install python`).
 
 ```sh
-pipx install "git+https://github.com/michael-berardi/TrimReaper@v0.1.0"
+pipx install "git+https://github.com/michael-berardi/TrimReaper@v0.2.0"
 trimreaper --version
 ```
 
@@ -24,7 +28,7 @@ Or run it from a checkout with no install: `PYTHONPATH=src python3 -m trimreaper
 
 ## Quick start
 
-TrimReaper only touches folders that belong to jobs it knows about. A job has an id like `J-0042`, and its clone's
+The job reaper only touches folders that belong to jobs it knows about (`trimreaper clean`, below, needs no jobs). A job has an id like `J-0042`, and its clone's
 folder name carries the same number (`myapp-j0042`, `j0042-myapp`).
 
 ```sh
@@ -45,7 +49,37 @@ trimreaper reap --job J-0042
 trimreaper tick
 ```
 
-`tick` runs once and exits. To run it on a schedule, call it from your own cron job, launchd agent or agent loop.
+`tick` runs once and exits. `trimreaper schedule install` runs it every 30 minutes with launchd (macOS); elsewhere,
+call it from cron or your agent loop. When the disk is 95% full or more, `tick` also runs `trimreaper clean`
+(below), at most once an hour.
+
+## Clean the whole machine
+
+`trimreaper clean` frees space that no job owns. It needs no setup.
+
+```sh
+trimreaper clean --dry-run   # what would go, what stays and why, plus a report of models and other large things
+trimreaper clean             # do it
+trimreaper clean --only npm,worktrees
+trimreaper clean --deep      # also the Go module cache, unused Docker images and unavailable simulators
+```
+
+| What | How |
+|---|---|
+| npm, pnpm, yarn (1.x), bun, uv, pip, Go build, Homebrew caches | The tool's own cleaner (`npm cache clean --force`, `uv cache prune`, `brew cleanup --prune=all` ...), run from your home folder and skipped while that tool runs. Homebrew also drops old versions of installed formulae; it never uninstalls one (`HOMEBREW_NO_AUTOREMOVE`) |
+| Docker build cache | `docker builder prune -af`, only when Docker is already running on a local socket (never a remote `DOCKER_HOST` or context, never volumes) |
+| Cargo's registry, Xcode's DerivedData | Folder by folder through the same guarded removal as job folders, skipped while Cargo, rust-analyzer or Xcode runs |
+| Agent worktrees | A linked git worktree no job owns goes after `worktreeIdleDays` (7) without a change, when it is unlocked and clean (edits hidden by `--skip-worktree` or `--assume-unchanged` count as changes), git ignores nothing in it but build output, it holds no `.env*` or other protected name, no unfinished job declares it, no process uses it, and every commit its HEAD ever pointed at is on a branch, tag or remote. Its branch stays. A worktree whose folder is already gone is forgotten by its repository after 30 days, under the same commit check |
+| Go module cache, unused Docker images, unavailable simulators | Only with `--deep` (`xcrun simctl delete unavailable` also deletes the app data of simulators the selected Xcode cannot run) |
+| Local models (Hugging Face, Ollama, LM Studio), Playwright browsers, Docker's disk image, local snapshots | Reported with their size. Never removed |
+
+Worktrees are found through `git worktree list` in every repository in `cloneBases`, and in the folders where agent tools
+keep their own: `~/.codex/worktrees` (or `$CODEX_HOME/worktrees`), `~/.cursor/worktrees`, `~/conductor/workspaces`,
+`~/.superset/worktrees`, `~/.claude-squad/worktrees` and Vibe Kanban's temporary folder. Claude Code's
+`<repo>/.claude/worktrees` sit inside the repository and are found through it. `worktreeHomes` replaces the list.
+
+What was freed is the volume's free space after the pass minus before it, not a sum of folder sizes. A tool's cleaner
+that fails is listed with its exit status and last line of output, and the command exits 3.
 
 Every command prints one JSON document on stdout. Exit status:
 
@@ -123,7 +157,7 @@ error that names it:
 {
   "cloneBases": [{"path": "~/dev"}],
   "scratchRoot": "~/.cache/agent-scratch",
-  "policy": {"cloneExpiryDays": 3, "evidenceExpiryDays": 14}
+  "policy": {"cloneExpiryDays": 3, "evidenceExpiryDays": 14, "cleanAtPercent": 95}
 }
 ```
 
@@ -135,6 +169,7 @@ error that names it:
 - Record the job when it starts (`job add`) and when it ends (`job status <id> done|failed|cancelled`). Name clone
   folders with the job number.
 - Prefer the MCP tools when your client has them (below); the command line works the same way.
+- Low on disk? `clean` with a dry run first, then without. Leave models and other reported items to a person.
 - Read `trimreaper status --items` before asking a person why the disk is full. `summary.reasonActions` says what would
   free each kept folder.
 - Never delete agent output with `rm -rf`. Mark folders you need to keep (`trimreaper mark <folder> evidence`).
@@ -142,8 +177,9 @@ error that names it:
 ## MCP server
 
 `trimreaper mcp` serves the same commands as tools to any MCP client over stdio: `job_add`, `job_status`, `job_list`,
-`reap_status` (read-only), `reap` and `mark`. `reap` is a dry run unless the call passes `"dryRun": false`, and every
-check above still applies. Acknowledging a stopped run and changing the policy stay on the command line, with a person.
+`reap_status` (read-only), `reap`, `clean` and `mark`. `reap` and `clean` are dry runs unless the call passes
+`"dryRun": false`, and every check above still applies. Acknowledging a stopped run, changing the policy and installing
+the schedule stay on the command line, with a person.
 
 Claude Code:
 
@@ -159,8 +195,9 @@ Other clients (Claude Desktop, Cursor and similar), in their MCP config:
 
 ## Embedding
 
-The engine (`src/trimreaper/core.py`) runs either with the standalone host in this package or vendored byte for byte
-into another program that supplies its own job store and folder layout. See [docs/EMBEDDING.md](docs/EMBEDDING.md).
+The engine (`src/trimreaper/core.py`) and the clean pass (`src/trimreaper/clean.py`) run either with the standalone host
+in this package or vendored byte for byte into another program that supplies its own job store and folder layout. See
+[docs/EMBEDDING.md](docs/EMBEDDING.md).
 
 ## More
 

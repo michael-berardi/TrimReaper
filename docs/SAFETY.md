@@ -48,6 +48,30 @@ finishes, in case it is resumed. A **build queue** is any tool that takes a per-
 
 These also remove files, each with its own checks:
 
+- **`trimreaper clean`** holds the same single-owner lock and writes a plan receipt before and a result receipt after
+  every action.
+  - A tool cache is cleaned only by its own tool, run from the home folder, and only when no process of that tool runs
+    (checked again right before the command). TrimReaper does not delete inside it. Docker is touched only on a local
+    socket; Homebrew runs with `HOMEBREW_NO_AUTOREMOVE`.
+  - A Cargo registry or Xcode DerivedData folder goes through the same fence, protected scan (no `.env*`, `.wrangler`,
+    `.vercel`, nested repository or retention marker other than `disposable`), fresh `lsof`/`ps` probe and
+    descriptor-relative removal as a job folder, with the identities of protected names beside it re-taken afterwards. A
+    retention marker on the cache root or anywhere inside the folder keeps it.
+  - An agent worktree passes, in order: unlocked; not named for a job (`*-jNNNN*` folders are the job reaper's); its
+    parent may be a removal root; no retention marker but `disposable`; `worktreeIdleDays` without a change to the
+    folder, its top-level entries, its HEAD, index or HEAD reflog; no unfinished job declares it or a folder in or
+    around it; the protected scan; it is still exactly the linked worktree its repository records (a `.git` file naming
+    `<repo>/.git/worktrees/<n>`, whose `gitdir` names the folder back, and git agrees), so a full repository standing at
+    an old worktree path is never removed; no lock file now; the engine's closed clean check (no index flag that hides
+    an edit, no tracked change, no untracked file); every ignored file known build output; every commit in its HEAD and
+    a readable HEAD reflog contained in a branch, tag or remote-tracking ref; and, last, no process uses it. The removal
+    re-runs all of them with fresh probes, then removes the folder through the fence and makes its repository forget
+    exactly that worktree (never `git worktree prune`). The branch is never deleted.
+  - A worktree whose folder is gone is forgotten only when the folder is still gone, its entry is 30 days old and
+    unlocked, the folder's parent exists (an empty mount point passes this, as in the engine's archive rule) and the
+    commit check passes.
+  - Models, browser builds, Docker's disk image and local snapshots are only measured.
+
 - **Evidence expiry** (`reap --job ... --expire-evidence`, and `tick`) unlinks old screenshots, recordings, traces and
   logs one file at a time. It holds the same owner lock and job authority, writes plan and result receipts, records each
   file's name and SHA-256 in `evidence-expired.jsonl` first, and skips any folder holding a marker, `.git`, a protected

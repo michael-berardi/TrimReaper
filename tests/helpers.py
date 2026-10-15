@@ -13,7 +13,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from trimreaper import cli
+from trimreaper import clean, cli
 
 GIT_ENV = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com", "GIT_COMMITTER_NAME": "t",
            "GIT_COMMITTER_EMAIL": "t@example.com", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}
@@ -34,9 +34,15 @@ class Home(unittest.TestCase):
             path.mkdir(parents=True)
         self.config_file = self.tmp / "config.json"
         self.write_config({})
-        env = mock.patch.dict(os.environ, {"TRIMREAPER_HOME": str(self.home), "TRIMREAPER_CONFIG": str(self.config_file), **GIT_ENV})
+        env = mock.patch.dict(os.environ, {"TRIMREAPER_HOME": str(self.home), "TRIMREAPER_CONFIG": str(self.config_file),
+                                           "HOME": str(self.home), **GIT_ENV})
         env.start()
         self.addCleanup(env.stop)
+        # The clean pass never reaches this machine's tools, caches or disk level from a test: none by default, fakes per test.
+        for patch in (mock.patch.object(clean, "CLEAN_TOOLS", ()), mock.patch.object(clean, "CLEAN_FOLDERS", ()),
+                      mock.patch.object(clean, "disk_state", lambda: {"path": str(self.tmp), "usedPercent": 50, "freeBytes": 10 ** 12})):
+            patch.start()
+            self.addCleanup(patch.stop)
         self.addCleanup(self.remove_tmp)
 
     def remove_tmp(self):
@@ -44,7 +50,7 @@ class Home(unittest.TestCase):
         subprocess.run(["rm", "-rf", str(self.tmp)], capture_output=True)
 
     def write_config(self, extra: dict):
-        config = {"cloneBases": [{"path": "~/dev"}], **self.config_extra, **extra}
+        config = {"cloneBases": [{"path": "~/dev"}], "worktreeHomes": [], **self.config_extra, **extra}
         self.config_file.write_text(json.dumps(config))
 
     # ---- the CLI ---------------------------------------------------------------------------------------------------
@@ -55,7 +61,7 @@ class Home(unittest.TestCase):
             code = cli.main(list(args))
         if code != expect:
             self.fail(f"trimreaper {' '.join(args)} exited {code}, expected {expect}\nstdout: {out.getvalue()}\nstderr: {err.getvalue()}")
-        text = out.getvalue() if code == 0 else err.getvalue()
+        text = out.getvalue() if code in (0, 3) else err.getvalue()  # 3: the pass ran; its JSON (naming the errors) is on stdout
         return json.loads(text) if text.strip() else None
 
     def state(self) -> sqlite3.Connection:

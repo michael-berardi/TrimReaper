@@ -45,6 +45,10 @@ DEFAULT_POLICY = {
     "cloneProtectedCopies": "keep",
     # Disk pressure: at or above this used percent, idle (parked/interrupted) jobs lose their derived build output too.
     "diskWarnPercent": 85,
+    # `tick` runs `trimreaper clean` when the volume is at or above this used percent (at most hourly); 0 turns it off.
+    "cleanAtPercent": 95,
+    # A linked git worktree no job owns goes after this many days without a change (and every other check); 0 keeps them all.
+    "worktreeIdleDays": 7,
 }
 
 DEFAULT_CONFIG = {
@@ -59,6 +63,7 @@ DEFAULT_CONFIG = {
     "release": {"installedApp": None, "rollbackApp": None},  # macOS app bundles whose versions are kept
     "buildQueueStateDir": None,       # a build queue's lock folder; default: <stateDir>/build-queue
     "diskVolume": None,               # volume measured for disk pressure; default: /System/Volumes/Data, else /
+    "worktreeHomes": None,            # where agent tools keep worktrees; default: the known homes (docs/CONFIGURATION.md)
     "policy": {},
 }
 
@@ -118,6 +123,9 @@ def check_config(merged: dict, path: Path) -> None:
             raise HostError(f"{path}: cloneBases entry {json.dumps(base)} needs a \"path\" and may have a \"prefix\" (unknown: {', '.join(extra) or 'none'})")
         if "prefix" in base and (not isinstance(base["prefix"], str) or not base["prefix"]):
             raise HostError(f"{path}: cloneBases prefix must be a non-empty string, not {json.dumps(base['prefix'])}")
+    homes = merged["worktreeHomes"]
+    if homes is not None and (not isinstance(homes, list) or not all(isinstance(h, str) for h in homes)):
+        bad("worktreeHomes", "a list of paths or null")
     release = merged["release"]
     if not isinstance(release, dict) or set(release) - {"installedApp", "rollbackApp"} \
             or any(v is not None and not isinstance(v, str) for v in release.values()):
@@ -128,7 +136,7 @@ def check_config(merged: dict, path: Path) -> None:
     # Every path is checked now, at load: a bad one found later would fail inside a sweep and stop it.
     paths = [merged[k] for k in ("stateDir", "cacheRoot", "archiveRoot", "scratchRoot", "releaseRoot", "releaseEvidenceRoot",
                                  "buildQueueStateDir", "diskVolume") if merged[k] is not None]
-    paths += [b["path"] for b in bases] + [v for v in release.values() if v is not None]
+    paths += [b["path"] for b in bases] + [v for v in release.values() if v is not None] + list(homes or ())
     for value in paths:
         path_form(value)
     if merged["home"] is not None and not Path(merged["home"]).expanduser().is_absolute():
@@ -158,9 +166,13 @@ def check_policy(policy: dict) -> None:
         value = merged[key]
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             raise HostError(f"policy {key} must be a whole number of days (0 = never), not {json.dumps(value)}")
-    value = merged["diskWarnPercent"]
-    if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 100:
-        raise HostError(f"policy diskWarnPercent must be a whole number from 1 to 100, not {json.dumps(value)}")
+    for key, low in (("diskWarnPercent", 1), ("cleanAtPercent", 0)):
+        value = merged[key]
+        if not isinstance(value, int) or isinstance(value, bool) or not low <= value <= 100:
+            raise HostError(f"policy {key} must be a whole number from {low} to 100, not {json.dumps(value)}")
+    value = merged["worktreeIdleDays"]
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise HostError(f"policy worktreeIdleDays must be a whole number of days (0 = never), not {json.dumps(value)}")
     if merged["cloneArchive"] not in ("archive", "keep"):
         raise HostError(f'policy cloneArchive must be "archive" or "keep", not {json.dumps(merged["cloneArchive"])}')
     if merged["cloneProtectedCopies"] not in ("keep", "remove"):
@@ -235,6 +247,12 @@ def reap_receipt_dir() -> Path:
 
 def reap_queue_state() -> Path:
     return configured("buildQueueStateDir") or state_dir() / "build-queue"
+
+
+def reap_worktree_homes() -> list[Path] | None:
+    """Folders where agent tools keep worktrees, as configured; None means the clean pass's built-in list."""
+    homes = config().get("worktreeHomes")
+    return None if homes is None else [expand(path) for path in homes]
 
 
 def app_version(app: Path | None) -> str | None:

@@ -32,7 +32,7 @@ class Server(Home):
         self.assertEqual(len(replies), 3, "a notification gets no answer")
         self.assertEqual(replies[0]["result"]["protocolVersion"], "2025-06-18")
         names = [t["name"] for t in replies[1]["result"]["tools"]]
-        self.assertEqual(names, ["job_add", "job_status", "job_list", "reap_status", "reap", "mark"])
+        self.assertEqual(names, ["job_add", "job_status", "job_list", "reap_status", "reap", "clean", "mark"])
         self.assertNotIn("owner_acknowledge", names)
         self.assertEqual(replies[2]["error"]["code"], -32601)
 

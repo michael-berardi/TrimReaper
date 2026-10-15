@@ -8,6 +8,22 @@ so a host can paste it, byte for byte, into its own module after defining them. 
 its copy and fail its tests when the copy no longer matches. Change the engine here, release it, then re-vendor; never
 edit an embedded copy.
 
+## The clean pass
+
+`src/trimreaper/clean.py` holds a second section, between `# >>> trimreaper clean >>>` and `# <<< trimreaper clean <<<`.
+It is vendored the same way, after the engine, and calls the engine's gates. Every name it defines starts with `clean_` or
+`CLEAN_`. `trimreaper core-digest` prints its SHA-256 under `clean`. Besides the engine's needs it reads `Counter`
+(collections), `ThreadPoolExecutor` (concurrent.futures) and one more host name:
+
+| Name | What it returns |
+|---|---|
+| `reap_worktree_homes()` | Folders where agent tools keep worktrees, as `Path`s, or `None` for the built-in list. |
+
+Its entry points are `clean_pass(dry_run, deep=False, only=None, report=True)` and `clean_auto(conn, policy, actions,
+errors)`, which a host's scheduled pass calls (it reads `cleanAtPercent` and `worktreeIdleDays` from the policy, defaulting
+to 95 and 7, and the `meta` key `clean:auto`). An embedded copy runs under the host's own single-owner lock, so a host
+never adds a second cleaner.
+
 ## Modules the host imports
 
 `errno`, `fcntl`, `hashlib`, `json`, `os`, `plistlib`, `pwd`, `re`, `shutil`, `sqlite3`, `stat`, `subprocess`,
