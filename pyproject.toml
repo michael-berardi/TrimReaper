@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trimreaper"
+version = "0.1.0"
+description = "Reclaims the disk that AI agent swarms leave behind (clones, build output, scratch, evidence) through one guarded deletion path."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [{ name = "Michael Berardi" }]
+keywords = ["disk-cleanup", "ai-agents", "agent-swarm", "git", "garbage-collection", "macos"]
+classifiers = [
+  "Environment :: Console",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3",
+  "Topic :: System :: Filesystems",
+  "Topic :: Utilities",
+]
+
+[project.urls]
+Homepage = "https://github.com/michael-berardi/TrimReaper"
+Issues = "https://github.com/michael-berardi/TrimReaper/issues"
+
+[project.scripts]
+trimreaper = "trimreaper.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
