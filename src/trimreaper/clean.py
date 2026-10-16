@@ -501,7 +501,12 @@ def clean_browser_builds(root: str) -> list[tuple[str, str, int]]:
 
 def clean_rust_targets(errors: list) -> list[tuple[str, str]]:
     """Find targets in repositories, including nested crates, without entering generated trees."""
-    roots = {clean_home(), *(str(base) for base, _ in reap_clone_bases()), *clean_worktree_homes()}
+    # The usual code and build homes, never the whole home: a home-wide walk ran out of its entry budget on a real machine
+    # (discovery-incomplete) and found nothing. Clone bases and worktree homes add the host's own layout.
+    homes = [clean_home(name) for name in ("dev", "Developer", "src", "code", "projects", "repos", "work", ".cache")]
+    if os.environ.get("TMPDIR"):
+        homes.append(os.path.realpath(os.environ["TMPDIR"]))
+    roots = {*homes, *(str(base) for base, _ in reap_clone_bases()), *clean_worktree_homes()}
     # Linked worktrees may live outside the home and configured clone bases.
     roots.update(entry["path"] for entry in clean_worktree_entries(errors, []) if entry["kind"] == "worktree")
     found, seen, count = set(), set(), 0
