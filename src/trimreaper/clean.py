@@ -160,7 +160,7 @@ CLEAN_FOLDERS = (
      "roots": lambda: [clean_home("Library", "Developer", "Xcode", "DerivedData")]},
 )
 CLEAN_WORKTREES = "worktrees"
-CLEAN_EXTRA_NAMES = ("rust-build-output", "agent-leftovers", "playwright")
+CLEAN_EXTRA_NAMES = ("rust-build-output", "project-dependencies", "agent-leftovers", "browser-clones", "playwright")
 CLEAN_RUST_BUSY = ("cargo", "rustc", "rust-analyzer", "clippy", "clippy-driver", "cargo-clippy")
 CLEAN_NAMES = tuple(t["name"] for t in CLEAN_TOOLS) + tuple(f["name"] for f in CLEAN_FOLDERS) + (CLEAN_WORKTREES,) + CLEAN_EXTRA_NAMES
 
@@ -300,18 +300,20 @@ def clean_worktree_gitdir(repo: str, path: str) -> str | None:
 
 
 def clean_newest_change(path: str, gitdir: str | None) -> float:
-    """The newest mtime among the worktree folder, its top-level entries and its HEAD, index and HEAD reflog."""
-    stamps = [os.lstat(path).st_mtime]
+    """The newest mtime among the folder's top-level entries and its HEAD, index and HEAD reflog. The folder's own mtime and the
+    regenerable output folders are left out: removing one output (or a clean pass removing them) must not make the project look
+    freshly worked on."""
+    stamps = []
     with os.scandir(path) as entries:
         for entry in entries:
-            if not reap_protected(entry.name):
+            if not reap_protected(entry.name) and entry.name not in CLEAN_PROJECT_OUTPUTS and entry.name != "target":
                 stamps.append(entry.stat(follow_symlinks=False).st_mtime)
     for name in ("HEAD", "index", os.path.join("logs", "HEAD")):
         try:
             stamps.append(os.lstat(os.path.join(gitdir, name)).st_mtime) if gitdir else None
         except OSError:
             pass
-    return max(stamps)
+    return max(stamps) if stamps else os.lstat(path).st_mtime
 
 
 def clean_linked_identity(entry: dict) -> None:
@@ -460,9 +462,40 @@ def clean_leftover_roots() -> list[tuple[str, bool]]:
     return roots
 
 
-def clean_stale_tree(path: str) -> None:
-    """Every entry must be six hours idle; bounded metadata-only walk, never follow links."""
-    cutoff, count = now() - 6 * 3600, 0
+# Temp folders any tool may leave behind: a user's own folder in the shared temp folder after a day without a change, one in the per-user
+# temp folder after three days. Names the system or a running app manages there are never candidates.
+CLEAN_TEMP_IDLE_HOURS = {"shared": 24, "user": 72}
+CLEAN_TEMP_SYSTEM = re.compile(r"(?i)^(?:\.|com\.apple\.|TemporaryItems$|.*\.(?:sock|socket|pid|lock)$|launchd|tmux-|ssh-|powerlog|"
+                               r"CoreSimulator|xcrun_db|KSOutOfProcessFetcher)")
+
+
+def clean_temp_roots() -> list[tuple[str, int]]:
+    roots = []
+    shared = os.path.realpath("/tmp")
+    if os.path.isdir(shared):
+        roots.append((shared, CLEAN_TEMP_IDLE_HOURS["shared"]))
+    if os.environ.get("TMPDIR") and os.path.realpath(os.environ["TMPDIR"]) != shared:
+        roots.append((os.path.realpath(os.environ["TMPDIR"]), CLEAN_TEMP_IDLE_HOURS["user"]))
+    return roots
+
+
+def clean_clone_roots() -> list[str]:
+    """macOS code-sign clones: a browser copies its own app bundle into the per-user `X` folder at launch and removes the copy when it
+    quits; a browser that is killed (automation, a crash) leaves its copy behind, one per launch, and an updated browser's old copies
+    hold the old version's blocks. Every `<bundle id>.code_sign_clone` folder there."""
+    tmp = os.environ.get("TMPDIR")
+    if not tmp or os.uname().sysname != "Darwin":
+        return []
+    base = os.path.join(os.path.dirname(os.path.realpath(tmp).rstrip("/")), "X")
+    try:
+        return sorted(e.path for e in os.scandir(base) if e.name.endswith(".code_sign_clone") and e.is_dir(follow_symlinks=False))
+    except OSError:
+        return []
+
+
+def clean_stale_tree(path: str, hours: int = 6) -> None:
+    """Every entry must be `hours` idle; bounded metadata-only walk, never follow links."""
+    cutoff, count = now() - hours * 3600, 0
     stack = [(path, 0)]
     while stack:
         folder, depth = stack.pop()
@@ -472,7 +505,7 @@ def clean_stale_tree(path: str) -> None:
         if info.st_uid != os.getuid():
             raise ReapRefused("not-owned-by-user")
         if info.st_mtime > cutoff:
-            raise ReapRefused("recent:less-than-6h")
+            raise ReapRefused(f"recent:less-than-{hours}h")
         with os.scandir(folder) as entries:
             for entry in entries:
                 count += 1
@@ -482,7 +515,7 @@ def clean_stale_tree(path: str) -> None:
                 if info.st_uid != os.getuid():
                     raise ReapRefused("not-owned-by-user")
                 if info.st_mtime > cutoff:
-                    raise ReapRefused("recent:less-than-6h")
+                    raise ReapRefused(f"recent:less-than-{hours}h")
                 if entry.is_dir(follow_symlinks=False):
                     stack.append((entry.path, depth + 1))
 
@@ -514,10 +547,37 @@ CLEAN_RUST_SCAN_ENTRIES = 3_000_000
 
 def clean_rust_targets(errors: list) -> list[tuple[str, str]]:
     """Find targets in repositories, including nested crates, without entering generated trees."""
+    return [(path, repo) for path, repo in clean_repo_walk(errors, frozenset({"target"}), "rust-build-output")]
+
+
+# Dependency stores and generated output a project recreates with one install or build. Each is removed only when git ignores it,
+# its manifest is beside it, and the project is idle (clean_project_gates). `dist` and `build` are never here: some projects commit them.
+CLEAN_PROJECT_OUTPUTS = {"node_modules": ("package.json",), ".next": ("package.json",), ".astro": ("package.json",), ".turbo": ("package.json",),
+                         ".svelte-kit": ("package.json",), ".nuxt": ("package.json",), ".parcel-cache": ("package.json",), ".vite": ("package.json",),
+                         ".venv": ("pyproject.toml", "requirements.txt", "requirements-dev.txt", "uv.lock", "Pipfile", "setup.py"),
+                         ".pytest_cache": (), ".mypy_cache": (), ".ruff_cache": ()}
+
+
+CLEAN_PROJECT_JOB_IDLE_HOURS = 6
+CLEAN_CODE_HOMES = ("dev", "Developer", "src", "code", "projects", "repos", "work", ".cache")
+
+
+def clean_project_outputs(errors: list) -> list[tuple[str, str]]:
+    """Every regenerable dependency or output folder inside a repository in the code homes, with the repository it belongs to."""
+    found = []
+    for path, repo in clean_repo_walk(errors, frozenset(CLEAN_PROJECT_OUTPUTS), "project-dependencies"):
+        manifests = CLEAN_PROJECT_OUTPUTS[os.path.basename(path)]
+        if not manifests or any(os.path.isfile(os.path.join(os.path.dirname(path), m)) for m in manifests):
+            found.append((path, repo))
+    return found
+
+
+def clean_repo_walk(errors: list, wanted: frozenset, label: str) -> list[tuple[str, str]]:
+    """Folders named in `wanted` inside repositories, without entering them or any generated tree."""
     # The usual code and build homes, never the whole home: a home-wide walk ran out of its entry budget on a real machine
     # (discovery-incomplete) and found nothing. Clone bases and worktree homes add the host's own layout.
     # (Temp-folder build roots are the agent-leftovers target's job: the temp folder holds unreadable system folders.)
-    homes = [clean_home(name) for name in ("dev", "Developer", "src", "code", "projects", "repos", "work", ".cache")]
+    homes = [clean_home(name) for name in CLEAN_CODE_HOMES]
     roots = {*homes, *(str(base) for base, _ in reap_clone_bases()), *clean_worktree_homes()}
     # Linked worktrees may live outside the home and configured clone bases.
     roots.update(entry["path"] for entry in clean_worktree_entries(errors, []) if entry["kind"] == "worktree")
@@ -537,16 +597,18 @@ def clean_rust_targets(errors: list) -> list[tuple[str, str]]:
                 entries = list(scan)
             count += len(entries)
             if count > CLEAN_RUST_SCAN_ENTRIES:
-                errors.append({"clean": "rust-build-output", "error": f"discovery-incomplete: more than {CLEAN_RUST_SCAN_ENTRIES} entries"})
+                errors.append({"clean": label, "error": f"discovery-incomplete: more than {CLEAN_RUST_SCAN_ENTRIES} entries"})
                 break
             if any(e.name == ".git" and not e.is_symlink() for e in entries):
                 in_repo, repo = True, folder
             for entry in entries:
                 if not entry.is_dir(follow_symlinks=False) or reap_protected(entry.name):
                     continue
-                if entry.name == "target":
+                if entry.name in wanted:
                     if in_repo:
                         found.add((entry.path, repo))
+                    continue
+                if entry.name == "target":
                     continue
                 if entry.name in CLEAN_RUST_SCAN_SKIP or (folder in homes and entry.name in CLEAN_RUST_SCAN_TOOL_CACHES):
                     continue
@@ -554,7 +616,7 @@ def clean_rust_targets(errors: list) -> list[tuple[str, str]]:
                 if in_repo or depth < CLEAN_RUST_SCAN_REPO_SEARCH_DEPTH:
                     stack.append((entry.path, in_repo, depth + 1, repo))
         except OSError as error:
-            errors.append({"clean": "rust-build-output", "error": clean_tilde(folder) + ":" + reap_named(error)})
+            errors.append({"clean": label, "error": clean_tilde(folder) + ":" + reap_named(error)})
     return sorted(found)
 
 
@@ -563,16 +625,66 @@ def clean_rust_lock_paths(target: str, repo: str) -> list[Path]:
     return [reap_queue_lock(repo), Path(target, ".cargo-lock"), Path(target, ".cargo-build-lock"), *reap_cargo_locks(target)]
 
 
+def clean_project_gates(entry: dict, table: dict | None) -> None:
+    """A dependency or output folder goes only when git ignores it, no unfinished job claims its project, the project has been idle
+    `idleHours`, and no process holds anything in the project. Cheapest first."""
+    path, repo = entry["path"], entry["repo"]
+    code, _ = reap_git(repo, "check-ignore", "-q", "--", path)
+    if code == 1:
+        raise ReapRefused("tracked-or-not-ignored")
+    if code != 0:
+        raise ReapRefused(f"git-error:check-ignore:{code}")
+    # A copy made for a job (site-j0042, .worktrees/J-0042): kept while that job is unfinished, and once it is finished its output
+    # needs only CLEAN_PROJECT_JOB_IDLE_HOURS of quiet. Every other project needs the operator's idleHours.
+    # Only a job with a live worker (starting or running) protects regenerable output; a parked, blocked or queued job's project still
+    # waits the full idleHours. A declared folder that is a whole code home (the dev folder, the home folder) names no project and protects nothing.
+    limit = entry["idleHours"]
+    named = list(dict.fromkeys(reap_job_ids(*Path(repo).parts[-2:]) + [f"J-{int(n):04d}" for n in re.findall(r"(?:^|/)J-(\d{3,5})(?=/|$)", repo)]))
+    homes = {reap_canon(h) for h in [clean_home(), *(clean_home(n) for n in CLEAN_CODE_HOMES)] if os.path.isdir(h)}
+    with db() as conn:
+        unfinished = rows(conn, "SELECT * FROM jobs WHERE status NOT IN ('done','failed','cancelled')")
+        named_states = {r["status"] for r in rows(conn, "SELECT status FROM jobs WHERE id IN (%s)" % ",".join("?" * len(named)), tuple(named))} if named else set()
+    for job in unfinished:
+        live = job["status"] in ("starting", "running")
+        if job["id"] in named:
+            if live:
+                raise ReapRefused(f"in-use-by-running-job:{job['id']}")
+            continue
+        for declared in reap_declared_paths(job):
+            if reap_canon(declared) in homes:
+                continue
+            if live and (reap_inside(declared, repo) or reap_inside(repo, declared)):
+                raise ReapRefused(f"in-use-by-running-job:{job['id']}")
+    if named_states and not named_states - {"done", "failed", "cancelled"}:
+        limit = min(limit, CLEAN_PROJECT_JOB_IDLE_HOURS)
+    dot_git = os.path.join(repo, ".git")
+    gitdir = clean_pointer_target(dot_git) if os.path.isfile(dot_git) else dot_git
+    idle = (now() - clean_newest_change(repo, gitdir)) / 3600
+    if idle < limit:
+        raise ReapRefused(f"recent:{idle:.0f}h-of-{limit}h")
+    reap_holders(repo, repo, table)
+
+
 def clean_extra_gates(entry: dict, table: dict | None = None) -> None:
     path, kind = entry["path"], entry["name"]
+    if kind == "project-dependencies":
+        clean_project_gates(entry, table)
     clean_folder_gates(path)
-    if kind == "rust-build-output":
+    if kind == "project-dependencies":
+        pass
+    elif kind == "rust-build-output":
         busy = sorted(set(CLEAN_RUST_BUSY) & clean_running())
         if busy:
             raise ReapRefused("in-use:" + ",".join(busy))
         clean_folder_gates(entry["target"])
     elif kind == "agent-leftovers":
-        clean_stale_tree(path)
+        clean_stale_tree(path, entry.get("idleHours", 6))
+    elif kind == "browser-clones":
+        info = os.lstat(path)
+        if info.st_uid != os.getuid():
+            raise ReapRefused("not-owned-by-user")
+        if now() - info.st_mtime < 3600:
+            raise ReapRefused("recent:less-than-1h")
     else:
         builds = clean_browser_builds(entry["root"])
         if not any(browser == entry["browser"] and build > entry["build"] for _, browser, build in builds):
@@ -580,7 +692,7 @@ def clean_extra_gates(entry: dict, table: dict | None = None) -> None:
     reap_holders(entry.get("target", path), entry.get("target", path), table)
 
 
-def clean_extra_entries(only: set, errors: list) -> list[dict]:
+def clean_extra_entries(only: set, errors: list, idle_hours: int = 48) -> list[dict]:
     entries = []
     def add(name, path, root, **extra):
         entries.append({"name": name, "kind": "debris", "path": path, "root": root, "paths": [path], "tier": "safe", **extra})
@@ -595,6 +707,9 @@ def clean_extra_entries(only: set, errors: list) -> list[dict]:
                     if profile.name != "debug" and profile.is_dir(follow_symlinks=False) and not reap_protected(profile.name) \
                             and os.path.isdir(path) and not os.path.islink(path):
                         add("rust-build-output", path, target, target=target, repo=repo)
+    if "project-dependencies" in only and idle_hours:
+        for path, repo in clean_project_outputs(errors):
+            add("project-dependencies", path, os.path.dirname(path), repo=repo, idleHours=idle_hours)
     if "agent-leftovers" in only:
         for root, sessions in clean_leftover_roots():
             if not os.path.isdir(root) or os.path.islink(root) or os.lstat(root).st_uid != os.getuid():
@@ -604,6 +719,29 @@ def clean_extra_entries(only: set, errors: list) -> list[dict]:
                     matches = sessions or bool(re.fullmatch(r"(?:.+-verify-.+|ultraterm-release\..+|ultraterm-publish-check\..+|.*-rust-target.*)", child.name))
                     if matches and child.is_dir(follow_symlinks=False) and not reap_protected(child.name):
                         add("agent-leftovers", child.path, root)
+        seen = {e["path"] for e in entries}
+        sessions_root = os.path.realpath(f"/private/tmp/claude-{os.getuid()}")
+        for root, hours in clean_temp_roots():
+            try:
+                children = list(os.scandir(root))
+            except OSError:
+                continue
+            for child in children:
+                if child.path in seen or os.path.realpath(child.path) == sessions_root or CLEAN_TEMP_SYSTEM.match(child.name) \
+                        or reap_protected(child.name) or not child.is_dir(follow_symlinks=False):
+                    continue
+                try:
+                    if child.stat(follow_symlinks=False).st_uid != os.getuid():
+                        continue
+                except OSError:
+                    continue
+                add("agent-leftovers", child.path, root, idleHours=hours)
+    if "browser-clones" in only:
+        for root in clean_clone_roots():
+            with os.scandir(root) as clones:
+                for clone in clones:
+                    if clone.name.startswith("code_sign_clone.") and clone.is_dir(follow_symlinks=False):
+                        add("browser-clones", clone.path, root)
     if "playwright" in only:
         root = clean_home("Library", "Caches", "ms-playwright")
         for path, browser, build in clean_browser_builds(root):
@@ -623,7 +761,7 @@ def clean_extra_entries(only: set, errors: list) -> list[dict]:
 
 # ---- the plan -------------------------------------------------------------------------------------------------------
 
-def clean_plan(only: set, deep: bool, errors: list, skipped: list, days: int) -> list[dict]:
+def clean_plan(only: set, deep: bool, errors: list, skipped: list, days: int, hours: int = 48) -> list[dict]:
     names = clean_running()
     def tool_entry(spec):
         entry = {"name": spec["name"], "kind": "tool-cache", "command": " ".join(spec["argv"]), "spec": spec,
@@ -682,7 +820,7 @@ def clean_plan(only: set, deep: bool, errors: list, skipped: list, days: int) ->
             except OSError as error:
                 entry["keep"] = "error:" + reap_named(error)
             entries.append(entry)
-    entries.extend(clean_extra_entries(only, errors))
+    entries.extend(clean_extra_entries(only, errors, hours))
     return entries
 
 
@@ -864,7 +1002,8 @@ def clean_pass(dry_run: bool, deep: bool = False, only: list | None = None, repo
     disk = disk_state()
     policy = policy if policy is not None else load_policy()
     days = policy.get("worktreeIdleDays", 7)
-    entries = clean_plan(chosen, deep, errors, skipped, days)
+    hours = policy.get("projectIdleHours", 48)
+    entries = clean_plan(chosen, deep, errors, skipped, days, hours)
     for entry in entries:  # a removal sizes only what it removes; a dry run also sizes what is kept, except job folders
         if not dry_run and "keep" in entry or str(entry.get("keep")).startswith("job-folder"):
             entry["paths"] = []

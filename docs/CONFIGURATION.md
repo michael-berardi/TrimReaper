@@ -36,6 +36,7 @@ Paths are absolute or start with `~/`. Here `~` is the reap home (`home`), not t
 | `cleanAtPercent` | `95` | When the volume reaches this used percent, `tick` runs one `trimreaper clean` pass (the safe tier, no report). There is no timer: it runs again only on new pressure (`cleanGrowthGB` more used, or free space under `cleanFloorGB`), and dropping back below re-arms it. `0` turns it off. |
 | `cleanGrowthGB` | `5` | New pressure after an automatic pass: this many more GB used than when that pass ended. |
 | `cleanFloorGB` | `10` | Free space under this many GB always counts as new pressure, even below `cleanAtPercent`. |
+| `projectIdleHours` | `48` | A project's dependency and output folders (`node_modules`, `.next`, `.venv` ...) are removed by `clean` after this many hours without a change in the project; a copy named after a finished job needs 6. `0` keeps them all. |
 | `worktreeIdleDays` | `7` | A linked git worktree no job owns is removed by `clean` after this many days without a change, and every other check. `0` keeps them all. |
 
 ## Jobs

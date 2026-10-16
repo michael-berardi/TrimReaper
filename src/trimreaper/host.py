@@ -54,6 +54,7 @@ DEFAULT_POLICY = {
     "parkedReapHours": 24,
     # A linked git worktree no job owns goes after this many days without a change (and every other check); 0 keeps them all.
     "worktreeIdleDays": 7,
+    "projectIdleHours": 48,
 }
 
 DEFAULT_CONFIG = {
@@ -175,7 +176,7 @@ def check_policy(policy: dict) -> None:
         value = merged[key]
         if not isinstance(value, int) or isinstance(value, bool) or not low <= value <= 100:
             raise HostError(f"policy {key} must be a whole number from {low} to 100, not {json.dumps(value)}")
-    for key, high in (("cleanGrowthGB", 1000), ("cleanFloorGB", 1000), ("parkedReapHours", 24 * 365)):
+    for key, high in (("cleanGrowthGB", 1000), ("cleanFloorGB", 1000), ("parkedReapHours", 24 * 365), ("projectIdleHours", 24 * 365)):
         value = merged[key]
         if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= high:
             raise HostError(f"policy {key} must be a whole number from 0 to {high}, not {json.dumps(value)}")

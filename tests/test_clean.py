@@ -26,9 +26,16 @@ class Home(FixtureHome):
         self.buildtmp = self.tmp / "buildtmp"
         self.sessions.mkdir()
         self.buildtmp.mkdir()
-        patch = mock.patch.object(clean, "clean_leftover_roots", lambda: [(str(self.sessions), True), (str(self.buildtmp), False)])
-        patch.start()
-        self.addCleanup(patch.stop)
+        self.sharedtmp = self.tmp / "sharedtmp"
+        self.clones = self.tmp / "X" / "com.example.Browser.code_sign_clone"
+        self.sharedtmp.mkdir()
+        self.clones.mkdir(parents=True)
+        # Never the machine's own temp folders: every temp root is a fixture folder.
+        for patch in (mock.patch.object(clean, "clean_leftover_roots", lambda: [(str(self.sessions), True), (str(self.buildtmp), False)]),
+                      mock.patch.object(clean, "clean_temp_roots", lambda: [(str(self.sharedtmp), 24), (str(self.buildtmp), 72)]),
+                      mock.patch.object(clean, "clean_clone_roots", lambda: [str(self.clones)])):
+            patch.start()
+            self.addCleanup(patch.stop)
 
 
 class Debris(Home):
@@ -187,6 +194,76 @@ class Debris(Home):
         out = self.run_target("agent-leftovers")
         self.assertTrue(out["items"][0]["keep"].startswith("protected-leaf:"), out)
         self.assertTrue((path / ".dev.vars").exists())
+
+    def test_idle_temp_folders_go_after_a_day_shared_and_three_days_per_user(self):
+        shared_old = self.put(self.sharedtmp, "tool-scratch/data").parent
+        shared_new = self.put(self.sharedtmp, "fresh-scratch/data").parent
+        user_mid = self.put(self.buildtmp, "two-days/data").parent
+        user_old = self.put(self.buildtmp, "four-days/data").parent
+        system = self.put(self.buildtmp, "com.apple.something/data").parent
+        for path, days in ((shared_old, 2), (user_mid, 2), (user_old, 4), (system, 30)):
+            self.age(path, days)
+        out = self.run_target("agent-leftovers")
+        self.assertFalse(shared_old.exists())
+        self.assertFalse(user_old.exists())
+        self.assertTrue(shared_new.exists())
+        self.assertTrue(user_mid.exists())
+        self.assertTrue(system.exists())
+        self.assertEqual(out["summary"]["done"], 2, out)
+
+    def test_abandoned_browser_code_sign_clones_go_and_an_open_one_stays(self):
+        old = self.put(self.clones, "code_sign_clone.AAAA/Browser.app/Contents/binary").parents[2]
+        open_ = self.put(self.clones, "code_sign_clone.BBBB/Browser.app/Contents/binary").parents[2]
+        fresh = self.put(self.clones, "code_sign_clone.CCCC/Browser.app/Contents/binary").parents[2]
+        self.age(old, 1)
+        self.age(open_, 1)
+        table = {"files": [("123", "Browser", "txt", str(open_ / "Browser.app/Contents/binary"))], "commands": []}
+        with mock.patch.object(clean, "reap_process_table", return_value=table):
+            out = self.run_target("browser-clones")
+        self.assertFalse(old.exists())
+        self.assertTrue(open_.exists())
+        self.assertTrue(fresh.exists())
+        self.assertEqual(out["summary"]["done"], 1, out)
+
+    def project(self, name="site", ignored=("node_modules/", ".next/")):
+        repo = self.home / "dev" / name
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        (repo / ".gitignore").write_text("".join(i + "\n" for i in ignored))
+        (repo / "package.json").write_text("{}")
+        self.put(repo, "node_modules/pkg/index.js")
+        self.put(repo, ".next/cache/x")
+        return repo
+
+    def test_idle_project_dependencies_go_and_tracked_or_recent_ones_stay(self):
+        idle = self.project("idle-site")
+        tracked = self.project("tracked-site", ignored=("node_modules/",))
+        recent = self.project("recent-site")
+        bare = self.home / "dev" / "no-manifest"
+        subprocess.run(["git", "init", "-q", str(bare)], check=True)
+        (bare / ".gitignore").write_text("node_modules/\n")
+        self.put(bare, "node_modules/pkg/index.js")
+        for path in (idle, tracked, bare):
+            self.age(path, 3)
+        out = self.run_target("project-dependencies")
+        self.assertFalse((idle / "node_modules").exists())
+        self.assertFalse((idle / ".next").exists())
+        self.assertTrue((idle / "package.json").exists())
+        self.assertFalse((tracked / "node_modules").exists())
+        self.assertTrue((tracked / ".next").exists())  # git does not ignore it: it may be committed work
+        self.assertTrue((recent / "node_modules").exists())  # touched within projectIdleHours
+        self.assertTrue((bare / "node_modules").exists())  # no package.json beside it: nothing could reinstall it
+        kept = {i["path"].split("/dev/")[-1]: i.get("keep") for i in out["items"]}
+        self.assertTrue(kept["tracked-site/.next"].startswith("tracked-or-not-ignored"), kept)
+        self.assertTrue(kept["recent-site/node_modules"].startswith("recent:"), kept)
+
+    def test_a_running_job_keeps_its_projects_dependencies(self):
+        repo = self.project("job-site-j4242")
+        self.age(repo, 3)
+        with mock.patch.object(clean, "rows", side_effect=lambda conn, sql, args=(): [{"id": "J-4242", "status": "running", "cwd": str(repo)}]
+                               if "NOT IN" in sql else [{"status": "running"}]):
+            out = self.run_target("project-dependencies")
+        self.assertTrue((repo / "node_modules").exists())
+        self.assertTrue(all(i["keep"].startswith("in-use-by-running-job:J-4242") for i in out["items"]), out)
 
     def browsers(self):
         root = self.home / "Library/Caches/ms-playwright"
