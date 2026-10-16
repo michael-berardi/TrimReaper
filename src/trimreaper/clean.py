@@ -499,6 +499,19 @@ def clean_browser_builds(root: str) -> list[tuple[str, str, int]]:
     return found
 
 
+# Folders that never hold a Rust crate's target: dependency stores, virtual environments, generated web output and tool caches.
+# (A walk of the dev and .cache homes listed 2.3 million entries, mostly these, and gave up at the 500,000-entry budget.)
+CLEAN_RUST_SCAN_SKIP = frozenset({".git", "node_modules", "Library", ".cache", ".local", ".Trash", "dist", "build", "vendor", ".venv", "venv", "__pycache__",
+                            "site-packages", ".next", ".astro", ".turbo", ".wrangler", ".svelte-kit", ".vercel", ".output", "coverage", ".pnpm-store",
+                            "Pods", "DerivedData", ".gradle", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox", "screenshots"})
+CLEAN_RUST_SCAN_TOOL_CACHES = frozenset({"uv", "pip", "npm", "pnpm", "yarn", "bun", "cargo", "go-build", "huggingface", "codex-runtimes", "ms-playwright",
+                                   "puppeteer", "node-gyp", "typescript", "prisma", "turbo", "pre-commit", "deno", "electron", "selenium"})
+CLEAN_RUST_SCAN_REPO_SEARCH_DEPTH = 4
+# Names only (one scandir per folder, no stat of files): about 10 s per million entries. Its own budget, larger than the engine's
+# deletion-proof walk (REAP_WALK_ENTRIES), because finding a target deletes nothing; each target is still proved before removal.
+CLEAN_RUST_SCAN_ENTRIES = 3_000_000
+
+
 def clean_rust_targets(errors: list) -> list[tuple[str, str]]:
     """Find targets in repositories, including nested crates, without entering generated trees."""
     # The usual code and build homes, never the whole home: a home-wide walk ran out of its entry budget on a real machine
@@ -509,9 +522,11 @@ def clean_rust_targets(errors: list) -> list[tuple[str, str]]:
     # Linked worktrees may live outside the home and configured clone bases.
     roots.update(entry["path"] for entry in clean_worktree_entries(errors, []) if entry["kind"] == "worktree")
     found, seen, count = set(), set(), 0
-    stack = [(root, False, 0, "") for root in sorted(roots)]
-    while stack:
-        folder, in_repo, depth, repo = stack.pop()
+    # Breadth-first, so shallow repositories are found before any budget is spent deep inside one tree.
+    stack, head = [(root, False, 0, "") for root in sorted(roots)], 0
+    while head < len(stack):
+        folder, in_repo, depth, repo = stack[head]
+        head += 1
         if folder in seen or os.path.islink(folder) or not os.path.isdir(folder):
             continue
         seen.add(folder)
@@ -521,8 +536,8 @@ def clean_rust_targets(errors: list) -> list[tuple[str, str]]:
             with os.scandir(folder) as scan:
                 entries = list(scan)
             count += len(entries)
-            if count > REAP_WALK_ENTRIES:
-                errors.append({"clean": "rust-build-output", "error": "discovery-incomplete"})
+            if count > CLEAN_RUST_SCAN_ENTRIES:
+                errors.append({"clean": "rust-build-output", "error": f"discovery-incomplete: more than {CLEAN_RUST_SCAN_ENTRIES} entries"})
                 break
             if any(e.name == ".git" and not e.is_symlink() for e in entries):
                 in_repo, repo = True, folder
@@ -533,7 +548,10 @@ def clean_rust_targets(errors: list) -> list[tuple[str, str]]:
                     if in_repo:
                         found.add((entry.path, repo))
                     continue
-                if entry.name not in (".git", "node_modules", "Library", ".cache", ".local", ".Trash", "dist", "build", "vendor"):
+                if entry.name in CLEAN_RUST_SCAN_SKIP or (folder in homes and entry.name in CLEAN_RUST_SCAN_TOOL_CACHES):
+                    continue
+                # Outside a repository only the first few levels are searched for repositories: a target lives in a repository.
+                if in_repo or depth < CLEAN_RUST_SCAN_REPO_SEARCH_DEPTH:
                     stack.append((entry.path, in_repo, depth + 1, repo))
         except OSError as error:
             errors.append({"clean": "rust-build-output", "error": clean_tilde(folder) + ":" + reap_named(error)})

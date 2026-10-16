@@ -68,6 +68,23 @@ class Debris(Home):
         self.assertTrue((target / "release/bundle/App.app/Contents/binary").exists())
         self.assertTrue(repo.exists())
 
+    def test_rust_discovery_skips_tool_caches_and_virtualenvs_and_finishes(self):
+        # A real machine's ~/dev and ~/.cache held 2.3 million entries, mostly tool caches and .venv trees, and the walk gave up
+        # (discovery-incomplete) after finding one target. Those trees are never entered now; a target in a job clone is still found.
+        for n in range(30):
+            self.put(self.home / ".cache" / "uv" / "archive-v0" / f"pkg{n}", "file.py", b"x")
+            self.put(self.home / "dev" / "app" / ".venv" / "lib" / f"mod{n}", "m.py", b"x")
+        self.put(self.home / ".cache" / "uv" / "archive-v0" / "pkg0" / ".git", "HEAD", b"ref")
+        self.put(self.home / ".cache" / "uv" / "archive-v0" / "pkg0" / "target" / "debug", "never", b"x")
+        self.put(self.home / ".cache" / "agent-scratch" / "job" / "clone", ".git", b"gitdir: /unused/fixture\n")
+        debug = self.put(self.home / ".cache" / "agent-scratch" / "job" / "clone", "target/debug/app").parent
+        errors = []
+        with mock.patch.object(clean, "CLEAN_RUST_SCAN_ENTRIES", 120):
+            found = clean.clean_rust_targets(errors)
+        self.assertEqual(errors, [])
+        self.assertEqual([Path(target).parent.name for target, _ in found], ["clone"])
+        self.assertTrue(debug.exists())
+
     def test_rust_in_a_recent_linked_worktree_is_independent_of_idle_policy(self):
         worktree = self.home / "projects" / "linked"
         self.put(worktree, ".git", b"gitdir: /unused/fixture\n")
