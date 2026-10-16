@@ -68,21 +68,54 @@ REAP_MARKER_PREFIX = ".ut-retention-"                  # every candidate is disp
 # job's clone (dist is excluded: it can hold a release); (2) a job cache folder tagged as a tool cache by a valid CACHEDIR.TAG
 # (Cargo, uv and ruff write one); (3) an unmarked job cache folder once its job finished evidenceExpiryDays ago, the same window
 # the operator set for screenshots and logs. Any retention marker (evidence, customer, release...) still wins, a marker in
-# the job folder keeps the whole job, and `protected-archive` is never derived.
+# the job folder preserves the whole job unless it is disposable, and `protected-archive` is never derived.
 REAP_DERIVED_KINDS = ("node_modules", ".next", ".open-next", ".turbo", ".astro", "target")
 # Disk pressure: clones of jobs that are parked or interrupted can hold a full disk while nothing runs in them. At or above
 # diskWarnPercent, the regenerable build output of a job
 # that is not starting or running is reapable too: such a job rebuilds it when it runs. Every per-item gate still applies (protected
 # leaves, git proofs, locks, open handles, cwd), and nothing else of an unfinished job is touched.
-# Nothing of a job that is running, approved, blocked or queued is touched, even under pressure.
-REAP_PRESSURE_IDLE = ("parked", "interrupted")
+# Parked/blocked jobs also surrender only derived output after parkedReapHours without a report; zero means pressure only.
+# Nothing of a running, approved or queued job is touched, even under pressure.
+REAP_PRESSURE_IDLE = ("parked", "blocked", "interrupted")
 REAP_PRESSURE = threading.local()
 
 
+def reap_idle_expired(job: dict, policy: dict) -> bool:
+    """No report/activity for the parked window; absent timestamps fail closed."""
+    hours = policy.get("parkedReapHours", 24)
+    if job.get("status") not in ("parked", "blocked") or isinstance(hours, bool) or not isinstance(hours, (int, float)) or hours <= 0:
+        return False
+    meta = job_meta(job)
+    clocks = [source.get(key) for source in (job, meta) for key in
+              ("created_at", "started_at", "updated_at", "last_reported_at", "last_report_at", "lastReportAt", "parked_at", "blocked_at")]
+    for nested in ("parked", "resume", "waitingOn", "needsOperator"):  # the host records park/resume/wait/ask times inside meta
+        value = meta.get(nested)
+        if isinstance(value, dict):
+            clocks += [value.get(key) for key in ("at", "since", "parkedAt")]
+    clocks = [stamp for stamp in clocks if isinstance(stamp, (int, float)) and not isinstance(stamp, bool)]
+    return bool(clocks) and now() - max(clocks) >= hours * 3600
+
+
 def reap_pressure_allows(item: dict, job: dict) -> bool:
-    """True inside a disk-pressure pass for derived build output whose claiming job is idle (not starting or running)."""
-    return bool(getattr(REAP_PRESSURE, "on", False)) and item.get("class") == "job-clone-regenerable" \
-        and item.get("kind") in REAP_DERIVED_KINDS and job["status"] in REAP_PRESSURE_IDLE
+    """Only derived output of idle jobs, under pressure or after their quiet window."""
+    return item.get("class") == "job-clone-regenerable" and item.get("kind") in REAP_DERIVED_KINDS \
+        and job["status"] in REAP_PRESSURE_IDLE \
+        and (bool(getattr(REAP_PRESSURE, "on", False)) or reap_idle_expired(job, load_policy())) \
+        and reap_idle_terminal_allows(job)
+
+
+def reap_idle_terminal_allows(job: dict) -> bool:
+    terminal = job.get("terminal_id")
+    if not terminal:
+        return True
+    live = reap_live_ids()
+    if live is None or terminal in live:
+        return False
+    with db() as conn:
+        record = row(conn, "SELECT status FROM cleanup_records WHERE terminal_id=?", (terminal,))
+        siblings = rows(conn, "SELECT id,status FROM jobs WHERE terminal_id=? AND id!=?", (terminal, job["id"]))
+    return not (record and record["status"] in ("verified", "closing", "awaiting-final-reply", "unknown")) \
+        and not any(j["status"] not in REAP_TERMINAL for j in siblings)
 CACHEDIR_TAG = "CACHEDIR.TAG"
 CACHEDIR_SIGNATURE = b"Signature: 8a477f597d28d172789f06886806bc55"   # bford.net/cachedir: the first 43 bytes of a valid tag
 REAP_SCAN_DEPTH = 4                   # directory levels searched for regenerable dirs inside one clone
@@ -983,6 +1016,95 @@ def reap_size(path: str, budget: float = 120) -> tuple[int | None, bool]:
     return result["bytes"], result["complete"]
 
 
+def reap_vendored_file(fd: int, name: str, digest: bool = False):
+    """Read a bounded, owned regular file without following links; protected bytes are only hashed."""
+    leaf = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=fd)
+    try:
+        before = os.fstat(leaf)
+        limit = 64 * 1024 * 1024 if digest else 4 * 1024 * 1024
+        if not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid() or before.st_nlink != 1 or before.st_size > limit:
+            raise ReapRefused("vendored-file-unsafe")
+        hashed, chunks, total = hashlib.sha256(), [], 0
+        while True:
+            chunk = os.read(leaf, 65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > limit:
+                raise ReapRefused("vendored-file-too-large")
+            if digest:
+                hashed.update(chunk)
+            else:
+                chunks.append(chunk)
+        after = os.fstat(leaf)
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != \
+                (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+            raise ReapRefused("vendored-file-changed")
+        return hashed.hexdigest() if digest else b"".join(chunks)
+    finally:
+        os.close(leaf)
+
+
+def reap_vendored_templates(path: str) -> dict:
+    """Manifest-verified env files only; a state directory, missing entry or mismatch invalidates its entire manifest."""
+    manifests, protected, states = [], [], []
+    def visit(rel, name, info, level, device):
+        if reap_protected(name):
+            (states if reap_fold(name) in REAP_PROTECTED_ROOTS else protected).append(rel)
+            return False
+        if reap_is_git(name):
+            return False
+        if name == "FILES.sha256" and stat.S_ISREG(info.st_mode):
+            manifests.append(rel)
+        if stat.S_ISDIR(info.st_mode) and info.st_dev != device:
+            raise ReapRefused("vendored-crosses-filesystem")
+        return True
+    try:
+        reap_fd_walk(path, visit, REAP_WALK_ENTRIES, blind=reap_is_git, listing=reap_refuse_git_layout)
+    except (OSError, ReapRefused):
+        return {}  # the ordinary protected/git scan still decides; no exception is granted by an incomplete walk
+    verified = {}
+    def read_relative(rel, digest=False):
+        fd = os.open(path, REAP_ROOT_FLAGS)
+        try:
+            device = os.fstat(fd).st_dev
+            for part in rel.split("/")[:-1]:
+                child = os.open(part, REAP_DIR_FLAGS, dir_fd=fd)
+                os.close(fd)
+                fd = child
+                if os.fstat(fd).st_dev != device:
+                    raise ReapRefused("vendored-crosses-filesystem")
+            return reap_vendored_file(fd, rel.rpartition("/")[2], digest)
+        finally:
+            os.close(fd)
+    for manifest in manifests:
+        base = manifest.rpartition("/")[0]
+        prefix = base + "/" if base else ""
+        leaves = [rel for rel in protected if rel.startswith(prefix)]
+        if not leaves or any(rel.startswith(prefix) for rel in states):
+            continue
+        try:
+            entries = {}
+            for line in read_relative(manifest).decode("utf-8").splitlines():
+                match = re.fullmatch(r"([0-9a-fA-F]{64})  \./(.+)", line)
+                if not match:
+                    raise ValueError("manifest syntax")
+                digest, rel = match.groups()
+                if rel.startswith("/") or any(part in ("", ".", "..") for part in rel.split("/")) or rel in entries:
+                    raise ValueError("manifest path")
+                entries[rel] = digest.lower()
+            matched = {}
+            for rel in leaves:
+                expected = entries.get(rel[len(prefix):])
+                if expected is None or read_relative(rel, True) != expected:
+                    raise ValueError("manifest mismatch")
+                matched[os.path.join(path, rel)] = expected
+            verified.update(matched)
+        except (OSError, ValueError, ReapRefused):
+            continue  # leave every protected name blocked, without logging bytes
+    return verified
+
+
 def reap_protected_scan(path: str, allow_git: bool = False, markers: bool = False, budget: int = REAP_WALK_ENTRIES,
                         repos: list | None = None, nested_disposable: bool = False, templates: frozenset = frozenset(),
                         protected_ok: bool = False, git_dirs: list | None = None, secrets: list | None = None) -> int:
@@ -999,6 +1121,7 @@ def reap_protected_scan(path: str, allow_git: bool = False, markers: bool = Fals
     (a whole clone, protected_ok) every protected name that is not a tracked template is appended: the archive saves those too."""
     if any(reap_protected(part) for part in Path(path).parts):
         raise ReapRefused("protected-scan-ancestor")
+    vendored = reap_vendored_templates(path)
     def listing(rel, names):
         try:
             reap_refuse_git_layout(rel, names)
@@ -1012,7 +1135,7 @@ def reap_protected_scan(path: str, allow_git: bool = False, markers: bool = Fals
                 if secrets is not None and os.path.join(path, rel) not in templates:
                     secrets.append(rel)  # named for the archive (it copies them owner-only before the clone goes); never opened here
                 return False  # a whole clone under cloneProtectedCopies=remove: named, never entered; it goes with the clone
-            if os.path.join(path, rel) in templates:  # a tracked env template of a whole clone (REAP_ENV_TEMPLATE)
+            if os.path.join(path, rel) in templates or os.path.join(path, rel) in vendored:  # tracked or manifest-verified template
                 try:
                     found = os.lstat(os.path.join(path, rel))  # metadata only: never opened, never followed
                 except OSError:
@@ -1123,6 +1246,10 @@ def reap_retention(item: dict) -> str:
 
 def reap_item_retention(item: dict) -> str:
     """A marker decides; without one, `disposable` is derived only in the three self-cleaning cases (see REAP_DERIVED_KINDS)."""
+    if item.get("class") == "job-cache-subdir" and item.get("owner"):
+        parent = reap_cache_retention(str(reap_cache_root() / item["owner"]))
+        if parent not in ("unmarked", REAP_DISPOSABLE):
+            return parent  # an explicit preserving job-folder marker applies to every child
     found = reap_cache_retention(item["path"])
     if found != "unmarked":
         return found
@@ -1131,7 +1258,7 @@ def reap_item_retention(item: dict) -> str:
             and os.path.basename(item["path"]) == item.get("kind"):
         return REAP_DISPOSABLE
     if cls == "job-cache-subdir" and reap_fold(os.path.basename(item["path"])) not in EVIDENCE_KEEP_DIRS and item.get("owner") \
-            and reap_cache_retention(str(reap_cache_root() / item["owner"])) == "unmarked":  # a marker on the job folder keeps it all
+            and reap_cache_retention(str(reap_cache_root() / item["owner"])) in ("unmarked", REAP_DISPOSABLE):  # only a preserving parent marker keeps it all
         if reap_cachedir_tagged(item["path"]) or reap_scratch_expired(item["owner"]):
             return REAP_DISPOSABLE
     if cls == "agent-scratch" and reap_scratch_idle(item["path"]):
@@ -2963,7 +3090,10 @@ def reap_empty_directory(fd: int, dev: int, depth: int, rel: str, tally: dict, a
             if base and os.path.join(base, sub) in templates:
                 entry = os.stat(name, dir_fd=fd, follow_symlinks=False)
                 if stat.S_ISREG(entry.st_mode) and entry.st_nlink == 1:
-                    os.unlink(name, dir_fd=fd)  # the proved, tracked env template goes with its clone
+                    expected = templates.get(os.path.join(base, sub)) if isinstance(templates, dict) else None
+                    if expected and reap_vendored_file(fd, name, True) != expected:
+                        raise ReapRefused(f"vendored-file-changed:{sub}")
+                    os.unlink(name, dir_fd=fd)  # a tracked template, or freshly hashed manifest entry
                     tally["removed"] += 1
                     continue
             raise ReapRefused(f"protected-leaf-appeared:{sub}")
@@ -3432,7 +3562,8 @@ def reap_item(item: dict, mode: str = "delete", ctx: dict | None = None) -> dict
                 result["preserved"] = before
                 checks.append("preserved-root-metadata")
             seconds, entry_limit = reap_size_plan(item["path"], ctx.get("sizeBudget", 120)) if apply else (ctx.get("sizeBudget", 120), REAP_WALK_ENTRIES)
-            sizing = reap_metadata_size(item["path"], seconds, entry_limit, templates=templates, protected_ok=protected_ok)
+            sizing = reap_metadata_size(item["path"], seconds, entry_limit,
+                                        templates=templates | reap_vendored_templates(item["path"]).keys(), protected_ok=protected_ok)
             if apply:
                 reap_size_note(item["path"], sizing)
             result["bytes"] = sizing["bytes"]
@@ -3506,7 +3637,9 @@ def reap_item(item: dict, mode: str = "delete", ctx: dict | None = None) -> dict
                     if not since:
                         raise ReapRefused("archive-sole-copy-unrecorded")  # no stamp, no removal: the archive must be protected first
                 try:
-                    reap_remove_and_verify(fence, item["path"], before, result, allow_git, templates, protected_ok)
+                    removal_templates = dict.fromkeys(templates)
+                    removal_templates.update(reap_vendored_templates(item["path"]))
+                    reap_remove_and_verify(fence, item["path"], before, result, allow_git, removal_templates, protected_ok)
                 finally:
                     if made is not None and since and not had_stamp and not result.get("removed"):
                         # Nothing was removed (the removal refused before its first byte): the clone is still the primary copy and the archive's
@@ -3758,7 +3891,7 @@ def reap_job_owned(conn, job: dict, dry_run: bool, actor: str, clones: list | No
                 return {**out, "deleted": 0, "reclaimedBytes": 0, "preserved": len(items), "dfDeltaBytes": 0, "reasons": ["reap-already-running"]}
         ctx = {"run": uuid.uuid4().hex[:12]}
         before = reap_free_bytes()
-        REAP_PRESSURE.on = pressure
+        REAP_PRESSURE.on = pressure and disk_level(load_policy(), disk_state()) != "ok"
         try:
             results, stopped = reap_sweep(items, "dry-run" if dry_run else "delete", ctx)
         finally:
@@ -4263,7 +4396,9 @@ def reap_tick(conn, policy: dict, live: list, actions: list, errors: list) -> No
             if not reap_job_blocker(conn, job, live_ids):
                 due.append(job)
         if not due:
-            return  # idle ticks create no journal and need no handoff
+            idle = rows(conn, "SELECT * FROM jobs WHERE status IN ('parked','blocked','interrupted')")
+            if not idle or (disk_level(policy, disk_state()) == "ok" and not any(reap_idle_expired(j, policy) for j in idle)):
+                return  # truly idle ticks create no journal and need no handoff
         try:
             clones = reap_clone_roots()  # discovery failure must not take a lease or grow the owner journal
         except (HostError, OSError, ValueError, sqlite3.Error) as error:
@@ -4279,12 +4414,12 @@ REAP_PRESSURE_RECHECK_SECONDS = 1800
 
 
 def reap_pressure_pass(conn, policy: dict, live_ids: set, started: float, actions: list, errors: list, clones: list) -> None:
-    """At or above diskWarnPercent, the derived build output of idle unfinished jobs (largest disk users first is the reaper's own
-    order within a job; jobs oldest first), within the tick's time budget. Each job is looked at again at most every half hour."""
-    disk = disk_state()
-    if disk_level(policy, disk) == "ok":
-        return
+    """Derived output under disk pressure or after parkedReapHours of quiet, within the tick's time budget.
+    Jobs oldest first; each job is looked at again at most every half hour. Clone, cache and evidence remain untouched."""
+    pressure = disk_level(policy, disk_state()) != "ok"
     for job in rows(conn, "SELECT * FROM jobs WHERE status IN (%s) ORDER BY created_at" % ",".join("?" * len(REAP_PRESSURE_IDLE)), REAP_PRESSURE_IDLE):
+        if not pressure and not reap_idle_expired(job, policy):
+            continue
         if time.monotonic() - started > REAP_TICK_SECONDS:
             return
         key = "reap:pressure:" + job["id"]
@@ -4640,6 +4775,14 @@ def reap_audit_item(item: dict, blocker: str | None, ctx: dict, deadline: float)
         return {**base, "state": "gone", "bytes": 0, "blocking": None}
     ctx["sizeBudget"] = 1.0 if time.monotonic() > deadline else max(1.0, min(60.0, deadline - time.monotonic()))
     size_reason = None
+    idle_pressure = False
+    if blocker in ("job-parked", "job-blocked", "job-interrupted") and item.get("class") == "job-clone-regenerable" \
+            and item.get("kind") in REAP_DERIVED_KINDS:
+        with db() as conn:
+            job = row(conn, "SELECT * FROM jobs WHERE id=?", (item["owner"],))
+        idle_pressure = disk_level(load_policy(), disk_state()) != "ok"
+        if job and (idle_pressure or reap_idle_expired(job, load_policy())):
+            blocker = None  # every fresh authority/terminal/process proof still runs below
     if blocker:
         entry = {"state": "blocked", "blocking": blocker}
         done = None
@@ -4647,7 +4790,12 @@ def reap_audit_item(item: dict, blocker: str | None, ctx: dict, deadline: float)
         entry = {"state": "blocked", "blocking": "audit-budget-exhausted"}
         done = None
     else:
-        done = reap_item(item, "audit", ctx)
+        previous_pressure = getattr(REAP_PRESSURE, "on", False)
+        REAP_PRESSURE.on = idle_pressure
+        try:
+            done = reap_item(item, "audit", ctx)
+        finally:
+            REAP_PRESSURE.on = previous_pressure
         entry = {"state": "reapable" if done["outcome"] == "would-delete" else "blocked", "blocking": done["reason"]}
         if done.get("archive"):
             entry["archive"] = str(done["archive"].get("reason", "")).split(":")[0]  # reapable once archived first
@@ -4667,12 +4815,12 @@ def reap_audit_item(item: dict, blocker: str | None, ctx: dict, deadline: float)
 # Every reason an item is kept, as an action the operator (or a later tick) can take. reap-status prints the line for each reason
 # it reports, with the bytes behind it; an unlisted reason still prints, with a pointer to the item's own text.
 REAP_REASON_ACTIONS = {
-    "job-parked": "unfinished job (parked): kept; its derived build output goes only under disk pressure; finish or cancel the job",
+    "job-parked": "unfinished job (parked): clone/cache/evidence kept; derived output goes under pressure or after parkedReapHours without a report",
     "job-approved": "job approved and waiting to run: kept until it finishes",
     "job-running": "job running: kept until it finishes",
     "job-queued": "job queued: kept until it finishes",
-    "job-blocked": "job blocked: kept; resolve or cancel the job",
-    "job-interrupted": "job interrupted: kept; resume or cancel the job",
+    "job-blocked": "job blocked: clone/cache/evidence kept; derived output goes under pressure or after parkedReapHours without a report",
+    "job-interrupted": "job interrupted: clone/cache/evidence kept; derived output goes only under disk pressure",
     "settling": "job finished moments ago: reaped after the settle window",
     "worker-terminal-still-open": "worker terminal still live: never removed under a live terminal; close it through cleanup-status / cleanup-record",
     "terminal-state-unknown": "the terminal host did not answer: retried next tick",

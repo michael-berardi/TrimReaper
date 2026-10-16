@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.0 (2026-10-16)
+
+- Automatic clean is event-driven: one pass when the volume reaches `cleanAtPercent`, then only on new pressure (`cleanGrowthGB`, `cleanFloorGB`); dropping below re-arms it. `clean_auto_observe` decides without starting anything. No hourly repeat.
+- Parked or blocked jobs give up derived build output after `parkedReapHours` (24) without activity; disk pressure now reaps blocked jobs' output too.
+- Expired job cache folders are no longer kept because their job folder carries a `disposable` marker.
+- A folder whose `.env*`/`.envrc` files are all listed with matching hashes in its own `FILES.sha256` (a pinned vendored source copy) is no longer kept for them; `.wrangler`/`.vercel` still always block.
+- `clean` also removes Rust `debug` and incremental output no compiler uses (release artifacts stay), stale agent session folders under `/private/tmp/claude-<uid>` and build roots in TMPDIR (six hours idle), old Playwright browser builds no process uses, and the Docker build cache with a Colima `fstrim`.
+- An automatic pass reports the space it actually freed.
+
 ## 0.2.0 (2026-10-15)
 
 - `trimreaper clean`: frees space no job owns, on any machine and for any user, with no setup. Tool caches go through the

@@ -14,9 +14,247 @@ import time
 from pathlib import Path
 from unittest import mock
 
-from helpers import DAY, Home
+from helpers import DAY, Home as FixtureHome
 
 from trimreaper import clean, cli, mcp
+
+
+class Home(FixtureHome):
+    def setUp(self):
+        super().setUp()
+        self.sessions = self.tmp / "claude-sessions"
+        self.buildtmp = self.tmp / "buildtmp"
+        self.sessions.mkdir()
+        self.buildtmp.mkdir()
+        patch = mock.patch.object(clean, "clean_leftover_roots", lambda: [(str(self.sessions), True), (str(self.buildtmp), False)])
+        patch.start()
+        self.addCleanup(patch.stop)
+
+
+class Debris(Home):
+    def setUp(self):
+        super().setUp()
+        # The probes are fixture snapshots, never real cleanup paths or machine processes.
+        for patch in (mock.patch.object(clean, "clean_running", return_value=set()),
+                      mock.patch.object(clean, "reap_process_table", return_value={"files": [], "commands": []})):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def run_target(self, target, dry=False):
+        return self.cli("clean", *( ["--dry-run"] if dry else []), "--only", target)
+
+    def rust(self):
+        repo = self.home / "projects" / "recent-repo"
+        (repo / ".git").mkdir(parents=True)
+        self.put(repo, "target/debug/app")
+        self.put(repo, "target/release/app")
+        self.put(repo, "target/release/bundle/App.app/Contents/binary")
+        self.put(repo, "target/release/incremental/state")
+        self.put(repo, "target/aarch64-apple-darwin/incremental/state")
+        self.put(repo, "target/debug/.cargo-lock", b"")
+        return repo, repo / "target"
+
+    def test_rust_removes_recent_debug_and_incremental_but_keeps_release_and_bundles(self):
+        repo, target = self.rust()
+        planned = self.run_target("rust-build-output", True)
+        self.assertEqual(planned["summary"]["candidates"], 3, planned)
+        self.assertTrue((target / "debug").exists())
+        out = self.run_target("rust-build-output")
+        self.assertEqual(out["summary"]["done"], 3, out)
+        self.assertFalse((target / "debug").exists())
+        self.assertFalse((target / "release/incremental").exists())
+        self.assertFalse((target / "aarch64-apple-darwin/incremental").exists())
+        self.assertTrue((target / "release/app").exists())
+        self.assertTrue((target / "release/bundle/App.app/Contents/binary").exists())
+        self.assertTrue(repo.exists())
+
+    def test_rust_in_a_recent_linked_worktree_is_independent_of_idle_policy(self):
+        worktree = self.home / "projects" / "linked"
+        self.put(worktree, ".git", b"gitdir: /unused/fixture\n")
+        debug = self.put(worktree, "src-tauri/target/debug/app").parent
+        self.write_config({"policy": {"worktreeIdleDays": 0}})
+        out = self.run_target("rust-build-output")
+        self.assertEqual(out["summary"]["done"], 1, out)
+        self.assertFalse(debug.exists())
+        self.assertTrue((worktree / ".git").exists())
+
+    def test_linked_worktree_outside_home_is_discovered(self):
+        worktree = self.tmp / "external-worktree"
+        self.put(worktree, ".git", b"gitdir: /unused/fixture\n")
+        debug = self.put(worktree, "target/debug/app").parent
+        with mock.patch.object(clean, "clean_worktree_entries", return_value=[{"path": str(worktree), "kind": "worktree"}]):
+            out = self.run_target("rust-build-output")
+        self.assertEqual(out["summary"]["done"], 1, out)
+        self.assertFalse(debug.exists())
+
+    def test_every_rust_producer_keeps_output(self):
+        _, target = self.rust()
+        for name in clean.CLEAN_RUST_BUSY:
+            with mock.patch.object(clean, "clean_running", return_value={name}):
+                out = self.run_target("rust-build-output")
+            self.assertEqual(out["summary"]["done"], 0, out)
+            self.assertTrue(all(item["keep"] == "in-use:" + name for item in out["items"]))
+        self.assertTrue((target / "debug").exists())
+
+    def test_cargo_lock_is_nonblocking_and_held_through_removal(self):
+        _, target = self.rust()
+        lock = target / "debug/.cargo-lock"
+        with clean.reap_locks([lock], create=False):
+            out = self.run_target("rust-build-output")
+        self.assertEqual(out["summary"]["done"], 0, out)
+        self.assertTrue(all(item["keep"].startswith("lock-busy:") for item in out["items"]))
+        remove = clean.reap_remove_and_verify
+        checked = []
+        def verify(*args, **kwargs):
+            if lock.exists():
+                with self.assertRaises(clean.ReapRefused):
+                    with clean.reap_locks([lock], create=False):
+                        pass
+                checked.append(True)
+            return remove(*args, **kwargs)
+        with mock.patch.object(clean, "reap_remove_and_verify", side_effect=verify):
+            out = self.run_target("rust-build-output")
+        self.assertEqual(out["summary"]["done"], 3, out)
+        self.assertTrue(checked)
+
+    def test_rust_open_files_and_protected_leaves_keep_output(self):
+        _, target = self.rust()
+        table = {"files": [("123", "editor", "7r", str(target / "release/app"))], "commands": []}
+        with mock.patch.object(clean, "reap_process_table", return_value=table):
+            out = self.run_target("rust-build-output")
+        self.assertEqual(out["summary"]["done"], 0, out)
+        self.put(target, "debug/.env.local", b"secret")
+        out = self.run_target("rust-build-output")
+        self.assertEqual(out["summary"]["done"], 0, out)
+        self.assertTrue((target / "debug/.env.local").exists())
+
+    def test_stale_sessions_and_named_tmp_builds_only(self):
+        old = self.put(self.sessions, "session-old/nested/log").parent.parent
+        recent = self.put(self.sessions, "session-recent/nested/log").parent.parent
+        paths = [self.put(self.buildtmp, name + "/data").parent for name in
+                 ("app-verify-abc", "ultraterm-release.123", "ultraterm-publish-check.123", "app-rust-target-123")]
+        unrelated = self.put(self.buildtmp, "unrelated/data").parent
+        for path in [old, recent, unrelated, *paths]:
+            self.age(path, 1)
+        os.utime(recent / "nested/log", None)
+        planned = self.run_target("agent-leftovers", True)
+        self.assertEqual(planned["summary"]["candidates"], 5, planned)
+        self.assertTrue(old.exists())
+        out = self.run_target("agent-leftovers")
+        self.assertEqual(out["summary"]["done"], 5, out)
+        self.assertFalse(old.exists())
+        self.assertTrue(recent.exists())
+        self.assertTrue(unrelated.exists())
+        self.assertTrue(all(not path.exists() for path in paths))
+
+    def test_session_open_file_cwd_and_command_line_are_kept(self):
+        path = self.put(self.sessions, "session/data").parent
+        self.age(path, 1)
+        for table in ({"files": [("123", "agent", "cwd", str(path))], "commands": []},
+                      {"files": [("123", "agent", "5r", str(path / "data"))], "commands": []},
+                      {"files": [], "commands": [("123", "agent " + str(path))]}):
+            with mock.patch.object(clean, "reap_process_table", return_value=table):
+                out = self.run_target("agent-leftovers")
+            self.assertTrue(out["items"][0]["keep"].startswith("in-use:"), out)
+            self.assertTrue(path.exists())
+
+    def test_sessions_recheck_freshness_before_deletion_and_keep_secrets(self):
+        path = self.put(self.sessions, "session/data").parent
+        self.age(path, 1)
+        entry = clean.clean_extra_entries({"agent-leftovers"}, [])[0]
+        os.utime(path / "data", None)
+        with self.assertRaisesRegex(clean.ReapRefused, "recent"):
+            clean.clean_act(entry, "fixture", 7)
+        self.put(path, ".dev.vars", b"secret")
+        self.age(path, 1)
+        out = self.run_target("agent-leftovers")
+        self.assertTrue(out["items"][0]["keep"].startswith("protected-leaf:"), out)
+        self.assertTrue((path / ".dev.vars").exists())
+
+    def browsers(self):
+        root = self.home / "Library/Caches/ms-playwright"
+        for name in ("chromium-99", "chromium-100", "firefox-8", "firefox-10", "chromium_headless_shell-12", "chromium_headless_shell-13", "unknown"):
+            self.put(root, name + "/browser")
+        return root
+
+    def test_playwright_keeps_newest_numeric_build_of_each_browser(self):
+        root = self.browsers()
+        out = self.run_target("playwright")
+        self.assertEqual(out["summary"]["done"], 3, out)
+        for name in ("chromium-100", "firefox-10", "chromium_headless_shell-13", "unknown"):
+            self.assertTrue((root / name).exists(), name)
+        for name in ("chromium-99", "firefox-8", "chromium_headless_shell-12"):
+            self.assertFalse((root / name).exists(), name)
+
+    def test_running_old_browser_and_newest_after_replan_are_kept(self):
+        root = self.browsers()
+        table = {"files": [], "commands": [("321", str(root / "chromium-99/browser") + " --headless")]}
+        with mock.patch.object(clean, "reap_process_table", return_value=table):
+            out = self.run_target("playwright")
+        item = next(item for item in out["items"] if item["path"].endswith("chromium-99"))
+        self.assertTrue(item["keep"].startswith("in-use:"), out)
+        entry = next(e for e in clean.clean_extra_entries({"playwright"}, []) if e["path"].endswith("chromium-99"))
+        clean.shutil.rmtree(root / "chromium-100")
+        with self.assertRaisesRegex(clean.ReapRefused, "newest-browser-build"):
+            clean.clean_act(entry, "fixture", 7)
+
+    def test_docker_build_gate_and_colima_trim_commands(self):
+        for command in ("123 docker build .", "123 docker buildx build .", "123 /bin/docker-buildx build ."):
+            with mock.patch.object(clean, "clean_docker_up", return_value=None), mock.patch.object(clean, "clean_run", return_value=(0, command)):
+                self.assertEqual(clean.clean_docker_ready(), "in-use:docker-build")
+        with mock.patch.dict(os.environ, {"DOCKER_HOST": "unix:///Users/test/.colima/default/docker.sock"}), \
+                mock.patch.object(clean, "clean_run", return_value=(0, "")) as run:
+            clean.clean_colima_trim()
+            self.assertEqual(run.call_args.args[0], ["colima", "ssh", "--", "sudo", "fstrim", "-av"])
+
+    def test_session_symlinks_and_protected_state_are_never_removed(self):
+        outside = self.put(self.tmp, "outside/data").parent
+        (self.sessions / "linked-session").symlink_to(outside, target_is_directory=True)
+        for state in (".wrangler", ".vercel", ".env.production", ".dev.vars.local"):
+            path = self.put(self.sessions, "session-" + state + "/" + state + "/state").parent.parent
+            self.age(path, 1)
+        out = self.run_target("agent-leftovers")
+        self.assertEqual(out["summary"]["done"], 0, out)
+        self.assertTrue((outside / "data").exists())
+        self.assertTrue((self.sessions / "linked-session").is_symlink())
+        self.assertEqual(len(out["items"]), 4, out)
+        self.assertTrue(all(item["keep"].startswith("protected-leaf:") for item in out["items"]), out)
+
+    def test_docker_prune_rechecks_builds_and_trims_only_after_success(self):
+        spec = {"name": "docker-build-cache", "argv": ["docker", "builder", "prune", "-af"], "busy": ()}
+        entry = {"name": spec["name"], "kind": "tool-cache", "spec": spec}
+        calls = []
+        def prune(argv, **kwargs):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, stdout="pruned", stderr="")
+        with mock.patch.object(clean, "clean_docker_ready", return_value=None) as ready, \
+                mock.patch.object(clean.subprocess, "run", side_effect=prune), \
+                mock.patch.object(clean, "clean_colima_trim", side_effect=lambda: (calls.append("trim") or (0, ""))), \
+                mock.patch.object(clean, "clean_receipt"):
+            clean.clean_run_tool(entry, "fixture")
+        self.assertEqual(calls, [["docker", "builder", "prune", "-af"], "trim"])
+        self.assertEqual(entry["colimaTrim"], "trimmed")
+        ready.assert_called_once()
+        entry = {"name": spec["name"], "kind": "tool-cache", "spec": spec}
+        with mock.patch.object(clean, "clean_docker_ready", return_value="in-use:docker-build"), \
+                mock.patch.object(clean.subprocess, "run") as run:
+            clean.clean_run_tool(entry, "fixture")
+        run.assert_not_called()
+        self.assertEqual(entry["keep"], "in-use:docker-build")
+
+    def test_auto_reports_actual_free_space_delta_even_when_zero(self):
+        self.cli("status")  # initialize the fixture database
+        for delta in (0, 123456):
+            with contextlib.closing(self.state()) as conn:
+                conn.execute("DELETE FROM meta WHERE key=?", (clean.CLEAN_AUTO_KEY,))
+                conn.commit()
+                actions, errors = [], []
+                disks = [{"usedPercent": 98, "freeBytes": 100}, {"usedPercent": 98, "freeBytes": 100 + delta}]
+                with mock.patch.object(clean, "disk_state", side_effect=disks), \
+                        mock.patch.object(clean, "clean_pass", return_value={"summary": {"done": 1, "freedBytes": 999}, "errors": []}):
+                    clean.clean_auto(conn, {"cleanAtPercent": 95}, actions, errors)
+            self.assertEqual(actions[0]["freedBytes"], delta)
+            self.assertEqual(errors, [])
 
 
 class Worktrees(Home):
@@ -302,27 +540,39 @@ class Report(Home):
 
 
 class Threshold(Home):
-    def tick(self, used: int):
-        with mock.patch.object(clean, "disk_state", lambda: {"path": str(self.tmp), "usedPercent": used, "freeBytes": 10 ** 9}):
+    GB = 1024 ** 3
+
+    def tick(self, used: int, free_gb: int = 50, at: float | None = None):
+        patches = [mock.patch.object(clean, "disk_state", lambda: {"path": str(self.tmp), "usedPercent": used, "freeBytes": free_gb * self.GB})]
+        if at is not None:
+            patches.append(mock.patch.object(clean, "now", lambda: at))
+        with contextlib.ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
             return self.cli("tick")
 
-    def test_tick_cleans_at_cleanAtPercent_at_most_hourly(self):
+    def cleaned(self, out):
+        return [a.get("reason") for a in out["actions"] if a.get("did") == "cleaned-at-disk-pressure"]
+
+    def test_automatic_clean_is_event_driven_not_a_timer(self):
         repo = self.clone("app")
         path = repo.parent / "app-old"
         self.git(repo, "worktree", "add", "-b", "old", str(path))
         self.age(path, 10)
         self.age(repo / ".git" / "worktrees" / "app-old", 10)
-
-        self.assertEqual(self.tick(94)["actions"], [], "below the default 95%")
+        t = time.time()
+        self.assertEqual(self.cleaned(self.tick(94, at=t)), [], "below the default 95%")
         self.assertTrue(path.exists())
-        first = self.tick(95)
-        self.assertEqual([a["did"] for a in first["actions"]], ["cleaned-at-disk-pressure"], first)
+        self.assertEqual(self.cleaned(self.tick(95, at=t + 1)), ["crossed"])
         self.assertFalse(path.exists())
-        self.assertEqual(self.tick(99)["actions"], [], "at most once an hour")
-        with contextlib.closing(sqlite3.connect(str(self.home / ".local/state/trimreaper/state.sqlite3"))) as conn, conn:
-            conn.execute("DELETE FROM meta WHERE key=?", (clean.CLEAN_AUTO_KEY,))
+        self.assertEqual(self.cleaned(self.tick(99, at=t + 7200)), [], "no new pressure two hours later: no repeat")
+        self.assertEqual(self.cleaned(self.tick(99, free_gb=44, at=t + 7300)), ["growth"], "6 GB more used")
+        self.assertEqual(self.cleaned(self.tick(90, free_gb=60, at=t + 7400)), [], "below again: re-armed")
+        self.assertEqual(self.cleaned(self.tick(96, free_gb=40, at=t + 7500)), ["crossed"], "the next crossing runs again")
+        self.assertEqual(self.cleaned(self.tick(96, free_gb=8, at=t + 7600)), [], "stampede guard: minutes apart")
+        self.assertEqual(self.cleaned(self.tick(96, free_gb=8, at=t + 8300)), ["floor"])
         self.write_config({"policy": {"cleanAtPercent": 0}})
-        self.assertEqual(self.tick(100)["actions"], [], "0 turns it off")
+        self.assertEqual(self.cleaned(self.tick(100, free_gb=1, at=t + 9999)), [], "0 turns it off")
 
     def test_policy_values_are_checked(self):
         for policy in ({"cleanAtPercent": 101}, {"cleanAtPercent": "95"}, {"worktreeIdleDays": -1}):

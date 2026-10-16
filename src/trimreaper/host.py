@@ -45,8 +45,13 @@ DEFAULT_POLICY = {
     "cloneProtectedCopies": "keep",
     # Disk pressure: at or above this used percent, idle (parked/interrupted) jobs lose their derived build output too.
     "diskWarnPercent": 85,
-    # `tick` runs `trimreaper clean` when the volume is at or above this used percent (at most hourly); 0 turns it off.
+    # `tick` runs `trimreaper clean` when the volume reaches this used percent, then again only on new pressure (no timer); 0 = off.
     "cleanAtPercent": 95,
+    # New pressure: this many more GB used since the last automatic pass, or free space under cleanFloorGB.
+    "cleanGrowthGB": 5,
+    "cleanFloorGB": 10,
+    # Parked/blocked jobs give up their derived build output after this many hours without a report; 0 = only under pressure.
+    "parkedReapHours": 24,
     # A linked git worktree no job owns goes after this many days without a change (and every other check); 0 keeps them all.
     "worktreeIdleDays": 7,
 }
@@ -170,6 +175,10 @@ def check_policy(policy: dict) -> None:
         value = merged[key]
         if not isinstance(value, int) or isinstance(value, bool) or not low <= value <= 100:
             raise HostError(f"policy {key} must be a whole number from {low} to 100, not {json.dumps(value)}")
+    for key, high in (("cleanGrowthGB", 1000), ("cleanFloorGB", 1000), ("parkedReapHours", 24 * 365)):
+        value = merged[key]
+        if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= high:
+            raise HostError(f"policy {key} must be a whole number from 0 to {high}, not {json.dumps(value)}")
     value = merged["worktreeIdleDays"]
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise HostError(f"policy worktreeIdleDays must be a whole number of days (0 = never), not {json.dumps(value)}")

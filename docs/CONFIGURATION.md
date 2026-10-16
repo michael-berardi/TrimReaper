@@ -31,8 +31,11 @@ Paths are absolute or start with `~/`. Here `~` is the reap home (`home`), not t
 | `archiveExpiryDays` | `30` | An archive goes this many days after it became the only copy of its clone. `0`: archives are kept. |
 | `cloneArchive` | `"archive"` | `"archive"` saves work no remote holds before an expired folder goes. Any other value keeps such folders. |
 | `cloneProtectedCopies` | `"keep"` | `"keep"` keeps every clone that holds `.env*`, `.dev.vars*`, `.wrangler` or `.vercel`. `"remove"` archives those owner-only (`protected.tar.gz`) and lets them go with the clone; it needs `cloneArchive` `"archive"`. Copies inside dependency or build folders (`node_modules/.env` ...) are not archived: they go with the folder. |
-| `diskWarnPercent` | `85` | At or above this used percent, the build output of parked or interrupted jobs goes too. Checked during a `tick` that has a finished job due. |
-| `cleanAtPercent` | `95` | At or above this used percent, `tick` runs `trimreaper clean` (the safe tier, no report), at most once an hour. `0` turns it off. |
+| `diskWarnPercent` | `85` | At or above this used percent, the build output of parked, blocked or interrupted jobs goes too. Checked on every `tick` that has idle jobs. |
+| `parkedReapHours` | `24` | A parked or blocked job with no report, start or park for this many hours gives up its derived build output (`node_modules`, `target`, `.next`, `.open-next`, `.turbo`, `.astro`); its clone, cache and evidence stay. `0`: only under disk pressure. |
+| `cleanAtPercent` | `95` | When the volume reaches this used percent, `tick` runs one `trimreaper clean` pass (the safe tier, no report). There is no timer: it runs again only on new pressure (`cleanGrowthGB` more used, or free space under `cleanFloorGB`), and dropping back below re-arms it. `0` turns it off. |
+| `cleanGrowthGB` | `5` | New pressure after an automatic pass: this many more GB used than when that pass ended. |
+| `cleanFloorGB` | `10` | Free space under this many GB always counts as new pressure, even below `cleanAtPercent`. |
 | `worktreeIdleDays` | `7` | A linked git worktree no job owns is removed by `clean` after this many days without a change, and every other check. `0` keeps them all. |
 
 ## Jobs

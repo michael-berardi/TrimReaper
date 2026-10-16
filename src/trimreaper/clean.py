@@ -8,7 +8,7 @@ Three things, each with its own rule:
 * Agent worktrees: linked git worktrees left by Claude Code, Codex, Cursor, Conductor and the like. One goes when it is idle,
   unlocked, clean, holds nothing git ignores but build output, holds no protected name, no process uses it, and every commit
   its HEAD ever pointed at is still on a branch, tag or remote. It goes through the guarded removal; its branch stays.
-* Local models, browser builds, Docker's disk image and local snapshots are reported with their size, never removed.
+* Stale build/session debris and superseded browser builds use guarded removal; models and disk images are report-only.
 
 Only names, sizes and times are read, never file contents. Space freed is the volume's free space after minus before.
 Everything between the `trimreaper clean` markers can be vendored byte for byte after the engine, like the engine itself
@@ -17,6 +17,7 @@ Everything between the `trimreaper clean` markers can be vendored byte for byte 
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -35,7 +36,7 @@ CLEAN_HOST_NAMES = ("reap_worktree_homes",)
 # >>> trimreaper clean >>>
 CLEAN_TOOL_SECONDS = 900       # one native cleaner; longer is a named timeout
 CLEAN_SIZE_SECONDS = 20        # one size walk; longer is reported as incomplete
-CLEAN_AUTO_SECONDS = 3600      # `tick` cleans at most this often while the disk stays above cleanAtPercent
+CLEAN_AUTO_SECONDS = 600       # stampede guard only: automatic passes are event-driven (see clean_auto_observe)
 CLEAN_AUTO_KEY = "clean:auto"
 CLEAN_TOOL_ENV = {"HOMEBREW_NO_AUTO_UPDATE": "1", "HOMEBREW_NO_ENV_HINTS": "1", "HOMEBREW_NO_AUTOREMOVE": "1"}  # cleanup never uninstalls a formula
 # Tools run from the home folder, so a project's own config (.npmrc, a pinned yarn) never changes which cache they clean.
@@ -92,6 +93,34 @@ def clean_docker_up() -> str | None:
     return None if clean_run(["docker", "info", "--format", "{{.ServerVersion}}"], 15)[0] == 0 else "docker-not-running"
 
 
+def clean_docker_ready() -> str | None:
+    reason = clean_docker_up()
+    if reason:
+        return reason
+    code, out = clean_run(["ps", "-axww", "-o", "pid=,command="], 30)
+    if code != 0 or not out.strip():
+        return "probe-failed:docker-build-processes"
+    for line in out.splitlines():
+        tokens = line.split()[1:]
+        for index, token in enumerate(tokens):
+            program = os.path.basename(token).lower()
+            tail = tokens[index + 1:]
+            if program in ("docker-buildx", "buildkitd", "buildctl") or (program == "docker" and
+                    any(word in ("build", "buildx") for word in tail)):
+                return "in-use:docker-build"
+    return None
+
+
+def clean_colima_trim() -> tuple[int, str] | None:
+    host = os.environ.get("DOCKER_HOST")
+    if host is None:
+        code, out = clean_run(["docker", "context", "inspect", "--format", "{{.Endpoints.docker.Host}}"], 15)
+        host = out.strip() if code == 0 else ""
+    if host.startswith("unix://") and ".colima" in Path(host[7:]).parts:
+        return clean_run(["colima", "ssh", "--", "sudo", "fstrim", "-av"], CLEAN_TOOL_SECONDS)
+    return None
+
+
 def clean_installed(program: str) -> str | None:
     """Why `program` cannot run, or None. On macOS, /usr/bin/pip3, xcrun and the like are stubs that open an "install the
     developer tools" window when the Command Line Tools are missing; such a stub counts as missing."""
@@ -120,9 +149,9 @@ CLEAN_TOOLS = (
     {"name": "go", "argv": ["go", "clean", "-cache", "-testcache", "-fuzzcache"], "busy": ("go",), "where": clean_asked("go", "env", "GOCACHE")},
     {"name": "homebrew", "argv": ["brew", "cleanup", "--prune=all"], "busy": ("brew",), "where": clean_asked("brew", "--cache")},
     {"name": "simulators", "deep": True, "argv": ["xcrun", "simctl", "delete", "unavailable"], "busy": ("simulator",), "ready": clean_simctl},
-    {"name": "docker-build-cache", "argv": ["docker", "builder", "prune", "-af"], "busy": (), "ready": clean_docker_up},
+    {"name": "docker-build-cache", "argv": ["docker", "builder", "prune", "-af"], "busy": (), "ready": clean_docker_ready},
     {"name": "go-modules", "deep": True, "argv": ["go", "clean", "-modcache"], "busy": ("go", "gopls"), "where": clean_asked("go", "env", "GOMODCACHE")},
-    {"name": "docker-images", "deep": True, "argv": ["docker", "image", "prune", "-af"], "busy": (), "ready": clean_docker_up},
+    {"name": "docker-images", "deep": True, "argv": ["docker", "image", "prune", "-af"], "busy": (), "ready": clean_docker_ready},
 )
 # Caches with no cleaner of their own: each folder directly inside a root goes through the guarded removal.
 CLEAN_FOLDERS = (
@@ -131,7 +160,9 @@ CLEAN_FOLDERS = (
      "roots": lambda: [clean_home("Library", "Developer", "Xcode", "DerivedData")]},
 )
 CLEAN_WORKTREES = "worktrees"
-CLEAN_NAMES = tuple(t["name"] for t in CLEAN_TOOLS) + tuple(f["name"] for f in CLEAN_FOLDERS) + (CLEAN_WORKTREES,)
+CLEAN_EXTRA_NAMES = ("rust-build-output", "agent-leftovers", "playwright")
+CLEAN_RUST_BUSY = ("cargo", "rustc", "rust-analyzer", "clippy", "clippy-driver", "cargo-clippy")
+CLEAN_NAMES = tuple(t["name"] for t in CLEAN_TOOLS) + tuple(f["name"] for f in CLEAN_FOLDERS) + (CLEAN_WORKTREES,) + CLEAN_EXTRA_NAMES
 
 
 def clean_tilde(path: str) -> str:
@@ -420,6 +451,154 @@ def clean_worktree_entries(errors: list, skipped: list) -> list[dict]:
     return entries
 
 
+# ---- regenerable output and stale sessions ---------------------------------------------------------------------------
+
+def clean_leftover_roots() -> list[tuple[str, bool]]:
+    roots = [(f"/private/tmp/claude-{os.getuid()}", True)]
+    if os.environ.get("TMPDIR"):
+        roots.append((os.path.realpath(os.environ["TMPDIR"]), False))
+    return roots
+
+
+def clean_stale_tree(path: str) -> None:
+    """Every entry must be six hours idle; bounded metadata-only walk, never follow links."""
+    cutoff, count = now() - 6 * 3600, 0
+    stack = [(path, 0)]
+    while stack:
+        folder, depth = stack.pop()
+        if depth > REAP_MAX_DEPTH:
+            raise ReapRefused("idle-scan-incomplete")
+        info = os.lstat(folder)
+        if info.st_uid != os.getuid():
+            raise ReapRefused("not-owned-by-user")
+        if info.st_mtime > cutoff:
+            raise ReapRefused("recent:less-than-6h")
+        with os.scandir(folder) as entries:
+            for entry in entries:
+                count += 1
+                if count > REAP_WALK_ENTRIES:
+                    raise ReapRefused("idle-scan-incomplete")
+                info = entry.stat(follow_symlinks=False)
+                if info.st_uid != os.getuid():
+                    raise ReapRefused("not-owned-by-user")
+                if info.st_mtime > cutoff:
+                    raise ReapRefused("recent:less-than-6h")
+                if entry.is_dir(follow_symlinks=False):
+                    stack.append((entry.path, depth + 1))
+
+
+def clean_browser_builds(root: str) -> list[tuple[str, str, int]]:
+    found = []
+    if not os.path.isdir(root) or os.path.islink(root):
+        return found
+    with os.scandir(root) as entries:
+        for entry in entries:
+            match = re.fullmatch(r"([a-zA-Z][a-zA-Z0-9_-]*)-([0-9]+)", entry.name)
+            if match and entry.is_dir(follow_symlinks=False):
+                found.append((entry.path, match[1], int(match[2])))
+    return found
+
+
+def clean_rust_targets(errors: list) -> list[tuple[str, str]]:
+    """Find targets in repositories, including nested crates, without entering generated trees."""
+    roots = {clean_home(), *(str(base) for base, _ in reap_clone_bases()), *clean_worktree_homes()}
+    # Linked worktrees may live outside the home and configured clone bases.
+    roots.update(entry["path"] for entry in clean_worktree_entries(errors, []) if entry["kind"] == "worktree")
+    found, seen, count = set(), set(), 0
+    stack = [(root, False, 0, "") for root in sorted(roots)]
+    while stack:
+        folder, in_repo, depth, repo = stack.pop()
+        if folder in seen or os.path.islink(folder) or not os.path.isdir(folder):
+            continue
+        seen.add(folder)
+        if depth > REAP_MAX_DEPTH or any(reap_protected(part) for part in Path(folder).parts):
+            continue
+        try:
+            with os.scandir(folder) as scan:
+                entries = list(scan)
+            count += len(entries)
+            if count > REAP_WALK_ENTRIES:
+                errors.append({"clean": "rust-build-output", "error": "discovery-incomplete"})
+                break
+            if any(e.name == ".git" and not e.is_symlink() for e in entries):
+                in_repo, repo = True, folder
+            for entry in entries:
+                if not entry.is_dir(follow_symlinks=False) or reap_protected(entry.name):
+                    continue
+                if entry.name == "target":
+                    if in_repo:
+                        found.add((entry.path, repo))
+                    continue
+                if entry.name not in (".git", "node_modules", "Library", ".cache", ".local", ".Trash", "dist", "build", "vendor"):
+                    stack.append((entry.path, in_repo, depth + 1, repo))
+        except OSError as error:
+            errors.append({"clean": "rust-build-output", "error": clean_tilde(folder) + ":" + reap_named(error)})
+    return sorted(found)
+
+
+def clean_rust_lock_paths(target: str, repo: str) -> list[Path]:
+    # Include root locks as well as Cargo's profile/triple locks; the engine scan is bounded.
+    return [reap_queue_lock(repo), Path(target, ".cargo-lock"), Path(target, ".cargo-build-lock"), *reap_cargo_locks(target)]
+
+
+def clean_extra_gates(entry: dict, table: dict | None = None) -> None:
+    path, kind = entry["path"], entry["name"]
+    clean_folder_gates(path)
+    if kind == "rust-build-output":
+        busy = sorted(set(CLEAN_RUST_BUSY) & clean_running())
+        if busy:
+            raise ReapRefused("in-use:" + ",".join(busy))
+        clean_folder_gates(entry["target"])
+    elif kind == "agent-leftovers":
+        clean_stale_tree(path)
+    else:
+        builds = clean_browser_builds(entry["root"])
+        if not any(browser == entry["browser"] and build > entry["build"] for _, browser, build in builds):
+            raise ReapRefused("newest-browser-build")
+    reap_holders(entry.get("target", path), entry.get("target", path), table)
+
+
+def clean_extra_entries(only: set, errors: list) -> list[dict]:
+    entries = []
+    def add(name, path, root, **extra):
+        entries.append({"name": name, "kind": "debris", "path": path, "root": root, "paths": [path], "tier": "safe", **extra})
+    if "rust-build-output" in only:
+        for target, repo in clean_rust_targets(errors):
+            debug = os.path.join(target, "debug")
+            if os.path.isdir(debug) and not os.path.islink(debug):
+                add("rust-build-output", debug, target, target=target, repo=repo)
+            with os.scandir(target) as profiles:
+                for profile in profiles:
+                    path = os.path.join(profile.path, "incremental")
+                    if profile.name != "debug" and profile.is_dir(follow_symlinks=False) and not reap_protected(profile.name) \
+                            and os.path.isdir(path) and not os.path.islink(path):
+                        add("rust-build-output", path, target, target=target, repo=repo)
+    if "agent-leftovers" in only:
+        for root, sessions in clean_leftover_roots():
+            if not os.path.isdir(root) or os.path.islink(root) or os.lstat(root).st_uid != os.getuid():
+                continue
+            with os.scandir(root) as children:
+                for child in children:
+                    matches = sessions or bool(re.fullmatch(r"(?:.+-verify-.+|ultraterm-release\..+|ultraterm-publish-check\..+|.*-rust-target.*)", child.name))
+                    if matches and child.is_dir(follow_symlinks=False) and not reap_protected(child.name):
+                        add("agent-leftovers", child.path, root)
+    if "playwright" in only:
+        root = clean_home("Library", "Caches", "ms-playwright")
+        for path, browser, build in clean_browser_builds(root):
+            add("playwright", path, root, browser=browser, build=build)
+    table = reap_process_table() if entries else None
+    for entry in entries:
+        try:
+            if entry["name"] == "rust-build-output":
+                with reap_locks(clean_rust_lock_paths(entry["target"], entry["repo"]), create=False):
+                    clean_extra_gates(entry, table)
+            else:
+                clean_extra_gates(entry, table)
+        except (ReapRefused, OSError) as error:
+            entry["keep"] = str(error) if isinstance(error, ReapRefused) else "error:" + reap_named(error)
+    return entries
+
+
 # ---- the plan -------------------------------------------------------------------------------------------------------
 
 def clean_plan(only: set, deep: bool, errors: list, skipped: list, days: int) -> list[dict]:
@@ -481,6 +660,7 @@ def clean_plan(only: set, deep: bool, errors: list, skipped: list, days: int) ->
             except OSError as error:
                 entry["keep"] = "error:" + reap_named(error)
             entries.append(entry)
+    entries.extend(clean_extra_entries(only, errors))
     return entries
 
 
@@ -507,6 +687,11 @@ def clean_run_tool(entry: dict, run_id: str) -> None:
     if busy:
         entry["keep"] = "in-use:" + ",".join(busy)
         return
+    if entry["name"].startswith("docker-"):
+        reason = clean_docker_ready()
+        if reason:
+            entry["keep"] = reason
+            return
     clean_receipt("plan", entry, run_id)
     before = clean_free()
     try:
@@ -518,9 +703,13 @@ def clean_run_tool(entry: dict, run_id: str) -> None:
         outcome = f"failed:timeout-{CLEAN_TOOL_SECONDS}s"
     except OSError as error:
         outcome = "failed:" + reap_named(error)
+    if entry["name"] == "docker-build-cache" and outcome == "cleaned":
+        trim = clean_colima_trim()
+        if trim is not None:
+            entry["colimaTrim"] = "trimmed" if trim[0] == 0 else f"failed:exit-{trim[0]}"
     after = clean_free()
     entry["outcome"], entry["dfDeltaBytes"] = outcome, (after - before) if None not in (before, after) else None
-    clean_receipt("result", entry, run_id, outcome=outcome, dfDeltaBytes=entry["dfDeltaBytes"])
+    clean_receipt("result", entry, run_id, outcome=outcome, dfDeltaBytes=entry["dfDeltaBytes"], colimaTrim=entry.get("colimaTrim"))
 
 
 def clean_remove_folder(entry: dict, run_id: str, root: str, allow_git: bool, last_look) -> None:
@@ -558,6 +747,12 @@ def clean_remove_folder(entry: dict, run_id: str, root: str, allow_git: bool, la
 def clean_act(entry: dict, run_id: str, days: int) -> None:
     if entry["kind"] == "tool-cache":
         return clean_run_tool(entry, run_id)
+    if entry["kind"] == "debris":
+        with ExitStack() as stack:
+            if entry["name"] == "rust-build-output":
+                stack.enter_context(reap_locks(clean_rust_lock_paths(entry["target"], entry["repo"]), create=False))
+            clean_remove_folder(entry, run_id, entry["root"], False, lambda: clean_extra_gates(entry))
+        return
     if entry["kind"] == "worktree-entry":
         clean_entry_gates(entry)  # fresh
         clean_receipt("plan", entry, run_id)
@@ -691,24 +886,67 @@ def clean_pass(dry_run: bool, deep: bool = False, only: list | None = None, repo
     return out
 
 
-def clean_auto(conn, policy: dict, actions: list, errors: list) -> None:
-    """From `tick`: when the volume is at or above cleanAtPercent, one clean pass (safe tier), at most once an hour. `conn` is
-    the host's autocommit connection (like the engine's): the pacing key is written before the pass, not held in a transaction."""
+def clean_auto_state(conn) -> dict:
+    """The last automatic pass: {"at", "freeBytes"}; a legacy bare timestamp reads as {"at"}. Empty when armed (no pass pending)."""
+    stored = row(conn, "SELECT value FROM meta WHERE key=?", (CLEAN_AUTO_KEY,))
+    if not stored:
+        return {}
+    try:
+        value = json.loads(stored["value"])
+    except ValueError:
+        return {}
+    if isinstance(value, (int, float)):
+        return {"at": float(value)}
+    return value if isinstance(value, dict) else {}
+
+
+def clean_auto_observe(conn, policy: dict, disk: dict | None) -> str | None:
+    """Event-driven trigger, cheap enough for every tick and spawning nothing: the reason an automatic pass is due now, or None.
+    "crossed": the volume reached cleanAtPercent with no pass since it was last below it; "growth": cleanGrowthGB (default 5)
+    more is used than when the last pass ended; "floor": free space is under cleanFloorGB (default 10). Dropping back below
+    cleanAtPercent re-arms the trigger (the one write here), so the next crossing runs again. No recurring timer: a pass that
+    freed what it could is not repeated until real new pressure appears. CLEAN_AUTO_SECONDS is only a stampede guard."""
     percent = policy.get("cleanAtPercent", 95)
+    if not percent or not disk:
+        return None
+    state = clean_auto_state(conn)
+    floor = float(policy.get("cleanFloorGB", 10)) * 1024 ** 3
+    if disk["usedPercent"] < percent and disk["freeBytes"] >= floor:
+        if state:
+            conn.execute("DELETE FROM meta WHERE key=?", (CLEAN_AUTO_KEY,))  # re-arm for the next crossing
+        return None
+    if state and now() - float(state.get("at") or 0) < CLEAN_AUTO_SECONDS:
+        return None
+    if not state:
+        return "floor" if disk["usedPercent"] < percent else "crossed"
+    if disk["freeBytes"] < floor and (state.get("freeBytes") is None or disk["freeBytes"] < state["freeBytes"]):
+        return "floor"
+    growth = float(policy.get("cleanGrowthGB", 5)) * 1024 ** 3
+    if state.get("freeBytes") is None or state["freeBytes"] - disk["freeBytes"] >= growth:
+        return "growth"
+    return None
+
+
+def clean_auto(conn, policy: dict, actions: list, errors: list) -> None:
+    """From the host's scheduled pass (or a child it starts when clean_auto_observe says a pass is due): one clean pass (safe
+    tier) when a trigger fired. `conn` is the host's autocommit connection (like the engine's): the pass state is written before
+    the pass and updated with the free space after it, not held in a transaction."""
     disk = disk_state()
-    if not percent or not disk or disk["usedPercent"] < percent:
+    reason = clean_auto_observe(conn, policy, disk)
+    if not reason:
         return
-    last = row(conn, "SELECT value FROM meta WHERE key=?", (CLEAN_AUTO_KEY,))
-    if last and now() - float(last["value"]) < CLEAN_AUTO_SECONDS:
-        return
-    conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (CLEAN_AUTO_KEY, str(now())))
+    conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (CLEAN_AUTO_KEY, json.dumps({"at": now(), "freeBytes": disk["freeBytes"]})))
     try:
         out = clean_pass(False, report=False, policy=policy)
     except (HostError, ReapRefused, OSError) as error:
         errors.append({"clean": "auto", "error": str(error)})
         return
-    actions.append({"did": "cleaned-at-disk-pressure", "usedPercent": disk["usedPercent"], "atPercent": percent,
-                    "done": out["summary"]["done"], "freedBytes": out["summary"]["freedBytes"]})
+    after = disk_state()
+    freed = after["freeBytes"] - disk["freeBytes"] if after else None
+    if after:
+        conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (CLEAN_AUTO_KEY, json.dumps({"at": now(), "freeBytes": after["freeBytes"]})))
+    actions.append({"did": "cleaned-at-disk-pressure", "reason": reason, "usedPercent": disk["usedPercent"], "atPercent": policy.get("cleanAtPercent", 95),
+                    "done": out["summary"]["done"], "freedBytes": freed})
     errors.extend(out["errors"])
     if out.get("stopped"):
         errors.append({"clean": "auto", "stopped": out["stopped"]})

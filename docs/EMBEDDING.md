@@ -19,9 +19,10 @@ It is vendored the same way, after the engine, and calls the engine's gates. Eve
 |---|---|
 | `reap_worktree_homes()` | Folders where agent tools keep worktrees, as `Path`s, or `None` for the built-in list. |
 
-Its entry points are `clean_pass(dry_run, deep=False, only=None, report=True)` and `clean_auto(conn, policy, actions,
-errors)`, which a host's scheduled pass calls (it reads `cleanAtPercent` and `worktreeIdleDays` from the policy, defaulting
-to 95 and 7, and the `meta` key `clean:auto`). An embedded copy runs under the host's own single-owner lock, so a host
+Its entry points are `clean_pass(dry_run, deep=False, only=None, report=True)`, `clean_auto_observe(conn, policy, disk)` (the
+event-driven trigger: why a pass is due now, or None; it starts nothing) and `clean_auto(conn, policy, actions,
+errors)`, which a host's scheduled pass calls (it reads `cleanAtPercent`, `cleanGrowthGB`, `cleanFloorGB` and `worktreeIdleDays` from the policy, defaulting
+to 95, 5, 10 and 7, and the `meta` key `clean:auto`). An embedded copy runs under the host's own single-owner lock, so a host
 never adds a second cleaner.
 
 ## Modules the host imports
