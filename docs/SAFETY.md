@@ -44,6 +44,21 @@ finishes, in case it is resumed. A **build queue** is any tool that takes a per-
 15. **After.** The identities of protected files next to the item are re-taken. Any difference stops the whole sweep.
     The result receipt is written while the locks are still held.
 
+## Narrow exact-output route
+
+`job-derived-output` still uses `reap_item`, receipts, descriptor removal and all final checks. Unlike a source-root
+sweep it can reclaim only a named `target` or `node_modules` whose producer registry matches the source/output
+identities. The owner must be settled and terminal; an interrupted owner needs a verified interruption clock. Every
+live exact/descendant output claim is checked, including machine-recorded path claims. A continuation's source-root
+claim alone is not an output claim. Producer and Cargo locks cover all proofs and removal.
+
+Git must prove in-repository output ignored and untracked; source need not be clean or pushed because no source is
+removed. Detached cache output instead requires safe source Git metadata and producer association. A source-only cwd
+may remain, but output handles, source non-cwd handles, unknown builders, protected names and preserving retention
+markers still refuse. A release-bearing target without an explicit disposable output marker stays. Legacy or unmanaged
+outputs without producer proof stay. See [EMBEDDING.md](EMBEDDING.md#exact-terminal-job-outputs) for the cooperative
+producer contract; this is not an OS sandbox against a writer that deliberately bypasses the queue.
+
 ## Removals outside `reap_item`
 
 These also remove files, each with its own checks:

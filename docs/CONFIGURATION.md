@@ -33,9 +33,10 @@ Paths are absolute or start with `~/`. Here `~` is the reap home (`home`), not t
 | `cloneProtectedCopies` | `"keep"` | `"keep"` keeps every clone that holds `.env*`, `.dev.vars*`, `.wrangler` or `.vercel`. `"remove"` archives those owner-only (`protected.tar.gz`) and lets them go with the clone; it needs `cloneArchive` `"archive"`. Copies inside dependency or build folders (`node_modules/.env` ...) are not archived: they go with the folder. |
 | `diskWarnPercent` | `85` | At or above this used percent, the build output of parked, blocked or interrupted jobs goes too. Checked on every `tick` that has idle jobs. |
 | `parkedReapHours` | `24` | A parked or blocked job with no report, start or park for this many hours gives up its derived build output (`node_modules`, `target`, `.next`, `.open-next`, `.turbo`, `.astro`); its clone, cache and evidence stay. `0`: only under disk pressure. |
-| `cleanAtPercent` | `95` | When the volume reaches this used percent, `tick` runs one `trimreaper clean` pass (the safe tier, no report). There is no timer: it runs again only on new pressure (`cleanGrowthGB` more used, or free space under `cleanFloorGB`), and dropping back below re-arms it. `0` turns it off. |
+| `cleanAtPercent` | `85` | High watermark: starts an event-driven safe clean pass. `0` disables automatic cleaning. Otherwise it must exceed `cleanToPercent` and be at most 100. |
+| `cleanToPercent` | `80` | Low watermark: try largest disposable candidates first until measured occupancy reaches this goal. Must be positive and below the high watermark. Below this level re-arms the high crossing. Unmet goals retry only on new pressure or a changed release event, after the cooldown. |
 | `cleanGrowthGB` | `5` | New pressure after an automatic pass: this many more GB used than when that pass ended. |
-| `cleanFloorGB` | `10` | Free space under this many GB always counts as new pressure, even below `cleanAtPercent`. |
+| `cleanFloorGB` | `10` | At or above the high watermark, further decline below this free-space floor counts as new pressure. |
 | `projectIdleHours` | `48` | A project's dependency and output folders (`node_modules`, `.next`, `.venv` ...) are removed by `clean` after this many hours without a change in the project; a copy named after a finished job needs 6. `0` keeps them all. |
 | `worktreeIdleDays` | `7` | A linked git worktree no job owns is removed by `clean` after this many days without a change, and every other check. `0` keeps them all. |
 

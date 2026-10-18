@@ -173,8 +173,56 @@ def clean_tilde(path: str) -> str:
 
 
 def clean_free() -> int | None:
-    disk = disk_state()
+    disk = clean_disk()
     return disk["freeBytes"] if disk else None
+
+
+def clean_os_refusal(error: OSError) -> str:
+    """A candidate failure never aborts independent candidates or authorizes a retry."""
+    return ("missing:" if isinstance(error, FileNotFoundError) else "unreadable:") + reap_named(error)
+
+
+def clean_scan(path: str, label: str, errors: list) -> list:
+    try:
+        with os.scandir(path) as scan:
+            return list(scan)
+    except OSError as error:
+        errors.append({"clean": label, "path": clean_tilde(str(path)), "error": clean_os_refusal(error)})
+        return []
+
+
+def clean_directory(entry, label: str, errors: list) -> bool:
+    try:
+        return entry.is_dir(follow_symlinks=False)
+    except OSError as error:
+        errors.append({"clean": label, "path": clean_tilde(entry.path), "error": clean_os_refusal(error)})
+        return False
+
+
+def clean_goals(policy: dict) -> tuple[float, float]:
+    high, low = policy.get("cleanAtPercent", 85), policy.get("cleanToPercent", 80)
+    if high == 0 and not isinstance(high, bool):
+        high = 85  # automatic off is not a refusal of an explicitly requested manual clean
+    if any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in (high, low)) or not 0 < low < high <= 100:
+        raise HostError("clean goals must satisfy 0 < cleanToPercent < cleanAtPercent <= 100")
+    return high, low
+
+
+def clean_disk() -> dict | None:
+    try:
+        return disk_state()
+    except (OSError, HostError):
+        return None
+
+
+def clean_occupancy(disk: dict | None, low: float) -> dict:
+    """Never infer exact capacity from the host's rounded df percentage."""
+    used, free = (disk.get("usedBytes"), disk.get("freeBytes")) if disk else (None, None)
+    if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 <= v < float("inf") for v in (used, free)) or used + free <= 0:
+        return {"usedPercent": None, "remainingBytes": None, "goalMet": None}
+    total = used + free
+    excess = max(0, used * 100 - total * low)
+    return {"usedPercent": used * 100 / total, "remainingBytes": int(-(-excess // 100)), "goalMet": excess == 0}
 
 
 def clean_running() -> set:
@@ -236,7 +284,7 @@ def clean_main_repos(errors: list) -> list[str]:
             continue
         for entry in entries:
             dot_git = os.path.join(entry.path, ".git")
-            if (not prefix or entry.name.startswith(prefix)) and entry.is_dir(follow_symlinks=False) \
+            if (not prefix or entry.name.startswith(prefix)) and clean_directory(entry, CLEAN_WORKTREES, errors) \
                     and os.path.isdir(dot_git) and not os.path.islink(dot_git):
                 found.add(reap_canon(entry.path))
     for top in clean_worktree_homes():
@@ -247,7 +295,14 @@ def clean_main_repos(errors: list) -> list[str]:
                 entries = list(os.scandir(folder))
             except OSError:
                 continue
-            dot_git = next((e for e in entries if e.name == ".git" and e.is_file(follow_symlinks=False)), None)
+            dot_git = None
+            for entry in entries:
+                if entry.name == ".git":
+                    try:
+                        if entry.is_file(follow_symlinks=False):
+                            dot_git = entry
+                    except OSError as error:
+                        errors.append({"clean": CLEAN_WORKTREES, "path": clean_tilde(entry.path), "error": clean_os_refusal(error)})
             if dot_git is not None:
                 gitdir = clean_pointer_target(dot_git.path)
                 common = os.path.dirname(os.path.dirname(gitdir)) if gitdir else ""
@@ -255,7 +310,7 @@ def clean_main_repos(errors: list) -> list[str]:
                     found.add(reap_canon(os.path.dirname(common)))
                 continue
             if depth < 3:
-                stack.extend((e.path, depth + 1) for e in entries if e.is_dir(follow_symlinks=False) and not reap_protected(e.name))
+                stack.extend((e.path, depth + 1) for e in entries if clean_directory(e, CLEAN_WORKTREES, errors) and not reap_protected(e.name))
     return sorted(found)
 
 
@@ -443,6 +498,8 @@ def clean_listed(repo: str):
         return clean_linked_worktrees(repo)
     except ReapRefused as refusal:
         return refusal
+    except OSError as error:
+        return ReapRefused(clean_os_refusal(error))
 
 
 def clean_worktree_entries(errors: list, skipped: list) -> list[dict]:
@@ -454,11 +511,15 @@ def clean_worktree_entries(errors: list, skipped: list) -> list[dict]:
             skipped.append({"repo": clean_tilde(repo), "reason": str(records)})
             continue
         for record in records:
-            path = reap_canon(record["worktree"])
-            entry = {"name": CLEAN_WORKTREES, "kind": "worktree", "path": path, "repo": repo, "git": record,
-                     "branch": record.get("branch", "").removeprefix("refs/heads/") or None, "gitdir": clean_worktree_gitdir(repo, path)}
-            if not os.path.lexists(path):
-                entry["kind"] = "worktree-entry"  # the folder is gone; only the repository's record of it is left
+            entry = {"name": CLEAN_WORKTREES, "kind": "worktree", "path": record["worktree"], "repo": repo, "git": record,
+                     "branch": record.get("branch", "").removeprefix("refs/heads/") or None}
+            try:
+                path = entry["path"] = reap_canon(record["worktree"])
+                entry["gitdir"] = clean_worktree_gitdir(repo, path)
+                if not os.path.lexists(path):
+                    entry["kind"] = "worktree-entry"  # only the repository's stale registration remains
+            except OSError as error:
+                entry["keep"] = clean_os_refusal(error)
             entries.append(entry)
     return entries
 
@@ -530,15 +591,15 @@ def clean_stale_tree(path: str, hours: int = 6) -> None:
                     stack.append((entry.path, depth + 1))
 
 
-def clean_browser_builds(root: str) -> list[tuple[str, str, int]]:
+def clean_browser_builds(root: str, errors: list | None = None) -> list[tuple[str, str, int]]:
     found = []
+    errors = errors if errors is not None else []
     if not os.path.isdir(root) or os.path.islink(root):
         return found
-    with os.scandir(root) as entries:
-        for entry in entries:
-            match = re.fullmatch(r"([a-zA-Z][a-zA-Z0-9_-]*)-([0-9]+)", entry.name)
-            if match and entry.is_dir(follow_symlinks=False):
-                found.append((entry.path, match[1], int(match[2])))
+    for entry in clean_scan(root, "playwright", errors):
+        match = re.fullmatch(r"([a-zA-Z][a-zA-Z0-9_-]*)-([0-9]+)", entry.name)
+        if match and clean_directory(entry, "playwright", errors):
+            found.append((entry.path, match[1], int(match[2])))
     return found
 
 
@@ -612,7 +673,7 @@ def clean_repo_walk(errors: list, wanted: frozenset, label: str) -> list[tuple[s
             if any(e.name == ".git" and not e.is_symlink() for e in entries):
                 in_repo, repo = True, folder
             for entry in entries:
-                if not entry.is_dir(follow_symlinks=False) or reap_protected(entry.name):
+                if not clean_directory(entry, label, errors) or reap_protected(entry.name):
                     continue
                 if entry.name in wanted:
                     if in_repo:
@@ -726,50 +787,48 @@ def clean_extra_entries(only: set, errors: list, idle_hours: int = 48) -> list[d
             debug = os.path.join(target, "debug")
             if os.path.isdir(debug) and not os.path.islink(debug):
                 add("rust-build-output", debug, target, target=target, repo=repo)
-            with os.scandir(target) as profiles:
-                for profile in profiles:
-                    path = os.path.join(profile.path, "incremental")
-                    if profile.name != "debug" and profile.is_dir(follow_symlinks=False) and not reap_protected(profile.name) \
-                            and os.path.isdir(path) and not os.path.islink(path):
-                        add("rust-build-output", path, target, target=target, repo=repo)
+            for profile in clean_scan(target, "rust-build-output", errors):
+                path = os.path.join(profile.path, "incremental")
+                if profile.name != "debug" and clean_directory(profile, "rust-build-output", errors) and not reap_protected(profile.name) \
+                        and os.path.isdir(path) and not os.path.islink(path):
+                    add("rust-build-output", path, target, target=target, repo=repo)
     if "project-dependencies" in only and idle_hours:
         for path, repo in clean_project_outputs(errors):
             add("project-dependencies", path, os.path.dirname(path), repo=repo, idleHours=idle_hours)
     if "agent-leftovers" in only:
         for root, sessions in clean_leftover_roots():
-            if not os.path.isdir(root) or os.path.islink(root) or os.lstat(root).st_uid != os.getuid():
+            try:
+                if not os.path.isdir(root) or os.path.islink(root) or os.lstat(root).st_uid != os.getuid():
+                    continue
+            except OSError as error:
+                errors.append({"clean": "agent-leftovers", "path": clean_tilde(root), "error": clean_os_refusal(error)})
                 continue
-            with os.scandir(root) as children:
-                for child in children:
-                    matches = sessions or bool(re.fullmatch(r"(?:.+-verify-.+|ultraterm-release\..+|ultraterm-publish-check\..+|.*-rust-target.*)", child.name))
-                    if matches and child.is_dir(follow_symlinks=False) and not reap_protected(child.name):
-                        add("agent-leftovers", child.path, root)
+            for child in clean_scan(root, "agent-leftovers", errors):
+                matches = sessions or bool(re.fullmatch(r"(?:.+-verify-.+|ultraterm-release\..+|ultraterm-publish-check\..+|.*-rust-target.*)", child.name))
+                if matches and clean_directory(child, "agent-leftovers", errors) and not reap_protected(child.name):
+                    add("agent-leftovers", child.path, root)
         seen = {e["path"] for e in entries}
         sessions_root = os.path.realpath(f"/private/tmp/claude-{os.getuid()}")
         for root, hours in clean_temp_roots():
-            try:
-                children = list(os.scandir(root))
-            except OSError:
-                continue
-            for child in children:
+            for child in clean_scan(root, "agent-leftovers", errors):
                 if child.path in seen or os.path.realpath(child.path) == sessions_root or CLEAN_TEMP_SYSTEM.match(child.name) \
-                        or reap_protected(child.name) or not child.is_dir(follow_symlinks=False):
+                        or reap_protected(child.name) or not clean_directory(child, "agent-leftovers", errors):
                     continue
                 try:
                     if child.stat(follow_symlinks=False).st_uid != os.getuid():
                         continue
-                except OSError:
+                except OSError as error:
+                    errors.append({"clean": "agent-leftovers", "path": clean_tilde(child.path), "error": clean_os_refusal(error)})
                     continue
                 add("agent-leftovers", child.path, root, idleHours=hours)
     if "browser-clones" in only:
         for root in clean_clone_roots():
-            with os.scandir(root) as clones:
-                for clone in clones:
-                    if clone.name.startswith("code_sign_clone.") and clone.is_dir(follow_symlinks=False):
-                        add("browser-clones", clone.path, root)
+            for clone in clean_scan(root, "browser-clones", errors):
+                if clone.name.startswith("code_sign_clone.") and clean_directory(clone, "browser-clones", errors):
+                    add("browser-clones", clone.path, root)
     if "playwright" in only:
         root = clean_home("Library", "Caches", "ms-playwright")
-        for path, browser, build in clean_browser_builds(root):
+        for path, browser, build in clean_browser_builds(root, errors):
             add("playwright", path, root, browser=browser, build=build)
     table = reap_process_table() if entries else None
     for entry in entries:
@@ -780,7 +839,7 @@ def clean_extra_entries(only: set, errors: list, idle_hours: int = 48) -> list[d
                     stack.enter_context(reap_locks(locks, create=False))
                 clean_extra_gates(entry, table)
         except (ReapRefused, OSError) as error:
-            entry["keep"] = str(error) if isinstance(error, ReapRefused) else "error:" + reap_named(error)
+            entry["keep"] = str(error) if isinstance(error, ReapRefused) else clean_os_refusal(error)
     return entries
 
 
@@ -788,7 +847,7 @@ def clean_extra_entries(only: set, errors: list, idle_hours: int = 48) -> list[d
 
 def clean_plan(only: set, deep: bool, errors: list, skipped: list, days: int, hours: int = 48) -> list[dict]:
     names = clean_running()
-    def tool_entry(spec):
+    def probe_tool(spec):
         entry = {"name": spec["name"], "kind": "tool-cache", "command": " ".join(spec["argv"]), "spec": spec,
                  "paths": [], "tier": "deep" if spec.get("deep") else "safe"}
         busy = sorted(set(spec["busy"]) & names)
@@ -806,6 +865,12 @@ def clean_plan(only: set, deep: bool, errors: list, skipped: list, days: int, ho
         if not missing and spec.get("where"):
             entry["paths"] = [p for p in spec["where"]() if os.path.isdir(p)]
         return entry
+    def tool_entry(spec):
+        try:
+            return probe_tool(spec)
+        except OSError as error:
+            return {"name": spec["name"], "kind": "tool-cache", "paths": [], "tier": "deep" if spec.get("deep") else "safe",
+                    "keep": clean_os_refusal(error)}
     with ThreadPoolExecutor(max_workers=8) as pool:  # each probe runs the tool once (`uv cache dir` ...)
         entries = list(pool.map(tool_entry, [spec for spec in CLEAN_TOOLS if spec["name"] in only]))
     for spec in CLEAN_FOLDERS:
@@ -815,24 +880,32 @@ def clean_plan(only: set, deep: bool, errors: list, skipped: list, days: int, ho
         for root in spec["roots"]():
             if not os.path.isdir(root) or os.path.islink(root):
                 continue
-            root = reap_canon(root)
-            with os.scandir(root) as children:
-                for child in sorted(children, key=lambda c: c.name):
+            try:
+                root = reap_canon(root)
+            except OSError as error:
+                errors.append({"clean": spec["name"], "path": clean_tilde(root), "error": clean_os_refusal(error)})
+                continue
+            for child in sorted(clean_scan(root, spec["name"], errors), key=lambda c: c.name):
+                entry = {"name": spec["name"], "kind": "folder-cache", "path": child.path, "root": root, "paths": [child.path], "tier": "safe"}
+                try:
                     if not child.is_dir(follow_symlinks=False):
                         continue
-                    entry = {"name": spec["name"], "kind": "folder-cache", "path": child.path, "root": root, "paths": [child.path], "tier": "safe"}
-                    try:
-                        if busy:
-                            raise ReapRefused("in-use:" + ",".join(busy))
-                        clean_folder_gates(child.path)
-                    except ReapRefused as refusal:
-                        entry["keep"] = str(refusal)
-                    entries.append(entry)
+                    if busy:
+                        raise ReapRefused("in-use:" + ",".join(busy))
+                    clean_folder_gates(child.path)
+                except ReapRefused as refusal:
+                    entry["keep"] = str(refusal)
+                except OSError as error:
+                    entry["keep"] = clean_os_refusal(error)
+                entries.append(entry)
     if CLEAN_WORKTREES in only:
         table = None
         for entry in clean_worktree_entries(errors, skipped):
             entry["tier"], entry["paths"] = "safe", [entry["path"]] if entry["kind"] == "worktree" else []
             try:
+                if "keep" in entry:
+                    entries.append(entry)
+                    continue
                 if not days:
                     raise ReapRefused("off:worktreeIdleDays=0")
                 if entry["kind"] == "worktree-entry":
@@ -843,7 +916,7 @@ def clean_plan(only: set, deep: bool, errors: list, skipped: list, days: int, ho
             except ReapRefused as refusal:
                 entry["keep"] = str(refusal)
             except OSError as error:
-                entry["keep"] = "error:" + reap_named(error)
+                entry["keep"] = clean_os_refusal(error)
             entries.append(entry)
     entries.extend(clean_extra_entries(only, errors, hours))
     return entries
@@ -851,13 +924,23 @@ def clean_plan(only: set, deep: bool, errors: list, skipped: list, days: int, ho
 
 def clean_size_all(entries: list[dict]) -> None:
     jobs = [(entry, path) for entry in entries for path in entry["paths"]]
+    def size_one(job):
+        try:
+            return reap_metadata_size(job[1], CLEAN_SIZE_SECONDS)
+        except OSError as error:
+            return {"bytes": None, "complete": False, "reason": clean_os_refusal(error)}
     with ThreadPoolExecutor(max_workers=16) as pool:
-        sized = list(pool.map(lambda job: reap_metadata_size(job[1], CLEAN_SIZE_SECONDS), jobs))
+        sized = list(pool.map(size_one, jobs))
     for entry in entries:
         entry["bytes"], entry["sizeComplete"] = 0, True
     for (entry, _), size in zip(jobs, sized):
         entry["bytes"] += size["bytes"] or 0
         entry["sizeComplete"] = entry["sizeComplete"] and size["complete"]
+        if not size["complete"]:
+            reason = size.get("reason") or "size-incomplete"
+            if reason.startswith("size-error:"):
+                reason = ("missing:" if "FileNotFoundError" in reason else "unreadable:") + reason
+            entry.setdefault("keep", reason)
 
 
 # ---- removal --------------------------------------------------------------------------------------------------------
@@ -912,7 +995,7 @@ def clean_remove_folder(entry: dict, run_id: str, root: str, allow_git: bool, la
     try:
         last_look()
     except (ReapRefused, OSError) as refusal:
-        reason = str(refusal) if isinstance(refusal, ReapRefused) else "error:" + reap_named(refusal)
+        reason = str(refusal) if isinstance(refusal, ReapRefused) else clean_os_refusal(refusal)
         clean_receipt("result", entry, run_id, outcome="refused", reason=reason)
         raise ReapRefused(reason)
     reap_remove_and_verify(fence, path, before, result, allow_git)
@@ -972,7 +1055,7 @@ def clean_inventory() -> list[dict]:
             return
         level = [root]
         for _ in range(depth):
-            level = [e.path for folder in level for e in os.scandir(folder) if e.is_dir(follow_symlinks=False) and not e.name.startswith(".")]
+            level = [e.path for folder in level for e in clean_scan(folder, kind, []) if clean_directory(e, kind, []) and not e.name.startswith(".")]
         for path in sorted(level):
             found.append({"kind": kind, "name": rename(os.path.relpath(path, root)), "path": path, "note": note})
     hub = os.environ.get("HF_HUB_CACHE") or (os.path.join(os.environ["HF_HOME"], "hub") if os.environ.get("HF_HOME") else None) \
@@ -1022,27 +1105,33 @@ def clean_shown(entry: dict) -> dict:
 
 
 def clean_pass(dry_run: bool, deep: bool = False, only: list | None = None, report: bool = True, policy: dict | None = None) -> dict:
-    """One pass. A dry run plans, sizes and reports; otherwise every candidate is acted on under the single cleanup owner."""
+    """A bounded candidate snapshot, largest first; stop on measured (not estimated) low-water occupancy."""
     if only is not None and not only:
         raise HostError("no clean targets named", "omit the target list for all of them: " + ", ".join(CLEAN_NAMES))
     unknown = sorted(set(only or ()) - set(CLEAN_NAMES))
     if unknown:
         raise HostError(f"unknown clean targets: {', '.join(unknown)}", "targets: " + ", ".join(CLEAN_NAMES))
     chosen, errors, skipped = set(only or CLEAN_NAMES), [], []
-    disk = disk_state()
     policy = policy if policy is not None else load_policy()
+    high, low = clean_goals(policy)
+    disk = clean_disk()
+    initial = clean_occupancy(disk, low)
     days = policy.get("worktreeIdleDays", 7)
     hours = policy.get("projectIdleHours", 48)
     entries = clean_plan(chosen, deep, errors, skipped, days, hours)
-    for entry in entries:  # a removal sizes only what it removes; a dry run also sizes what is kept, except job folders
-        if not dry_run and "keep" in entry or str(entry.get("keep")).startswith("job-folder"):
+    for entry in entries:  # never size job folders, or retained candidates during an actual removal
+        if (not dry_run and "keep" in entry) or str(entry.get("keep")).startswith("job-folder"):
             entry["paths"] = []
     clean_size_all(entries)
+    entries.sort(key=lambda e: ("keep" in e, -e["bytes"]))
     stopped = None
-    if not dry_run and any("keep" not in e for e in entries):
+    if not dry_run and initial["goalMet"] is not True and any("keep" not in e for e in entries):
         run_id = uuid.uuid4().hex[:12]
         with reap_cleanup_owner("clean"):
+            current = clean_occupancy(clean_disk(), low)
             for entry in entries:
+                if current["goalMet"] is True:
+                    break
                 if "keep" in entry:
                     continue
                 try:
@@ -1050,18 +1139,23 @@ def clean_pass(dry_run: bool, deep: bool = False, only: list | None = None, repo
                 except ReapRefused as refusal:
                     entry["keep"] = str(refusal)
                 except OSError as error:
-                    entry["keep"] = "error:" + reap_named(error)
+                    entry["keep"] = clean_os_refusal(error)
                 if entry.get("stopped"):
                     stopped = entry["stopped"]
                     held = getattr(REAP_CLEANUP_OWNER, "held", None)
                     if held:
                         held["stopped"] = stopped
                     break
-    after = disk_state()
+                current = clean_occupancy(clean_disk(), low)
+    after = clean_disk()
+    final = clean_occupancy(after, low)
     done = [e for e in entries if e.get("outcome") in ("cleaned", "removed", "worktree-entry-forgotten")]
     failed = [e for e in entries if e.get("outcome") and e not in done]
     candidates = [e for e in entries if "keep" not in e]
     out = {"dryRun": dry_run, "deep": deep, "disk": disk,
+           "cleanAtPercent": high, "cleanToPercent": low,
+           "initialOccupancy": initial, "finalOccupancy": final,
+           "remainingBytes": final["remainingBytes"], "goalMet": final["goalMet"],
            "summary": {"candidates": len(candidates), "candidateBytes": sum(e["bytes"] for e in candidates),
                        "kept": len(entries) - len(candidates), "done": len(done), "failed": len(failed),
                        "keptReasons": dict(sorted(Counter(e["keep"].split(":")[0] for e in entries if "keep" in e).items())),
@@ -1091,52 +1185,69 @@ def clean_auto_state(conn) -> dict:
     return value if isinstance(value, dict) else {}
 
 
-def clean_auto_observe(conn, policy: dict, disk: dict | None) -> str | None:
-    """Event-driven trigger, cheap enough for every tick and spawning nothing: the reason an automatic pass is due now, or None.
-    "crossed": the volume reached cleanAtPercent with no pass since it was last below it; "growth": cleanGrowthGB (default 5)
-    more is used than when the last pass ended; "floor": free space is under cleanFloorGB (default 10). Dropping back below
-    cleanAtPercent re-arms the trigger (the one write here), so the next crossing runs again. No recurring timer: a pass that
-    freed what it could is not repeated until real new pressure appears. CLEAN_AUTO_SECONDS is only a stampede guard."""
-    percent = policy.get("cleanAtPercent", 95)
-    if not percent or not disk:
+def clean_auto_observe(conn, policy: dict, disk: dict | None, event=None) -> str | None:
+    """Hysteresis and new host events, never a periodic retry. `event` is an opaque release-generation token.
+
+    Only below low re-arms a high crossing. Unresolved work can retry on a *changed* job/artifact release token;
+    a token is saved before starting, so unchanged ticks (and failed passes) cannot spin. The cooldown delays
+    new pressure/events but never creates one. Hosts may supply the token as policy.cleanEventToken instead.
+    """
+    if policy.get("cleanAtPercent") == 0:
+        return None
+    high, low = clean_goals(policy)
+    occupancy = clean_occupancy(disk, low)
+    percent = occupancy["usedPercent"]
+    if percent is None:
         return None
     state = clean_auto_state(conn)
-    floor = float(policy.get("cleanFloorGB", 10)) * 1024 ** 3
-    if disk["usedPercent"] < percent and disk["freeBytes"] >= floor:
+    if percent < low:
         if state:
-            conn.execute("DELETE FROM meta WHERE key=?", (CLEAN_AUTO_KEY,))  # re-arm for the next crossing
+            conn.execute("DELETE FROM meta WHERE key=?", (CLEAN_AUTO_KEY,))
         return None
     if state and now() - float(state.get("at") or 0) < CLEAN_AUTO_SECONDS:
         return None
     if not state:
-        return "floor" if disk["usedPercent"] < percent else "crossed"
-    if disk["freeBytes"] < floor and (state.get("freeBytes") is None or disk["freeBytes"] < state["freeBytes"]):
+        return "crossed" if percent >= high else None
+    event = policy.get("cleanEventToken") if event is None else event
+    if state.get("goalMet") is not True and event is not None and event != state.get("event"):
+        return "release"
+    if percent < high:
+        return None
+    previous = state.get("freeBytes")
+    if previous is None:
+        return None
+    floor = float(policy.get("cleanFloorGB", 10)) * 1024 ** 3
+    if disk["freeBytes"] < floor and disk["freeBytes"] < previous:
         return "floor"
     growth = float(policy.get("cleanGrowthGB", 5)) * 1024 ** 3
-    if state.get("freeBytes") is None or state["freeBytes"] - disk["freeBytes"] >= growth:
+    if disk["freeBytes"] < previous and previous - disk["freeBytes"] >= growth:
         return "growth"
     return None
 
 
-def clean_auto(conn, policy: dict, actions: list, errors: list) -> None:
-    """From the host's scheduled pass (or a child it starts when clean_auto_observe says a pass is due): one clean pass (safe
-    tier) when a trigger fired. `conn` is the host's autocommit connection (like the engine's): the pass state is written before
-    the pass and updated with the free space after it, not held in a transaction."""
-    disk = disk_state()
-    reason = clean_auto_observe(conn, policy, disk)
+def clean_auto(conn, policy: dict, actions: list, errors: list, event=None) -> None:
+    """One event-driven safe pass, with a pre-pass stamp and post-pass measured goal state."""
+    disk = clean_disk()
+    reason = clean_auto_observe(conn, policy, disk, event)
     if not reason:
         return
-    conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (CLEAN_AUTO_KEY, json.dumps({"at": now(), "freeBytes": disk["freeBytes"]})))
+    event = policy.get("cleanEventToken") if event is None else event
+    def save(measurement, goal_met):
+        state = {"at": now(), "freeBytes": measurement.get("freeBytes") if measurement else None,
+                 "goalMet": goal_met, "event": event}
+        conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (CLEAN_AUTO_KEY, json.dumps(state)))
+    save(disk, False)
     try:
         out = clean_pass(False, report=False, policy=policy)
     except (HostError, ReapRefused, OSError) as error:
         errors.append({"clean": "auto", "error": str(error)})
         return
-    after = disk_state()
+    after = out.get("diskAfter")
     freed = after["freeBytes"] - disk["freeBytes"] if after else None
-    if after:
-        conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (CLEAN_AUTO_KEY, json.dumps({"at": now(), "freeBytes": after["freeBytes"]})))
-    actions.append({"did": "cleaned-at-disk-pressure", "reason": reason, "usedPercent": disk["usedPercent"], "atPercent": policy.get("cleanAtPercent", 95),
+    save(after, out["goalMet"])
+    actions.append({"did": "cleaned-at-disk-pressure", "reason": reason, "usedPercent": clean_occupancy(disk, policy.get("cleanToPercent", 80))["usedPercent"],
+                    "atPercent": policy.get("cleanAtPercent", 85), "toPercent": policy.get("cleanToPercent", 80),
+                    "goalMet": out["goalMet"], "remainingBytes": out["remainingBytes"],
                     "done": out["summary"]["done"], "freedBytes": freed})
     errors.extend(out["errors"])
     if out.get("stopped"):

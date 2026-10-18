@@ -148,7 +148,7 @@ def cmd_tick(args) -> dict:
         policy = host.load_policy()
         core.reap_tick(conn, policy, [], actions, errors)
         core.evidence_expiry_tick(conn, policy, [], actions, errors)
-        clean.clean_auto(conn, policy, actions, errors)
+        clean.clean_auto(conn, policy, actions, errors, event=host.clean_release_event_token(conn))
     out = {"at": host.iso(), "actions": actions, "errors": errors}
     if args.record:
         write_private(host.state_dir() / "last-tick.json", json.dumps(out, indent=2, sort_keys=True, default=str) + "\n")
@@ -157,7 +157,12 @@ def cmd_tick(args) -> dict:
 
 def cmd_clean(args) -> dict:
     only = None if args.only is None else [name.strip() for part in args.only for name in part.split(",") if name.strip()]
-    return clean.clean_pass(args.dry_run, args.deep, only, report=not args.no_report)
+    policy = host.load_policy()
+    if getattr(args, "clean_at_percent", None) is not None:
+        policy["cleanAtPercent"] = args.clean_at_percent
+    if getattr(args, "clean_to_percent", None) is not None:
+        policy["cleanToPercent"] = args.clean_to_percent
+    return clean.clean_pass(args.dry_run, args.deep, only, report=not args.no_report, policy=policy)
 
 
 def write_private(path: Path, text: str, mode: int = 0o600) -> None:
@@ -345,6 +350,8 @@ def parser() -> argparse.ArgumentParser:
     tidy.add_argument("--deep", action="store_true", help="also the deep tier (Go module cache, unused Docker images)")
     tidy.add_argument("--only", action="append", metavar="NAMES", help="comma-separated targets: " + ",".join(clean.CLEAN_NAMES))
     tidy.add_argument("--no-report", action="store_true", help="skip the models/browsers/disk-image report")
+    tidy.add_argument("--clean-at-percent", "--high-watermark", type=float, help="high-water trigger percent (default 85)")
+    tidy.add_argument("--clean-to-percent", "--low-watermark", type=float, help="stop at this measured occupancy (default 80)")
     tidy.set_defaults(func=cmd_clean)
 
     schedule = sub.add_parser("schedule", help="run `tick` on a schedule with launchd (macOS)")

@@ -346,9 +346,9 @@ class Debris(Home):
                 conn.execute("DELETE FROM meta WHERE key=?", (clean.CLEAN_AUTO_KEY,))
                 conn.commit()
                 actions, errors = [], []
-                disks = [{"usedPercent": 98, "freeBytes": 100}, {"usedPercent": 98, "freeBytes": 100 + delta}]
-                with mock.patch.object(clean, "disk_state", side_effect=disks), \
-                        mock.patch.object(clean, "clean_pass", return_value={"summary": {"done": 1, "freedBytes": 999}, "errors": []}):
+                disks = [{"usedBytes": 4900, "usedPercent": 98, "freeBytes": 100}, {"usedBytes": 4900, "usedPercent": 98, "freeBytes": 100 + delta}]
+                with mock.patch.object(clean, "disk_state", return_value=disks[0]), \
+                        mock.patch.object(clean, "clean_pass", return_value={"summary": {"done": 1, "freedBytes": 999}, "errors": [], "diskAfter": disks[1], "goalMet": False, "remainingBytes": 1}):
                     clean.clean_auto(conn, {"cleanAtPercent": 95}, actions, errors)
             self.assertEqual(actions[0]["freedBytes"], delta)
             self.assertEqual(errors, [])
@@ -640,7 +640,8 @@ class Threshold(Home):
     GB = 1024 ** 3
 
     def tick(self, used: int, free_gb: int = 50, at: float | None = None):
-        patches = [mock.patch.object(clean, "disk_state", lambda: {"path": str(self.tmp), "usedPercent": used, "freeBytes": free_gb * self.GB})]
+        patches = [mock.patch.object(clean, "disk_state", lambda: {"path": str(self.tmp), "usedPercent": used,
+                   "usedBytes": 1 + int(free_gb * self.GB * min(used, 99.999) / (100 - min(used, 99.999))), "freeBytes": free_gb * self.GB})]
         if at is not None:
             patches.append(mock.patch.object(clean, "now", lambda: at))
         with contextlib.ExitStack() as stack:
@@ -658,13 +659,13 @@ class Threshold(Home):
         self.age(path, 10)
         self.age(repo / ".git" / "worktrees" / "app-old", 10)
         t = time.time()
-        self.assertEqual(self.cleaned(self.tick(94, at=t)), [], "below the default 95%")
+        self.assertEqual(self.cleaned(self.tick(84, at=t)), [], "below the default 85%")
         self.assertTrue(path.exists())
-        self.assertEqual(self.cleaned(self.tick(95, at=t + 1)), ["crossed"])
+        self.assertEqual(self.cleaned(self.tick(85, at=t + 1)), ["crossed"])
         self.assertFalse(path.exists())
         self.assertEqual(self.cleaned(self.tick(99, at=t + 7200)), [], "no new pressure two hours later: no repeat")
         self.assertEqual(self.cleaned(self.tick(99, free_gb=44, at=t + 7300)), ["growth"], "6 GB more used")
-        self.assertEqual(self.cleaned(self.tick(90, free_gb=60, at=t + 7400)), [], "below again: re-armed")
+        self.assertEqual(self.cleaned(self.tick(79, free_gb=60, at=t + 7400)), [], "below low watermark: re-armed")
         self.assertEqual(self.cleaned(self.tick(96, free_gb=40, at=t + 7500)), ["crossed"], "the next crossing runs again")
         self.assertEqual(self.cleaned(self.tick(96, free_gb=8, at=t + 7600)), [], "stampede guard: minutes apart")
         self.assertEqual(self.cleaned(self.tick(96, free_gb=8, at=t + 8300)), ["floor"])

@@ -19,11 +19,18 @@ It is vendored the same way, after the engine, and calls the engine's gates. Eve
 |---|---|
 | `reap_worktree_homes()` | Folders where agent tools keep worktrees, as `Path`s, or `None` for the built-in list. |
 
-Its entry points are `clean_pass(dry_run, deep=False, only=None, report=True)`, `clean_auto_observe(conn, policy, disk)` (the
-event-driven trigger: why a pass is due now, or None; it starts nothing) and `clean_auto(conn, policy, actions,
-errors)`, which a host's scheduled pass calls (it reads `cleanAtPercent`, `cleanGrowthGB`, `cleanFloorGB` and `worktreeIdleDays` from the policy, defaulting
-to 95, 5, 10 and 7, and the `meta` key `clean:auto`). An embedded copy runs under the host's own single-owner lock, so a host
-never adds a second cleaner.
+Its entry points are `clean_pass(dry_run, deep=False, only=None, report=True, policy=None)`,
+`clean_auto_observe(conn, policy, disk, event=None)` (why a pass is due; it starts nothing) and
+`clean_auto(conn, policy, actions, errors, event=None)`. Policy defaults are `cleanAtPercent=85`,
+`cleanToPercent=80`, `cleanGrowthGB=5`, `cleanFloorGB=10`, `worktreeIdleDays=7`. `cleanAtPercent=0`
+disables automatic cleaning. The `meta` key `clean:auto` stores measured progress and hysteresis.
+Supply a stable `event` token that changes only when jobs finish or outputs are released; an unmet goal may retry
+once for each changed token after the cooldown. Never use the current time or ordinary tick events as this token.
+An embedded copy uses the host's single-owner lock; never add a second cleaner.
+
+Results include `initialOccupancy`, `finalOccupancy`, `remainingBytes` and `goalMet`.
+`disk_state()` must supply exact `usedBytes` and `freeBytes`: occupancy uses used/(used+free), not an APFS
+volume's nominal total or a rounded percentage. Missing measurements yield unknown (`null`) goals.
 
 ## Modules the host imports
 
@@ -51,13 +58,37 @@ never adds a second cleaner.
 | `job_meta(job)`, `job_wait(job)` | A job's meta dict; the `{"job": id}` it waits on, or `None`. |
 | `whole_title(text)` | A job title shortened for display. |
 | `live_all()` | Live terminals as dicts with an `"id"`. A host that runs agents in terminals records a job's `terminal_id`; while that terminal is live, or its `cleanup_records` row is not settled, the job is not reaped, and the hints name `<REAP_CLI> cleanup-status` and `cleanup-record`. The standalone host runs no terminals. |
-| `disk_state()`, `disk_level(policy, disk)` | Used percent and free bytes; `"ok"`, or any other word for disk pressure. |
+| `disk_state()`, `disk_level(policy, disk)` | Exact `usedBytes`, `freeBytes`, rounded `usedPercent`; `"ok"`, or any other word for disk pressure. |
 | `reap_home()` | The home the reaper works below. |
 | `reap_clone_bases()` | `[(Path, prefix or None), ...]`: folders holding job clones. |
 | `reap_cache_root()`, `reap_archive_root()`, `reap_agent_scratch_root()` | Per-job scratch, archives, agent scratch. |
 | `reap_release_root()`, `reap_release_evidence_root()`, `reap_release_marks()` | Release candidates, release evidence, `{"installed": v, "rollback": v}`. |
 | `reap_receipt_dir()` | Where receipts and per-job locks live. |
 | `reap_queue_state()` | A build queue's lock folder. |
+
+## Exact terminal-job outputs
+
+The optional host callback `reap_output_ownership(source, output)` activates the narrow output-only route.
+The supplied standalone adapter reads producer-written records with `reap_registered_output_ownership` from
+`<buildQueueStateDir>/output-producers/<sha256(canonical output)>.json`. Missing or unsafe records preserve the output.
+
+A cooperating build queue must take the same permanent `reap_queue_lock(project)` locks before any build/install access,
+never unlink their inodes, and hold them through subprocess exit. Register output paths before work starts under those
+locks. Lock projects include the canonical source and output ancestors through the exact owning root, never a collection
+root or `/`. Producers record protocol `trimreaper-project-locks-v1`, source, output, owner, kind (`target` or
+`node_modules`), `lockProjects`, `claimInventory=job-meta-paths-v1`, source/output `{dev,ino}` identities,
+producer `{pid,start}`, and state `active` or `finished`. The private registry directory is 0700 and records are atomic
+0600 regular files. A dead interrupted producer still needs fresh job, claim, identity, Cargo-lock and process proofs.
+Historical outputs are never silently adopted.
+
+The callback returns a fresh structured proof with protocol, source, output, owner, kind, `projects` (the engine's
+`reap_output_projects` list), and claimInventory. A bare `True` is not a proof. This is cooperative build exclusion,
+not an OS sandbox; an unknown builder preserves output. An embedding host may register exact `(absolute executable,
+absolute control-agent entrypoint)` pairs in `REAP_OUTPUT_CONTROL_AGENTS`; this is never a general Node exemption.
+
+Only typed regenerable output can use this route. Source-root, Git, release, retention, protected-leaf, receipt,
+identity and no-follow safeguards remain in force. `meta.paths`, cwd/worktrees and explicit output declarations are
+checked freshly; a source-root claim alone is distinguished from an exact/descendant output claim.
 
 ## Tables the engine reads and writes
 
@@ -71,7 +102,8 @@ CREATE TABLE cleanup_records (terminal_id TEXT PRIMARY KEY, status TEXT NOT NULL
 ```
 
 plus whatever `log_event` writes to. Job ids are `J-` and four or five digits. Finished statuses are `done`, `failed` and
-`cancelled`.
+`cancelled`. The narrow output-only route additionally accepts `interrupted` when its interruption clock is verified;
+this does not make interrupted source roots terminal.
 
 The engine reads and writes:
 

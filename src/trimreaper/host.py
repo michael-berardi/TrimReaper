@@ -46,7 +46,9 @@ DEFAULT_POLICY = {
     # Disk pressure: at or above this used percent, idle (parked/interrupted) jobs lose their derived build output too.
     "diskWarnPercent": 85,
     # `tick` runs `trimreaper clean` when the volume reaches this used percent, then again only on new pressure (no timer); 0 = off.
-    "cleanAtPercent": 95,
+    "cleanAtPercent": 85,
+    # A clean pass stops at this low-water mark; manual clean uses 85 as its high mark when auto clean is off.
+    "cleanToPercent": 80,
     # New pressure: this many more GB used since the last automatic pass, or free space under cleanFloorGB.
     "cleanGrowthGB": 5,
     "cleanFloorGB": 10,
@@ -172,10 +174,16 @@ def check_policy(policy: dict) -> None:
         value = merged[key]
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             raise HostError(f"policy {key} must be a whole number of days (0 = never), not {json.dumps(value)}")
-    for key, low in (("diskWarnPercent", 1), ("cleanAtPercent", 0)):
-        value = merged[key]
-        if not isinstance(value, int) or isinstance(value, bool) or not low <= value <= 100:
-            raise HostError(f"policy {key} must be a whole number from {low} to 100, not {json.dumps(value)}")
+    value = merged["diskWarnPercent"]
+    if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 100:
+        raise HostError(f"policy diskWarnPercent must be a whole number from 1 to 100, not {json.dumps(value)}")
+    high, low = merged["cleanAtPercent"], merged["cleanToPercent"]
+    if any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in (high, low)):
+        raise HostError("clean goals must be finite numbers satisfying 0 < cleanToPercent < cleanAtPercent <= 100 (cleanAtPercent=0 disables auto clean)")
+    # Keep 0 in the effective policy so automatic clean remains off. Manual clean's effective high is 85.
+    effective_high = DEFAULT_POLICY["cleanAtPercent"] if high == 0 else high
+    if not 0 < low < effective_high <= 100:
+        raise HostError("clean goals must satisfy 0 < cleanToPercent < cleanAtPercent <= 100 (auto off uses a manual high of 85)")
     for key, high in (("cleanGrowthGB", 1000), ("cleanFloorGB", 1000), ("parkedReapHours", 24 * 365), ("projectIdleHours", 24 * 365)):
         value = merged[key]
         if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= high:
@@ -259,6 +267,13 @@ def reap_queue_state() -> Path:
     return configured("buildQueueStateDir") or state_dir() / "build-queue"
 
 
+def reap_output_ownership(source: str, output: str) -> dict:
+    # Only producer-written, identity-bound records activate the exact-output route.
+    # A missing registry keeps legacy/unmanaged outputs on the existing strict route.
+    from . import core
+    return core.reap_registered_output_ownership(source, output)
+
+
 def reap_worktree_homes() -> list[Path] | None:
     """Folders where agent tools keep worktrees, as configured; None means the clean pass's built-in list."""
     homes = config().get("worktreeHomes")
@@ -303,7 +318,7 @@ def load_policy() -> dict:
 
 
 def disk_state() -> dict | None:
-    """Used percent and free bytes of the data volume (used / (used + available), rounded up, the way df reports it)."""
+    """Actual used/free bytes and df-style rounded occupancy; APFS total includes space unavailable to this volume."""
     volume = config().get("diskVolume")
     for path in ((volume,) if volume else ("/System/Volumes/Data", "/")):
         try:
@@ -314,7 +329,8 @@ def disk_state() -> dict | None:
             continue
         total = usage.used + usage.free
         if total > 0:
-            return {"path": path, "usedPercent": -(-usage.used * 100 // total), "freeBytes": usage.free}
+            return {"path": path, "usedPercent": -(-usage.used * 100 // total), "usedBytes": usage.used,
+                    "freeBytes": usage.free}
     return None
 
 
@@ -389,6 +405,28 @@ def txn(conn):
 def log_event(conn, kind: str, subject: str | None = None, actor: str | None = None, data: dict | None = None):
     conn.execute("INSERT INTO events(ts,kind,subject,actor,data) VALUES(?,?,?,?,?)",
                  (now(), kind, subject, actor, json.dumps(data or {}, sort_keys=True)))
+
+
+def clean_release_event_token(conn) -> int:
+    """Stable release generation, not a timer or deletion authorization.
+
+    Only an actual transition to a finished job status or an evidenced scope release can retry unresolved clean work.
+    Reap results, blocked reports, ordinary job edits and ticks never advance this token. All clean safety gates still run.
+    """
+    # JSON may have been written by an older/external caller; malformed data cannot create a release or abort a tick.
+    found = conn.execute("""
+        SELECT COALESCE(MAX(id), 0) FROM events
+        WHERE CASE WHEN json_valid(data) THEN
+            (kind = 'job.status'
+             AND json_extract(data, '$.to') IN ('done', 'failed', 'cancelled')
+             AND json_extract(data, '$.from') IN
+                 ('queued', 'approved', 'running', 'blocked', 'parked', 'interrupted'))
+            OR (kind = 'cleanup.scope_released'
+                AND json_type(data, '$.evidence') = 'text'
+                AND length(trim(json_extract(data, '$.evidence'))) > 0)
+        ELSE 0 END
+    """).fetchone()
+    return found[0]
 
 
 def job_meta(job: dict | None) -> dict:

@@ -36,7 +36,7 @@ from .host import (  # noqa: F401  (the engine reads these as module globals)
     REAP_CLI, REAP_OWNER_DIRS, VERSION, HostError, actor_of, db, disk_level, disk_state, iso, job_meta, job_wait, live_all,
     load_policy, log_event, now, reap_agent_scratch_root, reap_archive_root, reap_cache_root, reap_clone_bases,
     reap_home, reap_queue_state, reap_receipt_dir, reap_release_evidence_root, reap_release_marks, reap_release_root, require,
-    row, rows, txn, whole_title,
+    row, rows, txn, whole_title, reap_output_ownership,
 )
 
 # The names an embedding host must define before the engine runs (checked by tests/test_embedding.py).
@@ -49,6 +49,11 @@ HOST_NAMES = (
 
 # >>> trimreaper core >>>
 REAP_TERMINAL = ("done", "failed", "cancelled")
+# Interrupted is terminal ONLY for the separately guarded, exact-output route.
+REAP_OUTPUT_TERMINAL = REAP_TERMINAL + ("interrupted",)
+REAP_OUTPUT_KINDS = ("target", "node_modules")
+REAP_OUTPUT_SCHEDULE_ITEMS = 16
+REAP_OUTPUT_SCHEDULE_SECONDS = 5
 REAP_SETTLE_SECONDS = 900             # a job that just finished may still be corrected or resumed
 REAP_CLOSED_SETTLE_SECONDS = 30       # ... unless its worker is already closed through the guarded cleanup: nothing can resume it
 REAP_RETRY_SECONDS = (900, 3600, 6 * 3600)   # wait after a pass that preserved something, by attempt
@@ -140,6 +145,7 @@ REAP_IDENTITY_KEYS = ("kind", "dev", "ino", "mode", "nlink", "size", "mtimeNs", 
 # class gets its retention from: ALL classes require an explicit owner marker freshly found on the item itself.
 # A build name, gitignore or a superseded release is not evidence that customer/QA/rollback bytes may go.
 REAP_CLASSES = {
+    "job-derived-output": {"git": (), "lock": True, "retention": "marker"},
     "job-clone-regenerable": {"git": ("ignored", "clean", "pushed", "untracked"), "lock": True, "retention": "marker"},
     "job-cache-subdir": {"git": (), "lock": False, "retention": "marker"},
     "release-target": {"git": ("ignored", "untracked"), "lock": True, "retention": "marker"},
@@ -1123,6 +1129,12 @@ def reap_protected_scan(path: str, allow_git: bool = False, markers: bool = Fals
         raise ReapRefused("protected-scan-ancestor")
     vendored = reap_vendored_templates(path)
     def listing(rel, names):
+        current = os.path.join(path, rel) if rel else path
+        if (rel or allow_git) and reap_fold(os.path.basename(current)) == "target" and reap_cache_retention(current) != REAP_DISPOSABLE \
+                and reap_target_release_bearing(current):
+            # Also protect a release-bearing target when an enclosing clone/cache is
+            # considered: otherwise whole-clone cleanup would bypass output retention.
+            raise ReapRefused("retention-preserved:release-runtime-rollback:" + (rel or "target"))
         try:
             reap_refuse_git_layout(rel, names)
         except ReapRefused as refusal:
@@ -1244,16 +1256,82 @@ def reap_retention(item: dict) -> str:
     return "ambiguous"
 
 
+def reap_target_release_bearing(path: str) -> bool:
+    """Names-only check of Cargo's target/release and target/<triple>/release layouts.
+    Signed/distributable artifacts at these levels also require an explicit output disposable marker.
+    Unreadable or over-budget inventories preserve; protected directories and symlinks are never entered.
+    """
+    listed = 0
+    artifacts = (".app", ".dmg", ".pkg", ".ipa", ".msix", ".sig", ".asc")
+    def scan(fd, depth):
+        nonlocal listed
+        with os.scandir(fd) as entries:
+            for entry in entries:
+                listed += 1
+                if listed > REAP_SCAN_ENTRIES:
+                    return True
+                name = reap_fold(entry.name)
+                if name == "release" or name.endswith(artifacts):
+                    return True
+                if depth == 0 and not reap_protected(entry.name) and not reap_is_git(entry.name):
+                    info = os.stat(entry.name, dir_fd=fd, follow_symlinks=False)
+                    if stat.S_ISDIR(info.st_mode):
+                        child = os.open(entry.name, REAP_DIR_FLAGS, dir_fd=fd)
+                        try:
+                            opened = os.fstat(child)
+                            if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino) or scan(child, 1):
+                                return True
+                        finally:
+                            os.close(child)
+        return False
+    try:
+        fd = os.open(path, REAP_ROOT_FLAGS)
+        try:
+            return scan(fd, 0)
+        finally:
+            os.close(fd)
+    except OSError:
+        return True
+
+
 def reap_item_retention(item: dict) -> str:
     """A marker decides; without one, `disposable` is derived only in the three self-cleaning cases (see REAP_DERIVED_KINDS)."""
-    if item.get("class") == "job-cache-subdir" and item.get("owner"):
+    if item.get("class") in ("job-cache-subdir", "job-derived-output") and item.get("owner") \
+            and reap_inside(item["path"], reap_canon(reap_cache_root() / item["owner"])):
         parent = reap_cache_retention(str(reap_cache_root() / item["owner"]))
         if parent not in ("unmarked", REAP_DISPOSABLE):
             return parent  # an explicit preserving job-folder marker applies to every child
+    if item.get("class") == "job-derived-output":
+        for parent in (item.get("source"), item["root"]):
+            if not parent:
+                return "ambiguous"
+            kept = reap_cache_retention(parent)
+            if kept not in ("unmarked", REAP_DISPOSABLE):
+                return kept
+        parent = os.path.dirname(item["path"])
+        while reap_inside(parent, item["root"]):
+            kept = reap_cache_retention(parent)
+            if kept not in ("unmarked", REAP_DISPOSABLE):
+                return kept
+            if parent == item["root"]:
+                break
+            parent = os.path.dirname(parent)
     found = reap_cache_retention(item["path"])
     if found != "unmarked":
         return found
     cls = item.get("class")
+    if os.path.basename(item["path"]) == "target" and cls in ("job-derived-output", "job-clone-regenerable", "job-cache-subdir"):
+        # Cargo's release profile can contain either rebuildable binaries or retained signed releases.
+        # Neither the target name, cache tag nor a parent disposable marker resolves that ambiguity.
+        if reap_target_release_bearing(item["path"]):
+            return "release-runtime-rollback"
+    if cls == "job-derived-output" and item.get("kind") in REAP_OUTPUT_KINDS \
+            and os.path.basename(item["path"]) == item["kind"]:
+        if item.get("ownership") == "detached-job-output":
+            # A sibling's name alone cannot turn arbitrary cache data into compiler output.
+            # Explicit disposable markers already returned above; otherwise require the tool's cache tag.
+            return REAP_DISPOSABLE if item["kind"] == "target" and reap_cachedir_tagged(item["path"]) else "unmarked"
+        return REAP_DISPOSABLE
     if cls == "job-clone-regenerable" and item.get("kind") in REAP_DERIVED_KINDS \
             and os.path.basename(item["path"]) == item.get("kind"):
         return REAP_DISPOSABLE
@@ -2854,7 +2932,418 @@ def reap_job_items(job: dict, clones: list, audit_dirs: bool = True) -> tuple[li
         pass
     except OSError:
         notes.append(f"unreadable: {cache}")
+    for item in items:
+        if item["class"] == "job-cache-subdir" and os.path.basename(item["path"]) in REAP_OUTPUT_KINDS and reap_output_registry_present(item["path"]):
+            targeted = reap_output_item(job["id"], item["path"])
+            if targeted:
+                item.update(targeted)
     return items + clone_items, notes
+
+
+# ---- exact terminal-job outputs (never a source-root permission) ------------------------------------------------
+
+def reap_output_registry_present(path: str) -> bool:
+    """Cheap capability discovery only; this never grants authority or reads a record."""
+    registry = reap_queue_state() / "output-producers" / (hashlib.sha256(path.encode("utf-8")).hexdigest() + ".json")
+    try:
+        info = os.lstat(registry)
+        return stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and info.st_nlink == 1
+    except OSError:
+        return False
+
+
+def reap_output_item(owner: str, path: str) -> dict | None:
+    """Reconstruct the source/output association from host-owned paths, not a caller's manifest.
+    Detached output is only <cache>/<job>/{target,node_modules}, beside one declared source checkout.
+    Ambiguous declarations, source symlinks, main shared checkouts and release trees are not inferred."""
+    if os.path.basename(path) not in REAP_OUTPUT_KINDS or reap_canon(path) != path:
+        return None
+    with db() as conn:
+        job = row(conn, "SELECT * FROM jobs WHERE id=?", (owner,))
+    if not job or job["status"] not in REAP_OUTPUT_TERMINAL:
+        return None
+    cache = reap_canon(reap_cache_root() / owner)
+    sources = []
+    for root, how in reap_job_roots(job, reap_clone_roots()):
+        if reap_inside(path, root) and path != root:
+            source = reap_repo_of(path, root)
+            if os.path.lexists(os.path.join(source, ".git")):
+                sources.append((source, root, root, how))
+    if os.path.dirname(path) == cache:
+        # Host path claims are machine records too; cwd is often null for managed workers.
+        declared = reap_declared_paths(job) + reap_output_claims(job)
+        for source in sorted(set(declared)):
+            if os.path.dirname(source) == cache and source != path and os.path.basename(source) not in REAP_REGENERABLE \
+                    and not os.path.islink(source) and os.path.lexists(os.path.join(source, ".git")):
+                sources.append((source, source, cache, "detached-job-output"))
+    sources = sorted(set(sources))
+    if len(sources) != 1:
+        return None
+    source, source_root, root, how = sources[0]
+    if how != "detached-job-output" and os.path.dirname(source_root) not in reap_clone_base_paths():
+        return None  # a symlinked clone base cannot gain authority through this narrower route
+    if any(reap_protected(p) for p in Path(source).parts):
+        return None
+    # Neither configured release data nor anything inside another derived output is a source checkout.
+    if reap_inside_folded(source, reap_canon(reap_release_root())) \
+            or any(reap_fold(p) in REAP_REGENERABLE for p in Path(source).relative_to(source_root).parts):
+        return None
+    item = {"path": path, "root": root, "source": source, "sourceRoot": source_root,
+            "owner": owner, "jobs": [owner], "class": "job-derived-output", "kind": os.path.basename(path),
+            "ownership": how}
+    item["retention"] = reap_item_retention(item)
+    return item
+
+
+def reap_output_terminal_blocker(conn, job: dict, live_ids: set | None) -> str | None:
+    """Fresh terminal proof without treating continuation/waiting on SOURCE as an output claim."""
+    if job["status"] not in REAP_OUTPUT_TERMINAL:
+        return "job-" + job["status"]
+    stamp = job.get("finished_at")
+    if job["status"] == "interrupted":
+        # Explicit clocks supersede finished_at. Older hosts need a matching
+        # interruption event, never an unrelated stale finish clock.
+        interrupted = job_meta(job).get("interrupted")
+        stamp = interrupted.get("at") if isinstance(interrupted, dict) else None
+        if "interrupted" not in job_meta(job):
+            event = row(conn, "SELECT ts FROM events WHERE subject=? AND kind='job.interrupted' ORDER BY id DESC LIMIT 1", (job["id"],))
+            event_stamp, finished = event.get("ts") if event else None, job.get("finished_at")
+            if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (event_stamp, finished)) \
+                    and abs(event_stamp - finished) < 1 and (job.get("started_at") or 0) < event_stamp:
+                stamp = event_stamp  # older hosts record interruption in the event log, not meta
+    if isinstance(stamp, str):
+        # UltraTerm interruption records use ISO timestamps. Require an explicit timezone;
+        # never infer local time, parse numeric strings or substitute a creation/update clock.
+        try:
+            match = re.fullmatch(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d{1,6})?(Z|[+-]\d{2}:\d{2})", stamp)
+            if not match:
+                raise ValueError("not a zoned ISO timestamp")
+            clock = time.strptime(match[1], "%Y-%m-%dT%H:%M:%S")
+            zone = match[3]
+            if clock.tm_sec > 59 or (zone != "Z" and (int(zone[1:3]) > 23 or int(zone[4:6]) > 59)):
+                raise ValueError("invalid timestamp")
+            # Gregorian ordinal arithmetic avoids local timezone/DST inference and adds
+            # no new module dependency to the byte-for-byte embedded engine.
+            year = clock.tm_year - 1
+            days = 365 * year + year // 4 - year // 100 + year // 400 + clock.tm_yday - 1 - 719162
+            offset = 0 if zone == "Z" else (int(zone[1:3]) * 60 + int(zone[4:6])) * 60 * (1 if zone[0] == "+" else -1)
+            stamp = days * 86400 + clock.tm_hour * 3600 + clock.tm_min * 60 + clock.tm_sec + float(match[2] or 0) - offset
+        except (ValueError, OverflowError):
+            stamp = None
+    if not isinstance(stamp, (int, float)) or isinstance(stamp, bool) or not 0 < stamp <= now() - REAP_SETTLE_SECONDS:
+        return "output-terminal-time-unverified"
+    if live_ids is None:
+        return "terminal-state-unknown"
+    terminal = job.get("terminal_id")
+    if terminal:
+        if terminal in live_ids:
+            return "worker-terminal-still-open"
+        record = row(conn, "SELECT status FROM cleanup_records WHERE terminal_id=?", (terminal,))
+        if record and record["status"] != "closed":
+            return "cleanup-" + record["status"]
+        if any(j["status"] not in REAP_TERMINAL for j in
+               rows(conn, "SELECT status FROM jobs WHERE terminal_id=? AND id!=?", (terminal, job["id"]))):
+            return "terminal-shared-with-live-job"
+    return None
+
+
+def reap_output_claims(job: dict, outputs_only: bool = False) -> list[str]:
+    """Explicit machine paths, including UltraTerm meta.paths, never prose.
+    paths/output declarations claim both ancestors and descendants; cwd/worktrees only claim
+    outputs they enter, so a source-only continuation does not itself own detached output.
+    Malformed claims fail closed. Source ownership remains cwd/worktrees, not meta.paths.
+    """
+    meta = job_meta(job)
+    if job.get("meta"):
+        try:
+            raw = json.loads(job["meta"]) if isinstance(job["meta"], str) else job["meta"]
+            if not isinstance(raw, dict):
+                raise ValueError("invalid job metadata")
+        except (ValueError, TypeError):
+            raise ReapRefused("output-declarations-unverified:" + job["id"])
+    cwd = job.get("cwd")
+    worktrees = meta.get("worktrees", [])
+    if (cwd is not None and (not isinstance(cwd, str) or not cwd.startswith("/") or ".." in Path(cwd).parts)) \
+            or not isinstance(worktrees, list) \
+            or not all(isinstance(p, str) and p.startswith("/") and ".." not in Path(p).parts for p in worktrees):
+        raise ReapRefused("output-declarations-unverified:" + job["id"])
+    paths = [] if outputs_only else list(reap_declared_paths(job))
+    for key in ("paths", "outputPaths", "outputs", "buildOutputs", "targetDir", "cargoTargetDir"):
+        value = meta.get(key, [])
+        values = [value] if isinstance(value, str) else value
+        if not isinstance(values, list) or not all(isinstance(p, str) and p.startswith("/") and ".." not in Path(p).parts for p in values):
+            raise ReapRefused("output-declarations-unverified:" + job["id"])
+        paths.extend(reap_canon(p) for p in values)
+    return sorted(set(paths))
+
+
+def reap_output_authority(item: dict) -> dict:
+    trusted = reap_output_item(item["owner"], item["path"])
+    if not trusted or any(trusted.get(k) != item.get(k) for k in ("source", "sourceRoot", "root", "ownership", "jobs")):
+        raise ReapRefused("output-source-ambiguous")
+    with db() as conn:
+        jobs = rows(conn, "SELECT * FROM jobs")
+        owner = next((j for j in jobs if j["id"] == item["owner"]), None)
+        if not owner:
+            raise ReapRefused("owner-unknown")
+        blocker = reap_output_terminal_blocker(conn, owner, reap_live_ids())
+        if blocker:
+            raise ReapRefused(blocker)
+        releases = rows(conn, "SELECT value FROM meta WHERE key LIKE 'cleanup:released:%'")
+    for record in releases:
+        try:
+            proof = json.loads(record["value"])
+            kept = proof.get("keep", [])
+            if not isinstance(kept, list) or not all(isinstance(p, str) and p.startswith("/") for p in kept):
+                raise ValueError("invalid keep paths")
+        except (ValueError, TypeError, AttributeError):
+            raise ReapRefused("output-release-claims-unverified")
+        for path in kept:
+            if reap_inside_folded(item["path"], reap_canon(path)) or reap_inside_folded(reap_canon(path), item["path"]):
+                raise ReapRefused("kept-by-release:" + path)
+    inventory = []
+    for job in jobs:
+        claims = reap_output_claims(job)
+        outputs = reap_output_claims(job, outputs_only=True)
+        # Other interrupted jobs remain conservative live claimants; only this owner has a terminal proof.
+        if job["id"] != item["owner"] and job["status"] not in REAP_TERMINAL:
+            if any(reap_inside_folded(p, item["path"]) for p in claims) \
+                    or any(reap_inside_folded(item["path"], p) for p in outputs):
+                raise ReapRefused("output-claimed-by:" + job["id"])
+        inventory.append((job["id"], job["status"], claims, outputs))
+    ownership = globals().get("reap_output_ownership")
+    if not callable(ownership):
+        raise ReapRefused("output-producer-unverified:host-ownership-interface-required")
+    producer = ownership(item["source"], item["path"])
+    reap_output_producer_proof(item, producer, reap_output_projects(item["source"], item["path"], item["root"]))
+    return {"producer": producer, "source": "host-exact-output", "owner": item["owner"], "status": owner["status"],
+            "finishedAt": owner.get("finished_at"), "terminal": owner.get("terminal_id"), "claims": inventory}
+
+
+def reap_output_projects(source: str, output: str, root: str) -> list[str]:
+    projects = {source}
+    current = os.path.dirname(output)
+    while reap_inside(current, root):
+        projects.add(current)
+        if current == root:
+            break
+        current = os.path.dirname(current)
+    return sorted(projects)
+
+
+def reap_registered_output_ownership(source: str, output: str) -> dict:
+    """Read a producer-written registry record; absence never permits adoption of an old output.
+    The queue writes this while holding the same permanent project locks this caller holds.
+    Same-user cooperative exclusion only: not protection against a malicious writer bypassing the queue.
+    """
+    root = reap_queue_state() / "output-producers"
+    digest = hashlib.sha256(output.encode("utf-8")).hexdigest()
+    path = root / (digest + ".json")
+    try:
+        fence = reap_fence(str(root), str(reap_queue_state()))
+        queue_fd = reap_open_fence(fence)
+        try:
+            parent_fd = os.open(root.name, REAP_DIR_FLAGS, dir_fd=queue_fd)
+        finally:
+            os.close(queue_fd)
+        try:
+            reap_expect(parent_fd, fence[-1][1], fence[-1][2], "output-registry-directory-changed")
+            if os.fstat(parent_fd).st_mode & 0o077:
+                raise ReapRefused("output-producer-unverified:unsafe-registry-directory")
+            fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=parent_fd)
+        finally:
+            os.close(parent_fd)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1 or info.st_mode & 0o077 or info.st_size > 65536:
+                raise ReapRefused("output-producer-unverified:unsafe-registry")
+            raw = os.read(fd, 65537)
+        finally:
+            os.close(fd)
+        record = json.loads(raw)
+    except (OSError, ValueError, UnicodeError) as error:
+        raise ReapRefused("output-producer-unverified:registry:" + reap_named(error)) from error
+    if not isinstance(record, dict) or record.get("source") != source or record.get("output") != output:
+        raise ReapRefused("output-producer-unverified:registry-association")
+    trusted = reap_output_item(record.get("owner"), output)
+    if not trusted or trusted["source"] != source:
+        raise ReapRefused("output-producer-unverified:registry-owner")
+    projects = reap_output_projects(source, output, trusted["root"])
+    lock_projects = record.get("lockProjects")
+    if not isinstance(lock_projects, list) or not all(p in lock_projects for p in projects):
+        raise ReapRefused("output-producer-unverified:registry-locks")
+    for project in projects:
+        try:
+            info = os.lstat(reap_queue_lock(project))
+        except OSError as error:
+            raise ReapRefused("output-producer-unverified:lock-missing") from error
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+            raise ReapRefused("output-producer-unverified:lock-unsafe")
+    for key, directory in (("sourceIdentity", source), ("outputIdentity", output)):
+        identity = record.get(key)
+        info = os.lstat(directory)
+        if not isinstance(identity, dict) or not stat.S_ISDIR(info.st_mode) or any(
+                identity.get(k) != v for k, v in (("dev", info.st_dev), ("ino", info.st_ino))):
+            raise ReapRefused("output-producer-unverified:registry-identity:" + key)
+    if record.get("state") != "finished":
+        producer = record.get("producer")
+        pid = producer.get("pid") if isinstance(producer, dict) else None
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            raise ReapRefused("output-producer-unverified:registry-producer")
+        table = reap_process_table()
+        if any(str(number) == str(pid) for number, _ in table["commands"]):
+            raise ReapRefused("output-producer-unverified:producer-still-active")
+        # A dead producer's exact output is still checked under its locks, including Cargo locks.
+        if record.get("state") != "active":
+            raise ReapRefused("output-producer-unverified:registry-state")
+    proof = {k: record.get(k) for k in ("protocol", "source", "output", "owner", "kind", "claimInventory")}
+    proof["projects"] = projects
+    reap_output_producer_proof(trusted, proof, projects)
+    return proof
+
+
+@contextmanager
+def reap_output_producer_guard(source: str, output: str):
+    """Cooperative producer protocol, NOT an OS sandbox or an all-process exclusion claim.
+
+    Required host interface: reap_output_ownership(source, output) returns a FRESH record
+    {protocol: 'trimreaper-project-locks-v1', source, output, owner, kind,
+     projects: [canonical project paths], claimInventory: 'job-meta-paths-v1'}.
+    It is called with ALL reap_output_projects locks already held. The host must verify the
+    exact source/output ownership from its producer registry, including detached target dirs;
+    reject unmanaged/unregistered producers; and implement mandatory shared reap_queue_lock
+    keys for EVERY build/install route before source/output access, held through subprocess
+    exit. Keep lock inodes permanent (no unlink/replacement), register output claims before
+    work starts under the same locks, and forbid new producers/ownership changes until exit.
+    Returning True, reconstructing a record from these arguments, or merely checking a job's
+    terminal state does NOT implement this contract. Missing capability preserves the output.
+    Core checks records and claims again before removal. Fresh process/handle probes remain
+    required: unknown builds are blocked, not presumed cooperative. No safety against a
+    malicious same-user writer bypassing the cooperative host is claimed.
+    """
+    ownership = globals().get("reap_output_ownership")
+    if not callable(ownership):
+        raise ReapRefused("output-producer-unverified:host-ownership-interface-required")
+    proof = ownership(source, output)
+    if not isinstance(proof, dict):
+        raise ReapRefused("output-producer-unverified:ownership-record-required")
+    yield proof
+
+
+def reap_output_producer_proof(item: dict, proof, projects: list[str]) -> None:
+    expected = {"protocol": "trimreaper-project-locks-v1", "source": item["source"],
+                "output": item["path"], "owner": item["owner"], "kind": item["kind"],
+                "projects": projects, "claimInventory": "job-meta-paths-v1"}
+    if not isinstance(proof, dict) or any(proof.get(k) != v for k, v in expected.items()):
+        raise ReapRefused("output-producer-unverified:ownership-record-mismatch")
+
+
+def reap_output_control_agent(pid: str, command: str, table: dict, item: dict) -> bool:
+    """An exact host-registered control command, never a generic node exemption.
+    Host registrations are (absolute executable, absolute entrypoint) pairs identifying Pi/
+    control agents, not build runners. lsof must independently show that executable as txt
+    and a cwd outside both source and output. All source/output handles are checked first.
+    """
+    parts = command.split()
+    if len(parts) < 2 or not all(p.startswith("/") for p in parts[:2]):
+        return False
+    known = globals().get("REAP_OUTPUT_CONTROL_AGENTS", ())
+    if (parts[0], parts[1]) not in known:
+        return False
+    files = [(fd, reap_private_alias(name)) for number, _, fd, name in table["files"] if number == pid]
+    cwd = [name for fd, name in files if fd == "cwd"]
+    executable = any(fd == "txt" and reap_canon(name) == reap_canon(parts[0]) for fd, name in files)
+    return executable and len(cwd) == 1 and not any(
+        reap_inside_folded(reap_canon(cwd[0]), item[key]) for key in ("source", "path"))
+
+
+def reap_item_holders(item: dict, table: dict | None) -> None:
+    if item["class"] != "job-derived-output":
+        reap_holders(item["path"], item["path"] if item["class"] == "job-clone-root" else item["root"], table)
+        return
+    if table is None:
+        code, out = reap_probe(["lsof", "-n", "-P", "-Fp", "--", item["path"]], 30)
+        if code not in (0, 1):
+            raise ReapRefused("probe-failed:lsof:" + str(code))
+        if out.strip():
+            raise ReapRefused("in-use:target-open")
+        table = reap_process_table()
+    output, source = reap_fold(item["path"]), reap_fold(item["source"])
+    for pid, command, fd, name in table["files"]:
+        name = reap_fold(reap_private_alias(name))
+        if reap_inside(name, output):
+            raise ReapRefused("in-use:output-handle:" + pid)
+        # Only source cwd is exempt. Non-cwd handles in the source still fail closed.
+        if fd != "cwd" and reap_inside(name, source):
+            raise ReapRefused("in-use:source-handle:" + pid)
+    builders = re.compile(r"(?:^|[\s/])(?:cargo|rustc|rustup|npm|npx|node|pnpm|yarn|bun|make|cmake|ninja|maturin|webpack|vite)(?:\s|$)")
+    for pid, command in table["commands"]:
+        folded = reap_fold(command)
+        # Unattributed builders are unsafe too: relative paths/environment can hide a detached target.
+        if output in folded or source in folded or (builders.search(folded) and not reap_output_control_agent(pid, command, table, item)):
+            raise ReapRefused("in-use:output-command:" + pid)
+
+
+def reap_item(item: dict, mode: str = "delete", ctx: dict | None = None) -> dict:
+    result = reap_item_strict(item, mode, ctx)
+    if item.get("class") not in ("job-clone-regenerable", "job-cache-subdir") \
+            or os.path.basename(str(item.get("path"))) not in REAP_OUTPUT_KINDS \
+            or result["outcome"] != "refused" or result.get("stopped") or result.get("removed") or result.get("archive"):
+        return result
+    if not callable(globals().get("reap_output_producer_guard")) or not reap_output_registry_present(item["path"]):
+        return result  # preserve strict diagnostics and avoid extra probes for legacy outputs
+    if result.get("reason", "").startswith(("outside-", "path-not-canonical", "allowed-root-", "protected-", "not-a-real-", "foreign-owner")):
+        return result  # a source-boundary refusal is never a scoped-output permission
+    targeted = reap_output_item(item["owner"], item["path"])
+    if targeted:
+        output_result = reap_item_strict(targeted, mode, ctx)
+        if output_result["outcome"] in ("deleted", "would-delete") or output_result.get("stopped"):
+            return output_result
+        result["outputRouteReason"] = output_result.get("reason")
+    return result
+
+
+def reap_output_sizes(items: list[dict]) -> dict:
+    """Bounded, fully gated audit ranking. Unknown, blocked and incompletely sized outputs get no priority.
+    Audit never authorizes removal: every proof is rerun with fresh process state by the deletion pass."""
+    deadline, scores, ctx = time.monotonic() + REAP_OUTPUT_SCHEDULE_SECONDS, {}, {}
+    for item in items[:REAP_OUTPUT_SCHEDULE_ITEMS]:
+        if time.monotonic() >= deadline:
+            break
+        if os.path.basename(item["path"]) not in REAP_OUTPUT_KINDS or reap_retention(item) != REAP_DISPOSABLE \
+                or not reap_output_registry_present(item["path"]):
+            continue
+        try:
+            if "table" not in ctx:
+                ctx["table"] = reap_process_table()
+            ctx["sizeBudget"] = max(0, deadline - time.monotonic())
+            result = reap_item(item, "audit", ctx)
+        except (ReapRefused, HostError, OSError, ValueError, sqlite3.Error):
+            continue
+        if result["outcome"] == "would-delete" and not result["bytesIncomplete"]:
+            scores[item["path"]] = result["bytes"] or 0
+    return scores
+
+
+def reap_output_order(items: list[dict]) -> list[dict]:
+    scores = reap_output_sizes(items)
+    return sorted(items, key=lambda i: (i["class"] == "job-clone-root", -scores.get(i["path"], -1)))
+
+
+def reap_output_job_order(jobs: list[dict], clones: list) -> list[dict]:
+    candidates, deadline = [], time.monotonic() + REAP_OUTPUT_SCHEDULE_SECONDS
+    for job in jobs[:REAP_OUTPUT_SCHEDULE_ITEMS]:
+        if len(candidates) >= REAP_OUTPUT_SCHEDULE_ITEMS or time.monotonic() >= deadline:
+            break
+        items, _ = reap_job_items(job, clones)
+        candidates.extend(i for i in items if os.path.basename(i["path"]) in REAP_OUTPUT_KINDS)
+    candidates = candidates[:REAP_OUTPUT_SCHEDULE_ITEMS]
+    sizes = reap_output_sizes(candidates)
+    scores = {}
+    for item in candidates:
+        if item["path"] in sizes:
+            scores[item["owner"]] = max(scores.get(item["owner"], 0), sizes[item["path"]])
+    return sorted(jobs, key=lambda j: -scores.get(j["id"], -1))
 
 
 # ---- the single deletion path -----------------------------------------------------------------------------------
@@ -2898,7 +3387,15 @@ def reap_boundary(item: dict) -> str:
             raise ReapRefused(f"protected-ancestor:{part}")
     rel = tuple(Path(path).relative_to(root).parts)
     cls, parent, owner = item["class"], reap_canon(Path(root).parent), item["owner"]
-    if cls == "job-clone-regenerable":
+    if cls == "job-derived-output":
+        trusted = reap_output_item(item["owner"], path)
+        if trusted is None or any(item.get(k) != trusted.get(k) for k in
+                                  ("root", "source", "sourceRoot", "kind", "ownership", "jobs")):
+            raise ReapRefused("output-source-ambiguous")
+        reap_vet_root(reap_canon(reap_cache_root()) if trusted["ownership"] == "detached-job-output"
+                      else os.path.dirname(trusted["sourceRoot"]))
+        kind = os.path.basename(path)
+    elif cls == "job-clone-regenerable":
         if parent not in reap_clone_base_paths():
             raise ReapRefused("outside-allowed-roots")
         reap_vet_root(parent)  # the clone base this clone sits in
@@ -2977,6 +3474,8 @@ def reap_authority(item: dict) -> dict:
     """Fresh job state for this item, from the host's own job records (never the item's word): every job named by the clone is
     finished, and no unfinished job claims the path (named in the directory, declared as its cwd/worktree, or waiting on
     the owner). Returns the evidence; the caller asks again later and refuses on any difference."""
+    if item.get("class") == "job-derived-output":
+        return reap_output_authority(item)
     with db() as conn:
         jobs = {j["id"]: j for j in rows(conn, "SELECT * FROM jobs")}
         successors = {}
@@ -3449,7 +3948,7 @@ def reap_worktree_forget(common: str, gitdir: str | None, removed: str) -> str:
         return "worktree-entry-kept:" + reap_named(error)
 
 
-def reap_item(item: dict, mode: str = "delete", ctx: dict | None = None) -> dict:
+def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) -> dict:
     """Gate, then (in "delete" mode) remove, one directory. The only function that removes a host's artifacts (the reaper's own
     housekeeping and evidence-file expiry are listed in docs/SAFETY.md).
     mode: "delete" removes it; "dry-run" runs every fresh gate but removes and writes nothing; "audit" is a dry run
@@ -3489,6 +3988,22 @@ def reap_item(item: dict, mode: str = "delete", ctx: dict | None = None) -> dict
             result["kind"] = reap_boundary(item)
             fence = reap_fence(item["path"], item["root"])
             checks.append("canonical-boundary")
+            targeted = item["class"] == "job-derived-output"
+            if targeted:
+                source = item["source"]
+                source_fence = reap_fence(source, item["sourceRoot"])
+                projects = reap_output_projects(source, item["path"], item["root"])
+                stack.enter_context(reap_locks([reap_queue_lock(p) for p in projects], create=apply))
+                # The core guard implements the shared cooperative protocol; host ownership is
+                # verified under these exact locks, not by a blanket all-writers=True assertion.
+                guard = globals().get("reap_output_producer_guard")
+                if not callable(guard):
+                    raise ReapRefused("output-producer-unverified:host-guard-unavailable")
+                proof = stack.enter_context(guard(source, item["path"]))
+                reap_output_producer_proof(item, proof, projects)
+                if result["kind"] == "target":
+                    stack.enter_context(reap_locks(reap_cargo_locks(item["path"]), create=False))
+                checks.extend(["exclusive-output-producer-guard", "producer-locks"])
             retention = reap_retention(item)  # established now, from the directory itself: the declared value is only a claim
             if retention != REAP_DISPOSABLE:
                 raise ReapRefused(f"retention-preserved:{retention}")
@@ -3504,7 +4019,7 @@ def reap_item(item: dict, mode: str = "delete", ctx: dict | None = None) -> dict
                     if os.path.isdir(os.path.join(item["path"], target)) and not os.path.islink(os.path.join(item["path"], target)):
                         stack.enter_context(reap_locks(reap_cargo_locks(os.path.join(item["path"], target)), create=False))
                 checks.append("producer-locks")
-            elif spec["lock"]:
+            elif spec["lock"] and not targeted:
                 projects, current = [], Path(item["path"]).parent
                 while reap_inside(str(current), item["root"]):
                     projects.append(str(current))
@@ -3540,6 +4055,14 @@ def reap_item(item: dict, mode: str = "delete", ctx: dict | None = None) -> dict
                     if held and reap_archive_on() and reap_archive_eligible(item):
                         # secret copies and local state go with the clone under cloneProtectedCopies=remove: archived first (owner-only)
                         raise ReapRefused(f"protected-copies:{len(held)}:{held[0][:60]}")
+                elif targeted:
+                    if reap_inside(item["path"], item["source"]):
+                        checks.extend(reap_git_proof(item["source"], item["path"], ("ignored", "untracked")))
+                    else:
+                        # The host guard proves the detached source/output association; Git cannot check-ignore
+                        # outside the checkout. Source Git metadata must nevertheless be safe to interpret.
+                        reap_git_gate(item["source"])
+                        checks.append("detached-source-git-safe")
                 elif spec["git"]:
                     checks.extend(reap_git_proof(item.get("repo") or item["root"], item["path"], spec["git"], ctx.setdefault("git", {}) if mode == "audit" else None))
                 if allow_git and not whole_clone:  # EVERY .git the scan permits is proved, at any depth and under any name, or the item stays whole
@@ -3576,7 +4099,7 @@ def reap_item(item: dict, mode: str = "delete", ctx: dict | None = None) -> dict
                 checks.append("plan-receipt-durable")
             if reap_authority(item) != evidence:
                 raise ReapRefused("authority-changed")
-            reap_holders(item["path"], item["path"] if whole_clone else item["root"], ctx.get("table") if mode == "audit" else None)  # fresh, with the locks still held
+            reap_item_holders(item, ctx.get("table") if mode == "audit" else None)  # fresh, with the locks still held
             checks.append("no-process-or-handle")
             made = None
             if archive is not None:  # saved and verified under the same locks, before the last look and the removal
@@ -3607,7 +4130,7 @@ def reap_item(item: dict, mode: str = "delete", ctx: dict | None = None) -> dict
             if set(again) != proved or (archive is not None and sorted(set(again_dirs)) != sorted(set(git_dirs))):
                 raise ReapRefused("nested-git-changed")
             if made is not None:  # the archive took time: a process, a file, an ignored folder or a ref may have moved since
-                reap_holders(item["path"], item["path"] if whole_clone else item["root"], None)  # fresh probes again, locks still held
+                reap_item_holders(item, None)  # fresh probes again, locks still held
                 checks.append("no-process-or-handle-after-archive")
                 units, collected = reap_archive_state(item, again, again_dirs)
                 if reap_archive_fingerprint(units, collected) != made["fingerprint"]:
@@ -3621,10 +4144,12 @@ def reap_item(item: dict, mode: str = "delete", ctx: dict | None = None) -> dict
             if reap_authority(item) != evidence:
                 raise ReapRefused("authority-changed")
             checks.append("authority-final")
+            if targeted and reap_fence(item["source"], item["sourceRoot"]) != source_fence:
+                raise ReapRefused("output-source-identity-changed")
             if not apply:
                 result["outcome"] = "would-delete"
             else:
-                reap_holders(item["path"], item["path"] if whole_clone else item["root"], None)  # once more, after the archive and its tree compare took their time
+                reap_item_holders(item, None)  # once more, after the archive and its tree compare took their time
                 checks.append("no-process-or-handle-final")
                 if made is not None:
                     # Stamped BEFORE the first byte is removed: a crash or power loss part-way through leaves a stamped archive, which the
@@ -3867,11 +4392,15 @@ def reap_job(conn, job: dict, dry_run: bool, actor: str, clones: list | None = N
         return reap_job_owned(conn, job, dry_run, actor, clones, pressure)
 
 
-def reap_job_owned(conn, job: dict, dry_run: bool, actor: str, clones: list | None = None, pressure: bool = False) -> dict:
+def reap_job_owned(conn, job: dict, dry_run: bool, actor: str, clones: list | None = None, pressure: bool = False,
+                   outputs_only: bool = False) -> dict:
     """Reap one finished job's artifacts through reap_item and record the outcome in the job's event log. `pressure` reaps only the
     derived build output of an idle unfinished job and records no reap state: its real reap still runs once it finishes."""
     clones = clones if clones is not None else reap_clone_roots()
     items, notes = reap_job_items(job, clones)
+    if outputs_only:
+        items = [targeted for i in items if (targeted := reap_output_item(job["id"], i["path"])) is not None]
+    items = reap_output_order(items)
     if pressure:
         items = [i for i in items if i.get("class") == "job-clone-regenerable" and i.get("kind") in REAP_DERIVED_KINDS]
     out = {"job": job["id"], "status": job["status"], "dryRun": dry_run, "items": [], "notes": notes, "attempted": bool(items)}
@@ -3905,7 +4434,7 @@ def reap_job_owned(conn, job: dict, dry_run: bool, actor: str, clones: list | No
     out.update(summary, items=results, dfDeltaBytes=delta, dfFreeBefore=before, dfFreeAfter=after, run=ctx["run"])
     if stopped:
         out["stopped"] = stopped
-    if pressure and not dry_run:
+    if (pressure or outputs_only) and not dry_run:
         if summary["deleted"]:
             log_event(conn, "job.reaped_under_pressure", job["id"], actor, {"reclaimedBytes": summary["reclaimedBytes"], "dfDeltaBytes": delta,
                                                                           "deleted": summary["deleted"], "preserved": summary["preserved"], "run": ctx["run"]})
@@ -3942,10 +4471,15 @@ def reap_one(conn, job: dict, live_ids: set | None, clones: list, errors: list) 
     state = reap_state(conn, job["id"])
     if reap_state_wait(state):
         return None
-    if reap_job_blocker(conn, job, live_ids):
+    outputs_only = bool(reap_job_blocker(conn, job, live_ids))
+    if outputs_only and (reap_output_terminal_blocker(conn, job, live_ids) or not any(
+            reap_output_registry_present(i["path"]) for i in reap_job_items(job, clones)[0])):
         return None
     try:
-        outcome = reap_job(conn, job, False, "tick", clones)
+        if outputs_only:
+            outcome = reap_job_owned(conn, job, False, "tick", clones, outputs_only=True)
+        else:
+            outcome = reap_job(conn, job, False, "tick", clones)
     except (HostError, OSError, ValueError, sqlite3.Error, ReapRefused) as error:
         errors.append({"reap": job["id"], "error": str(error)})
         held = getattr(REAP_CLEANUP_OWNER, "held", None)
@@ -4390,10 +4924,10 @@ def reap_tick(conn, policy: dict, live: list, actions: list, errors: list) -> No
         except (HostError, OSError, ValueError, sqlite3.Error) as error:
             errors.append({"reap": "terminal-handoff", "error": str(error)})
         due = []
-        for job in rows(conn, "SELECT * FROM jobs WHERE status IN ('done','failed','cancelled') ORDER BY finished_at"):
+        for job in rows(conn, "SELECT * FROM jobs WHERE status IN ('done','failed','cancelled','interrupted') ORDER BY finished_at"):
             if reap_state_wait(reap_state(conn, job["id"])):
                 continue
-            if not reap_job_blocker(conn, job, live_ids):
+            if not reap_job_blocker(conn, job, live_ids) or not reap_output_terminal_blocker(conn, job, live_ids):
                 due.append(job)
         if not due:
             idle = rows(conn, "SELECT * FROM jobs WHERE status IN ('parked','blocked','interrupted')")
@@ -4452,7 +4986,7 @@ def reap_tick_owned(conn, policy: dict, live: list, actions: list, errors: list,
         return  # state moved without a reaper home (tests, a second instance): reaping is off, silently
     live_ids, started, attempted, reaped = {s["id"] for s in live}, time.monotonic(), 0, False
     cleanup_owner = getattr(REAP_CLEANUP_OWNER, "held", None)
-    for job in due:
+    for job in reap_output_job_order(due, clones):
         if attempted >= REAP_TICK_JOBS or time.monotonic() - started > REAP_TICK_SECONDS:
             break
         outcome = reap_one(conn, job, live_ids, clones, errors)
@@ -4751,7 +5285,9 @@ def tool_reap_owned(params: dict) -> dict:
         if not job:
             raise HostError(f"no job {job_id}")
         blocker = reap_job_blocker(conn, job, live_ids)
-        if blocker:
+        outputs_only = bool(blocker) and not reap_output_terminal_blocker(conn, job, live_ids) and any(
+            reap_output_registry_present(i["path"]) for i in reap_job_items(job, reap_clone_roots())[0])
+        if blocker and (not outputs_only or params.get("expireEvidence")):
             raise HostError(f"{job_id} is not reapable: {blocker}", "only finished jobs whose worker is gone are reaped; run reap-status for the state of every job")
         if params.get("expireEvidence"):
             days = evidence_expiry_days(load_policy())
@@ -4764,6 +5300,8 @@ def tool_reap_owned(params: dict) -> dict:
             except OSError as error:
                 raise HostError(f"evidence expiry of {job_id} stopped: {reap_named(error)}",
                                     "the cleanup owner recorded a stopped handoff; read reap-owner-status and the manifest before acknowledging") from error
+        if outputs_only:
+            return reap_job_owned(conn, job, bool(params.get("dryRun")), actor_of(params), outputs_only=True)
         return reap_job(conn, job, bool(params.get("dryRun")), actor_of(params))
 
 
@@ -4776,6 +5314,11 @@ def reap_audit_item(item: dict, blocker: str | None, ctx: dict, deadline: float)
     ctx["sizeBudget"] = 1.0 if time.monotonic() > deadline else max(1.0, min(60.0, deadline - time.monotonic()))
     size_reason = None
     idle_pressure = False
+    if blocker and os.path.basename(item["path"]) in REAP_OUTPUT_KINDS and reap_output_registry_present(item["path"]):
+        with db() as conn:
+            job = row(conn, "SELECT * FROM jobs WHERE id=?", (item["owner"],))
+            if job and not reap_output_terminal_blocker(conn, job, reap_live_ids()):
+                blocker = None  # exact-output authority still runs; source roots never enter this branch
     if blocker in ("job-parked", "job-blocked", "job-interrupted") and item.get("class") == "job-clone-regenerable" \
             and item.get("kind") in REAP_DERIVED_KINDS:
         with db() as conn:

@@ -10,7 +10,7 @@ removes anything of yours, it writes the plan to a durable receipt.
 
 It also cleans the rest of a developer machine the same careful way: tool caches through each tool's own cleaner,
 and the worktrees that Claude Code, Codex, Cursor and other agents leave behind. It can run by itself when the disk
-fills up. It reads names, sizes and times, never the contents of your files.
+fills up. Discovery uses names, sizes and times. Files selected for an archive are read to preserve your work.
 
 It is the reaper engine of UltraTerm, released on its own so any agent setup can use it.
 
@@ -20,7 +20,7 @@ Requires macOS, Python 3.10 or newer, and `git`, `lsof` and `ps`. The `python3` 
 newer one comes from [python.org](https://www.python.org/downloads/) or Homebrew (`brew install python`).
 
 ```sh
-pipx install "git+https://github.com/michael-berardi/TrimReaper@v0.4.1"
+pipx install "git+https://github.com/michael-berardi/TrimReaper@v0.5.0"
 trimreaper --version
 ```
 
@@ -50,8 +50,8 @@ trimreaper tick
 ```
 
 `tick` runs once and exits. `trimreaper schedule install` runs it every 30 minutes with launchd (macOS); elsewhere,
-call it from cron or your agent loop. When the disk is 95% full or more, `tick` also runs `trimreaper clean`
-(below), at most once an hour.
+call it from cron or your agent loop. At 85% used, `tick` also runs `trimreaper clean`, targeting 80% used.
+It retries on new disk pressure or a changed job-release event, not a recurring cleanup timer.
 
 ## Clean the whole machine
 
@@ -62,6 +62,7 @@ trimreaper clean --dry-run   # what would go, what stays and why, plus a report 
 trimreaper clean             # do it
 trimreaper clean --only npm,worktrees
 trimreaper clean --deep      # also the Go module cache, unused Docker images and unavailable simulators
+trimreaper clean --high-watermark 85 --low-watermark 80
 ```
 
 | What | How |
@@ -84,7 +85,10 @@ keep their own: `~/.codex/worktrees` (or `$CODEX_HOME/worktrees`), `~/.cursor/wo
 `~/.superset/worktrees`, `~/.claude-squad/worktrees` and Vibe Kanban's temporary folder. Claude Code's
 `<repo>/.claude/worktrees` sit inside the repository and are found through it. `worktreeHomes` replaces the list.
 
-What was freed is the volume's free space after the pass minus before it, not a sum of folder sizes. A tool's cleaner
+Cleanup sizes candidates, tries the largest first and stops when measured occupancy reaches the low watermark.
+`goalMet` and `remainingBytes` report the actual result; unknown disk measurements produce `null`, not success.
+Protected or active data may prevent reaching the goal. Missing or unreadable candidates are skipped with a named reason;
+independent candidates continue. What was freed is the volume's free space after the pass minus before it, not a sum of folder sizes. A tool's cleaner
 that fails is listed with its exit status and last line of output, and the command exits 3.
 
 Every command prints one JSON document on stdout. Exit status:
@@ -107,13 +111,19 @@ Every command prints one JSON document on stdout. Exit status:
 | Its own archives | `archiveExpiryDays` (30) after the archive became the only copy |
 | Old release builds and release evidence | Off until configured: [docs/CONFIGURATION.md](docs/CONFIGURATION.md) |
 
+A host with the producer registry enabled can reclaim an exact `target` or `node_modules` of a settled finished,
+failed, cancelled or verifiably interrupted job even when a continuation keeps the source worktree. This requires the
+producer's source/output identity record, shared build locks, no live claim on the exact output, no open files and
+no running builder. A source working directory alone is not an output handle. Source and retained data stay;
+legacy outputs without producer proof stay on the stricter route. See [the embedding contract](docs/EMBEDDING.md).
+
 Under disk pressure (at or above `diskWarnPercent`, 85%), the build output of parked or interrupted jobs goes too;
 they rebuild it when they resume. The pressure check runs during a `tick` that has at least one finished job due.
 
 ## What it never removes
 
 - Anything of a job that is queued, approved, running, blocked, parked or interrupted, or that another job waits on
-  (`job add ... --waits-on`). The one exception is the disk-pressure rule above.
+  (`job add ... --waits-on`). Exceptions are the guarded exact-output and disk-pressure rules above; neither grants permission to delete source.
 - `.env*`, `.dev.vars*`, `.wrangler` and `.vercel` local files. A clone that holds one is kept whole, and TrimReaper
   does not enter or read them. Two exceptions: env *templates* that git tracks (`.env.example`, `.env.sample`,
   `.dev.vars.template` ...) go with an expired clone, since the remote holds the same file; and with
@@ -122,7 +132,7 @@ they rebuild it when they resume. The pressure check runs during a `tick` that h
   level (`ut` is from UltraTerm, where the format started). Write one with `trimreaper mark <folder> <class>`:
   `evidence` (proof of work you want kept), `customer` (customer data), `release-runtime-rollback` (what a release or
   its rollback needs). `disposable` is the opposite: it allows removal, still subject to every other check.
-- Anything a process has open, uses as its working directory, or names on its command line.
+- Anything a process has open or names on its command line. A source-only working directory is exempt only for the guarded exact-output route described above.
 - Anything reached through a symlink, on another volume, owned by another user, or outside the configured folders.
 - Your home folder or a system folder as a root, even if the configuration says so.
 
@@ -163,7 +173,7 @@ error that names it:
 {
   "cloneBases": [{"path": "~/dev"}],
   "scratchRoot": "~/.cache/agent-scratch",
-  "policy": {"cloneExpiryDays": 3, "evidenceExpiryDays": 14, "cleanAtPercent": 95}
+  "policy": {"cloneExpiryDays": 3, "evidenceExpiryDays": 14, "cleanAtPercent": 85, "cleanToPercent": 80}
 }
 ```
 
