@@ -20,7 +20,7 @@ Requires macOS, Python 3.10 or newer, and `git`, `lsof` and `ps`. The `python3` 
 newer one comes from [python.org](https://www.python.org/downloads/) or Homebrew (`brew install python`).
 
 ```sh
-pipx install "git+https://github.com/michael-berardi/TrimReaper@v0.5.1"
+pipx install "git+https://github.com/michael-berardi/TrimReaper@v0.5.2"
 trimreaper --version
 ```
 

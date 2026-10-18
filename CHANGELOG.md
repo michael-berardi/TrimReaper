@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.2 (2026-10-18)
+
+- Measure goals from `df -kP` Used and Available columns. On APFS, Python's total-minus-free value can include shared-container allocation and is not the volume's Used value. Failed or malformed probes expose a named fallback with unknown goal progress, never false success.
+
 ## 0.5.1 (2026-10-18)
 
 - Re-arm the high-water trigger when disk use reaches the low watermark exactly, not only below it. This preserves the next high-water crossing on smaller volumes where the growth threshold may not otherwise trigger.

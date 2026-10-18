@@ -5,7 +5,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from trimreaper import clean, host
+from trimreaper import clean, core, host
 
 
 class HostGoalPolicyTests(unittest.TestCase):
@@ -67,25 +67,26 @@ class HostGoalPolicyTests(unittest.TestCase):
 class HostDiskGoalTests(unittest.TestCase):
     def test_apfs_exact_used_bytes_not_total_or_rounded_occupancy(self):
         # APFS can report a shared container total different from used + available.
-        usage = SimpleNamespace(total=2000, used=801, free=199)
+        text = 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/synthetic 2000 801 199 81% /synthetic/data\n'
         with patch.object(host, "config", return_value={"diskVolume": "/synthetic/data"}), \
-                patch.object(host.shutil, "disk_usage", return_value=usage) as measure:
+                patch.object(core, "reap_probe", return_value=(0, text)) as measure:
             disk = host.disk_state()
-        measure.assert_called_once_with("/synthetic/data")
+        self.assertEqual(measure.call_args.args[:2], (["df", "-kP", "/synthetic/data"], 5))
         self.assertEqual(disk, {"path": "/synthetic/data", "usedPercent": 81,
-                                "usedBytes": 801, "freeBytes": 199})
+                                "usedBytes": 801 * 1024, "freeBytes": 199 * 1024, "measurement": "df-kP"})
         occupancy = clean.clean_occupancy(disk, 80)
         self.assertAlmostEqual(occupancy["usedPercent"], 80.1)
-        self.assertEqual(occupancy["remainingBytes"], 1)
+        self.assertEqual(occupancy["remainingBytes"], 1024)
         self.assertFalse(occupancy["goalMet"])
 
     def test_fallback_disk_measurement_keeps_actual_used_bytes(self):
-        usage = SimpleNamespace(total=1000, used=400, free=100)
+        text = 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/synthetic 1000 400 100 80% /\n'
         with patch.object(host, "config", return_value={"diskVolume": None}), \
-                patch.object(host.shutil, "disk_usage", side_effect=[OSError(), usage]) as measure:
+                patch.object(core, "reap_probe", side_effect=[(1, ''), (0, text)]) as measure, \
+                patch.object(core.shutil, "disk_usage", side_effect=OSError()):
             disk = host.disk_state()
         self.assertEqual(measure.call_count, 2)
-        self.assertEqual((disk["path"], disk["usedBytes"], disk["usedPercent"]), ("/", 400, 80))
+        self.assertEqual((disk["path"], disk["usedBytes"], disk["usedPercent"]), ("/", 400 * 1024, 80))
 
 
 class HostReleaseEventTests(unittest.TestCase):

@@ -318,19 +318,15 @@ def load_policy() -> dict:
 
 
 def disk_state() -> dict | None:
-    """Actual used/free bytes and df-style rounded occupancy; APFS total includes space unavailable to this volume."""
+    """Read df Used/Available, not APFS shared-container total-minus-free."""
+    from . import core
     volume = config().get("diskVolume")
     for path in ((volume,) if volume else ("/System/Volumes/Data", "/")):
-        try:
-            usage = shutil.disk_usage(path)
-        except OSError as error:
-            if volume:
-                raise HostError(f"diskVolume {volume} cannot be measured: {error.__class__.__name__}", "fix diskVolume or remove it")
-            continue
-        total = usage.used + usage.free
-        if total > 0:
-            return {"path": path, "usedPercent": -(-usage.used * 100 // total), "usedBytes": usage.used,
-                    "freeBytes": usage.free}
+        disk = core.reap_disk_state(path)
+        if disk:
+            return disk
+    if volume:
+        raise HostError(f"diskVolume {volume} cannot be measured", "fix diskVolume or remove it")
     return None
 
 

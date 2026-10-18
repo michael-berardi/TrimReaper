@@ -30,7 +30,9 @@ An embedded copy uses the host's single-owner lock; never add a second cleaner.
 
 Results include `initialOccupancy`, `finalOccupancy`, `remainingBytes` and `goalMet`.
 `disk_state()` must supply exact `usedBytes` and `freeBytes`: occupancy uses used/(used+free), not an APFS
-volume's nominal total or a rounded percentage. Missing measurements yield unknown (`null`) goals.
+volume's nominal total or a rounded percentage. `reap_disk_state(volume)` obtains these columns with a bounded
+`df -kP` probe. A failed or malformed probe includes `measurementError` and leaves `usedBytes` unknown in its
+conservative admission fallback; goals remain `null`, never inferred from shared-container allocation.
 
 ## Modules the host imports
 

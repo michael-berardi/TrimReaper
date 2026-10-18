@@ -294,6 +294,38 @@ def reap_free_bytes() -> int | None:
     return None
 
 
+def reap_disk_state(volume: str) -> dict | None:
+    """APFS df Used is not shutil's total-minus-free (which includes shared container allocation).
+    Exact goals use df's used/available columns. A failed probe keeps only a named conservative
+    admission fallback; usedBytes is unknown, so cleanup never reports a met goal from it.
+    """
+    reason = "df-malformed-output"
+    try:
+        code, text = reap_probe(["df", "-kP", volume], 5, env={**os.environ, "LC_ALL": "C"})
+        if code == 0:
+            lines = text.strip().splitlines()
+            fields = lines[-1].split(None, 5) if len(lines) == 2 else []
+            if len(fields) == 6 and all(v.isdecimal() for v in fields[1:4]):
+                used, free = int(fields[2]) * 1024, int(fields[3]) * 1024
+                total = used + free
+                if total > 0:
+                    return {"path": volume, "usedPercent": -(-used * 100 // total), "usedBytes": used,
+                            "freeBytes": free, "measurement": "df-kP"}
+        else:
+            reason = "df-exit:" + str(code)
+    except (OSError, subprocess.SubprocessError, ReapRefused) as error:
+        reason = "df-probe:" + reap_named(error)
+    try:
+        usage = shutil.disk_usage(volume)
+    except OSError:
+        return None
+    total = usage.used + usage.free
+    if total <= 0:
+        return None
+    return {"path": volume, "usedPercent": -(-usage.used * 100 // total), "usedBytes": None,
+            "freeBytes": usage.free, "measurement": "statvfs-fallback", "measurementError": reason}
+
+
 def reap_run(argv: list[str], timeout: float, env: dict | None = None, data: str | None = None):
     """Every external probe of the reaper goes through here."""
     if data is None:
