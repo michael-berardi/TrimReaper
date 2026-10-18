@@ -216,17 +216,23 @@ class AutoGoals(unittest.TestCase):
     def observe(self, used, event=None):
         return clean.clean_auto_observe(self.conn, self.policy, disk(used, 100 - used), event)
 
-    def test_high_crossing_and_below_low_rearm_not_high_band_rearm(self):
+    def test_high_crossing_and_low_rearm_not_high_band_rearm(self):
         self.assertIsNone(self.observe(84))
         self.assertEqual(self.observe(85), "crossed")
         self.state()
-        for used in (90, 84, 80, 85):
+        for used in (90, 84, 85):
             self.assertIsNone(self.observe(used))
             self.assertTrue(clean.clean_auto_state(self.conn))
         self.assertIsNone(self.observe(79))
         self.assertEqual(clean.clean_auto_state(self.conn), {})
         self.assertIsNone(self.observe(81))
         self.assertEqual(self.observe(85), "crossed")
+
+    def test_exact_low_rearms_small_volume_crossing(self):
+        self.state(goalMet=True, freeBytes=20)
+        self.assertIsNone(self.observe(80))
+        self.assertEqual(clean.clean_auto_state(self.conn), {})
+        self.assertEqual(self.observe(85), 'crossed')
 
     def test_release_generation_retries_unresolved_not_unchanged_ticks(self):
         self.state()

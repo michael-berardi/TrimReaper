@@ -1188,7 +1188,7 @@ def clean_auto_state(conn) -> dict:
 def clean_auto_observe(conn, policy: dict, disk: dict | None, event=None) -> str | None:
     """Hysteresis and new host events, never a periodic retry. `event` is an opaque release-generation token.
 
-    Only below low re-arms a high crossing. Unresolved work can retry on a *changed* job/artifact release token;
+    At or below low re-arms a high crossing. Unresolved work can retry on a *changed* job/artifact release token;
     a token is saved before starting, so unchanged ticks (and failed passes) cannot spin. The cooldown delays
     new pressure/events but never creates one. Hosts may supply the token as policy.cleanEventToken instead.
     """
@@ -1200,7 +1200,7 @@ def clean_auto_observe(conn, policy: dict, disk: dict | None, event=None) -> str
     if percent is None:
         return None
     state = clean_auto_state(conn)
-    if percent < low:
+    if percent <= low:
         if state:
             conn.execute("DELETE FROM meta WHERE key=?", (CLEAN_AUTO_KEY,))
         return None

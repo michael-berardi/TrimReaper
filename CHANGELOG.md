@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.1 (2026-10-18)
+
+- Re-arm the high-water trigger when disk use reaches the low watermark exactly, not only below it. This preserves the next high-water crossing on smaller volumes where the growth threshold may not otherwise trigger.
+
 ## 0.5.0 (2026-10-18)
 
 - Automatic cleanup starts at 85% used and targets 80%, with measured `goalMet` and `remainingBytes`. Largest disposable candidates go first; active or protected data can leave the goal unmet. Retries remain event-driven.
