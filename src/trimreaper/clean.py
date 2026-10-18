@@ -645,7 +645,7 @@ def clean_repository_output_gates(entry: dict, table: dict | None) -> float:
     # A copy made for a job (site-j0042, .worktrees/J-0042): kept while that job is unfinished, and once it is finished its output
     # needs only CLEAN_PROJECT_JOB_IDLE_HOURS of quiet. Every other project needs the operator's idleHours.
     # Only a job with a live worker (starting or running) protects regenerable output; a parked, blocked or queued job's project still
-    # waits the full idleHours. A declared folder that is a whole code home (the dev folder, the home folder) names no project and protects nothing.
+    # waits the full idleHours. A collection-root cwd names no project; explicit worktree declarations still protect it.
     limit = entry.get("idleHours", 0)
     explicit_named = [f"J-{int(n):04d}" for n in re.findall(r"(?:^|/)J-(\d{3,5})(?=/|$)", repo)]
     named = list(dict.fromkeys(reap_job_ids(*Path(repo).parts) + explicit_named))
