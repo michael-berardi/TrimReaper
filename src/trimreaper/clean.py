@@ -421,10 +421,20 @@ def clean_entry_gates(entry: dict) -> None:
 
 def clean_folder_gates(path: str) -> None:
     """A cache folder with no cleaner of its own: no retention but `disposable`, no protected name, no nested repository."""
-    for folder in (os.path.dirname(path), path):  # a marker on the cache root keeps every folder in it
-        retention = reap_cache_retention(folder)
+    # Check components before reading marker names: never traverse a protected or symlink ancestor.
+    absolute = Path(os.path.abspath(path))
+    for folder in reversed((absolute, *absolute.parents)):
+        if reap_protected(folder.name):
+            raise ReapRefused("protected-ancestor")
+        if not stat.S_ISDIR(os.lstat(folder).st_mode):
+            raise ReapRefused("non-directory-ancestor")
+    home = reap_canon(reap_home())
+    for folder in (absolute, *absolute.parents):
+        retention = reap_cache_retention(str(folder))
         if retention not in ("unmarked", REAP_DISPOSABLE):
             raise ReapRefused("retention:" + retention)
+        if str(folder) == home:
+            break
     reap_protected_scan(path, markers=True)
 
 
@@ -625,54 +635,69 @@ def clean_rust_lock_paths(target: str, repo: str) -> list[Path]:
     return [reap_queue_lock(repo), Path(target, ".cargo-lock"), Path(target, ".cargo-build-lock"), *reap_cargo_locks(target)]
 
 
-def clean_project_gates(entry: dict, table: dict | None) -> None:
-    """A dependency or output folder goes only when git ignores it, no unfinished job claims its project, the project has been idle
-    `idleHours`, and no process holds anything in the project. Cheapest first."""
+def clean_repository_output_gates(entry: dict, table: dict | None) -> float:
+    """Shared repository, ownership and process proof for regenerable project output; return its idle limit."""
     path, repo = entry["path"], entry["repo"]
-    code, _ = reap_git(repo, "check-ignore", "-q", "--", path)
-    if code == 1:
-        raise ReapRefused("tracked-or-not-ignored")
-    if code != 0:
-        raise ReapRefused(f"git-error:check-ignore:{code}")
+    if path == repo or not reap_inside(path, repo):
+        raise ReapRefused("outside-repository")
+    clean_folder_gates(path)
+    reap_git_proof(repo, path, ("clean", "pushed", "ignored", "untracked"))
     # A copy made for a job (site-j0042, .worktrees/J-0042): kept while that job is unfinished, and once it is finished its output
     # needs only CLEAN_PROJECT_JOB_IDLE_HOURS of quiet. Every other project needs the operator's idleHours.
     # Only a job with a live worker (starting or running) protects regenerable output; a parked, blocked or queued job's project still
     # waits the full idleHours. A declared folder that is a whole code home (the dev folder, the home folder) names no project and protects nothing.
-    limit = entry["idleHours"]
-    named = list(dict.fromkeys(reap_job_ids(*Path(repo).parts[-2:]) + [f"J-{int(n):04d}" for n in re.findall(r"(?:^|/)J-(\d{3,5})(?=/|$)", repo)]))
+    limit = entry.get("idleHours", 0)
+    explicit_named = [f"J-{int(n):04d}" for n in re.findall(r"(?:^|/)J-(\d{3,5})(?=/|$)", repo)]
+    named = list(dict.fromkeys(reap_job_ids(*Path(repo).parts) + explicit_named))
+    # Ancestor job names protect live work, but do not shorten the existing idle window.
+    idle_named = list(dict.fromkeys(reap_job_ids(*Path(repo).parts[-2:]) + explicit_named))
     homes = {reap_canon(h) for h in [clean_home(), *(clean_home(n) for n in CLEAN_CODE_HOMES)] if os.path.isdir(h)}
     with db() as conn:
         unfinished = rows(conn, "SELECT * FROM jobs WHERE status NOT IN ('done','failed','cancelled')")
-        named_states = {r["status"] for r in rows(conn, "SELECT status FROM jobs WHERE id IN (%s)" % ",".join("?" * len(named)), tuple(named))} if named else set()
+        named_states = {r["status"] for r in rows(conn, "SELECT status FROM jobs WHERE id IN (%s)" % ",".join("?" * len(idle_named)), tuple(idle_named))} if idle_named else set()
     for job in unfinished:
         live = job["status"] in ("starting", "running")
         if job["id"] in named:
             if live:
                 raise ReapRefused(f"in-use-by-running-job:{job['id']}")
             continue
-        for declared in reap_declared_paths(job):
-            if reap_canon(declared) in homes:
-                continue
+        # Only a collection-root cwd is nonspecific. Explicit worktrees remain concrete claims,
+        # even when they happen to name a collection root too.
+        claim = dict(job)
+        if claim.get("cwd") and reap_canon(Path(claim["cwd"]).expanduser()) in homes:
+            claim["cwd"] = None
+        for declared in reap_declared_paths(claim):
             if live and (reap_inside(declared, repo) or reap_inside(repo, declared)):
                 raise ReapRefused(f"in-use-by-running-job:{job['id']}")
     if named_states and not named_states - {"done", "failed", "cancelled"}:
         limit = min(limit, CLEAN_PROJECT_JOB_IDLE_HOURS)
+    reap_holders(repo, repo, table)
+    return limit
+
+
+def clean_project_gates(entry: dict, table: dict | None) -> None:
+    """Dependency output additionally waits for the existing project idle policy."""
+    if "idleHours" not in entry:
+        raise ReapRefused("project-idle-policy-unproved")
+    limit = clean_repository_output_gates(entry, table)
+    repo = entry["repo"]
     dot_git = os.path.join(repo, ".git")
     gitdir = clean_pointer_target(dot_git) if os.path.isfile(dot_git) else dot_git
     idle = (now() - clean_newest_change(repo, gitdir)) / 3600
     if idle < limit:
         raise ReapRefused(f"recent:{idle:.0f}h-of-{limit}h")
-    reap_holders(repo, repo, table)
 
 
 def clean_extra_gates(entry: dict, table: dict | None = None) -> None:
     path, kind = entry["path"], entry["name"]
     if kind == "project-dependencies":
         clean_project_gates(entry, table)
-    clean_folder_gates(path)
+    elif kind != "rust-build-output":
+        clean_folder_gates(path)
     if kind == "project-dependencies":
         pass
     elif kind == "rust-build-output":
+        clean_repository_output_gates(entry, table)
         busy = sorted(set(CLEAN_RUST_BUSY) & clean_running())
         if busy:
             raise ReapRefused("in-use:" + ",".join(busy))
@@ -749,10 +774,10 @@ def clean_extra_entries(only: set, errors: list, idle_hours: int = 48) -> list[d
     table = reap_process_table() if entries else None
     for entry in entries:
         try:
-            if entry["name"] == "rust-build-output":
-                with reap_locks(clean_rust_lock_paths(entry["target"], entry["repo"]), create=False):
-                    clean_extra_gates(entry, table)
-            else:
+            with ExitStack() as stack:
+                if entry["name"] in ("rust-build-output", "project-dependencies"):
+                    locks = clean_rust_lock_paths(entry["target"], entry["repo"]) if entry["name"] == "rust-build-output" else [reap_queue_lock(entry["repo"])]
+                    stack.enter_context(reap_locks(locks, create=False))
                 clean_extra_gates(entry, table)
         except (ReapRefused, OSError) as error:
             entry["keep"] = str(error) if isinstance(error, ReapRefused) else "error:" + reap_named(error)
@@ -909,8 +934,13 @@ def clean_act(entry: dict, run_id: str, days: int) -> None:
         return clean_run_tool(entry, run_id)
     if entry["kind"] == "debris":
         with ExitStack() as stack:
-            if entry["name"] == "rust-build-output":
-                stack.enter_context(reap_locks(clean_rust_lock_paths(entry["target"], entry["repo"]), create=False))
+            if entry["name"] in ("rust-build-output", "project-dependencies"):
+                held = stack.enter_context(reap_locks([reap_queue_lock(entry["repo"])], create=True))
+                if held != 1:
+                    raise ReapRefused("lock-unavailable:project-queue")
+                if entry["name"] == "rust-build-output":
+                    # The canonical queue flock is already held; take only Cargo's existing locks here.
+                    stack.enter_context(reap_locks(clean_rust_lock_paths(entry["target"], entry["repo"])[1:], create=False))
             clean_remove_folder(entry, run_id, entry["root"], False, lambda: clean_extra_gates(entry))
         return
     if entry["kind"] == "worktree-entry":
@@ -935,7 +965,7 @@ def clean_act(entry: dict, run_id: str, days: int) -> None:
 # ---- report-only inventory ------------------------------------------------------------------------------------------
 
 def clean_inventory() -> list[dict]:
-    """Large things a person decides about: local models, browser builds, Docker's disk image, local snapshots."""
+    """Read-only size report; older browser builds have a separate cleanup target, models and disk images do not."""
     found = []
     def children(kind: str, root: str | None, note: str, rename=lambda n: n, depth: int = 1):
         if not root or not os.path.isdir(root) or os.path.islink(root):

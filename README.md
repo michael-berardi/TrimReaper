@@ -20,7 +20,7 @@ Requires macOS, Python 3.10 or newer, and `git`, `lsof` and `ps`. The `python3` 
 newer one comes from [python.org](https://www.python.org/downloads/) or Homebrew (`brew install python`).
 
 ```sh
-pipx install "git+https://github.com/michael-berardi/TrimReaper@v0.2.0"
+pipx install "git+https://github.com/michael-berardi/TrimReaper@v0.4.1"
 trimreaper --version
 ```
 
@@ -72,10 +72,12 @@ trimreaper clean --deep      # also the Go module cache, unused Docker images an
 | Agent worktrees | A linked git worktree no job owns goes after `worktreeIdleDays` (7) without a change, when it is unlocked and clean (edits hidden by `--skip-worktree` or `--assume-unchanged` count as changes), git ignores nothing in it but build output, it holds no `.env*` or other protected name, no unfinished job declares it, no process uses it, and every commit its HEAD ever pointed at is on a branch, tag or remote. Its branch stays. A worktree whose folder is already gone is forgotten by its repository after 30 days, under the same commit check |
 | Project dependencies and output | `node_modules`, `.next`, `.astro`, `.turbo`, `.svelte-kit`, `.nuxt`, `.parcel-cache`, `.vite`, `.venv` and Python tool caches inside any repository in the code homes, when git ignores the folder, its manifest (`package.json`, `pyproject.toml`, `requirements.txt` ...) sits beside it so one install brings it back, the project has gone `projectIdleHours` (48) without a change (6 hours for a copy named after a finished job), no running job works in it and no process uses anything in it. `dist` and `build` are never touched: some projects commit them |
 | Rust build output | `debug` and `incremental` folders of every `target` in a repository (release artifacts stay), skipped while Cargo or rust-analyzer runs. Discovery is breadth-first and never enters tool caches, virtual environments or dependency stores |
+| Repository-output safeguards | Dependency and Rust output stays when Git cannot prove the repository clean and pushed, the folder ignored and untracked, a running job owns the project, or an enclosing folder up to the reap home carries a retention marker other than `disposable`. Removal holds the build queue's project lock and rechecks every proof |
 | Temp folders | A folder of yours in the shared temp folder after a day without a change, and in your per-user temp folder after three days, when nothing in it changed in that time and no process uses it. Folders the system or running apps manage there (`com.apple.*`, sockets, locks) are never candidates |
 | Browser code-sign clones (macOS) | A browser copies its app bundle into your per-user `X` folder at every launch and removes it on quit; a killed browser (automation, a crash) leaves one behind each time. Each abandoned copy goes after an hour when no process has it open |
 | Go module cache, unused Docker images, unavailable simulators | Only with `--deep` (`xcrun simctl delete unavailable` also deletes the app data of simulators the selected Xcode cannot run) |
-| Local models (Hugging Face, Ollama, LM Studio), Playwright browsers, Docker's disk image, local snapshots | Reported with their size. Never removed |
+| Superseded Playwright browser builds | Older builds only, when a newer build of the same browser is installed and no process uses the old one |
+| Local models (Hugging Face, Ollama, LM Studio), Docker's disk image, local snapshots | Reported with their size. Never removed |
 
 Worktrees are found through `git worktree list` in every repository in `cloneBases`, and in the folders where agent tools
 keep their own: `~/.codex/worktrees` (or `$CODEX_HOME/worktrees`), `~/.cursor/worktrees`, `~/conductor/workspaces`,

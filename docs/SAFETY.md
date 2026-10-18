@@ -1,8 +1,8 @@
 # Safety model
 
-Every folder of yours that TrimReaper removes goes through one function, `reap_item` in `src/trimreaper/core.py`.
-Every sweep (a job, scratch, archives, release evidence, releases) hands it one folder at a time. Each folder passes all
-of these gates, in this order, or it is kept and the first failing gate is recorded as the reason.
+Job, scratch, archive and release sweeps remove folders through `reap_item` in `src/trimreaper/core.py`.
+Each folder passes all of these gates, in this order, or it is kept and the first failing gate is recorded as the reason.
+Other removal paths, including `clean`, have their checks listed below.
 
 Terms used below: the **reap home** is the home folder TrimReaper works below (`home` in the config, your home by
 default). A **job** is a unit of agent work recorded with `trimreaper job add`. A job **settles** for 15 minutes after it
@@ -70,7 +70,8 @@ These also remove files, each with its own checks:
   - A worktree whose folder is gone is forgotten only when the folder is still gone, its entry is 30 days old and
     unlocked, the folder's parent exists (an empty mount point passes this, as in the engine's archive rule) and the
     commit check passes.
-  - Models, browser builds, Docker's disk image and local snapshots are only measured.
+  - Repository dependencies and Rust debug/incremental output must be ignored and untracked, in a repository whose Git state is clean (including hidden index changes) and whose HEAD is already held by a remote. An enclosing retention marker other than `disposable`, or a running job that owns the project, keeps the output. Collection-root working directories such as the home or code folder do not name a project. Actual removal holds the canonical build-queue project lock, creating it if needed, plus existing Cargo locks for Rust, through the fresh Git, retention, process and boundary checks and result receipt. Release artifacts stay.
+  - Older Playwright builds may be removed when a newer build of that same browser exists and no process uses the old one. Models, Docker's disk image and local snapshots are only measured.
 
 - **Evidence expiry** (`reap --job ... --expire-evidence`, and `tick`) unlinks old screenshots, recordings, traces and
   logs one file at a time. It holds the same owner lock and job authority, writes plan and result receipts, records each

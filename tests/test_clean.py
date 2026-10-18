@@ -51,8 +51,7 @@ class Debris(Home):
         return self.cli("clean", *( ["--dry-run"] if dry else []), "--only", target)
 
     def rust(self):
-        repo = self.home / "projects" / "recent-repo"
-        (repo / ".git").mkdir(parents=True)
+        repo = self.clone("recent-repo")
         self.put(repo, "target/debug/app")
         self.put(repo, "target/release/app")
         self.put(repo, "target/release/bundle/App.app/Contents/binary")
@@ -93,8 +92,10 @@ class Debris(Home):
         self.assertTrue(debug.exists())
 
     def test_rust_in_a_recent_linked_worktree_is_independent_of_idle_policy(self):
+        main = self.clone("linked-main")
         worktree = self.home / "projects" / "linked"
-        self.put(worktree, ".git", b"gitdir: /unused/fixture\n")
+        worktree.parent.mkdir(parents=True)
+        self.git(main, "worktree", "add", "--detach", str(worktree))
         debug = self.put(worktree, "src-tauri/target/debug/app").parent
         self.write_config({"policy": {"worktreeIdleDays": 0}})
         out = self.run_target("rust-build-output")
@@ -103,8 +104,9 @@ class Debris(Home):
         self.assertTrue((worktree / ".git").exists())
 
     def test_linked_worktree_outside_home_is_discovered(self):
+        main = self.clone("external-main")
         worktree = self.tmp / "external-worktree"
-        self.put(worktree, ".git", b"gitdir: /unused/fixture\n")
+        self.git(main, "worktree", "add", "--detach", str(worktree))
         debug = self.put(worktree, "target/debug/app").parent
         with mock.patch.object(clean, "clean_worktree_entries", return_value=[{"path": str(worktree), "kind": "worktree"}]):
             out = self.run_target("rust-build-output")
@@ -226,12 +228,13 @@ class Debris(Home):
         self.assertEqual(out["summary"]["done"], 1, out)
 
     def project(self, name="site", ignored=("node_modules/", ".next/")):
-        repo = self.home / "dev" / name
-        subprocess.run(["git", "init", "-q", str(repo)], check=True)
-        (repo / ".gitignore").write_text("".join(i + "\n" for i in ignored))
-        (repo / "package.json").write_text("{}")
+        repo = self.clone(name, ignored=ignored, tracked={"package.json": "{}"})
         self.put(repo, "node_modules/pkg/index.js")
         self.put(repo, ".next/cache/x")
+        if ".next/" not in ignored:
+            self.git(repo, "add", ".next")
+            self.git(repo, "commit", "-q", "-m", "tracked output fixture")
+            self.git(repo, "push", "-q")
         return repo
 
     def test_idle_project_dependencies_go_and_tracked_or_recent_ones_stay(self):
@@ -253,7 +256,7 @@ class Debris(Home):
         self.assertTrue((recent / "node_modules").exists())  # touched within projectIdleHours
         self.assertTrue((bare / "node_modules").exists())  # no package.json beside it: nothing could reinstall it
         kept = {i["path"].split("/dev/")[-1]: i.get("keep") for i in out["items"]}
-        self.assertTrue(kept["tracked-site/.next"].startswith("tracked-or-not-ignored"), kept)
+        self.assertTrue(kept["tracked-site/.next"].startswith("not-git-ignored"), kept)
         self.assertTrue(kept["recent-site/node_modules"].startswith("recent:"), kept)
 
     def test_a_running_job_keeps_its_projects_dependencies(self):
