@@ -146,7 +146,11 @@ REAP_IDENTITY_KEYS = ("kind", "dev", "ino", "mode", "nlink", "size", "mtimeNs", 
 # A build name, gitignore or a superseded release is not evidence that customer/QA/rollback bytes may go.
 REAP_CLASSES = {
     "job-derived-output": {"git": (), "lock": True, "retention": "marker"},
-    "job-clone-regenerable": {"git": ("ignored", "clean", "pushed", "untracked"), "lock": True, "retention": "marker"},
+    # A finished job's regenerable output rebuilds from the source that stays in the clone, so the clone's own uncommitted
+    # or stashed tracked work is not the output's business: derived kinds need derivedGit instead of clean/pushed. The
+    # output is still proved git-ignored and untracked, and every protected leaf, lock, handle and retention gate stands.
+    "job-clone-regenerable": {"git": ("ignored", "clean", "pushed", "untracked"), "derivedGit": ("ignored", "untracked"),
+                              "lock": True, "retention": "marker"},
     "job-cache-subdir": {"git": (), "lock": False, "retention": "marker"},
     "release-target": {"git": ("ignored", "untracked"), "lock": True, "retention": "marker"},
     # <scratch root>/<task>: the one home for agent scratch outside a job (delegation staging, ad-hoc audits).
@@ -4208,7 +4212,7 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
                         reap_git_gate(item["source"])
                         checks.append("detached-source-git-safe")
                 elif spec["git"]:
-                    checks.extend(reap_git_proof(item.get("repo") or item["root"], item["path"], spec["git"], ctx.setdefault("git", {}) if mode == "audit" else None))
+                    checks.extend(reap_git_proof(item.get("repo") or item["root"], item["path"], reap_class_git_needs(item), ctx.setdefault("git", {}) if mode == "audit" else None))
                 if allow_git and not whole_clone:  # EVERY .git the scan permits is proved, at any depth and under any name, or the item stays whole
                     for repo in sorted(set(repos)):
                         checks.extend(["nested-" + c for c in reap_git_proof(repo, repo, ("clean", "pushed", "all-refs"), ctx.setdefault("git", {}) if mode == "audit" else None)])
@@ -4408,6 +4412,15 @@ def reap_terminal_handoff_tick(conn, live_ids: set, errors: list) -> int:
         conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (key, json.dumps({"state": state, "at": now()})))
         sent += 1
     return sent
+
+
+def reap_class_git_needs(item: dict) -> tuple:
+    """The git proofs one item needs, from its class and its kind alone: never from the caller's word."""
+    spec = REAP_CLASSES.get(item.get("class")) or {}
+    if item.get("kind") in REAP_DERIVED_KINDS and os.path.basename(item.get("path") or "") == item.get("kind") \
+            and spec.get("derivedGit"):
+        return tuple(spec["derivedGit"])
+    return tuple(spec.get("git") or ())
 
 
 def reap_job_blocker(conn, job: dict, live_ids: set | None) -> str | None:

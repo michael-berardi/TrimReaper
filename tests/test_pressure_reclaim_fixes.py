@@ -31,11 +31,16 @@ class AstroOutput(Home):
         self.assertEqual(out['deleted'], 0, out)
         self.assertTrue((repo / '.astro/types.d.ts').exists())
 
-    def test_dirty_source_still_preserves_output(self):
+    def test_dirty_source_preserves_itself_and_still_gives_up_generated_output(self):
+        """A finished job's generated output rebuilds from the source that stays: uncommitted tracked work is not its business
+        (0.6.2). The clone keeps the edit, the generated metadata goes, and a tracked one still never goes."""
         repo = self.setup_astro()
         self.put(repo, 'README.md', b'edited\n')
-        self.assertEqual(self.cli('reap', '--job', 'J-0080')['deleted'], 0)
-        self.assertTrue((repo / '.astro').exists())
+        out = self.cli('reap', '--job', 'J-0080')
+        self.assertEqual(out['deleted'], 1, out)
+        self.assertFalse((repo / '.astro').exists())
+        self.assertEqual((repo / 'README.md').read_bytes(), b'edited\n')
+        self.assertTrue((repo / '.git').exists())
 
     def test_protected_leaf_still_preserves_output(self):
         repo = self.setup_astro()

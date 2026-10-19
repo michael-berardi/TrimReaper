@@ -102,7 +102,7 @@ Every command prints one JSON document on stdout. Exit status:
 
 | What | When |
 |---|---|
-| `node_modules`, `.next`, `.open-next`, `.turbo`, `.astro`, `target` in a job's clone | 15 minutes after the job finishes, when git ignores the folder (untracked `.astro` metadata is also recognized without an ignore rule) and the clone is clean and pushed |
+| `node_modules`, `.next`, `.open-next`, `.turbo`, `.astro`, `target` in a job's clone | 15 minutes after the job finishes, when git ignores the folder (untracked `.astro` metadata is also recognized without an ignore rule) and tracks nothing in it. Uncommitted or stashed work in the clone does not preserve build output that rebuilds from the source that stays |
 | `dist` in a job's clone | Once the clone itself expires (`dist` can hold a release) |
 | The whole clone | `cloneExpiryDays` (3) after every job named in it finished. Unsaved work is archived first |
 | Per-job scratch folders (`cacheRoot/J-NNNN/*`) | Tool caches (with a `CACHEDIR.TAG`) once the job finishes; anything else `evidenceExpiryDays` (14) after it finished |

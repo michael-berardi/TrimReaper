@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.2 (2026-10-19)
+
+- A finished job's regenerable build output (`node_modules`, `.next`, `.open-next`, `.turbo`, `.astro`, `target`) no longer waits for a clean, stash-free, pushed clone: its own git-ignored and untracked proofs still stand, and a tracked, nested, protected or release-bearing folder still preserves it. `dist` and whole-clone removal keep the full proofs.
+
 ## 0.6.1 (2026-10-19)
 
 - Sustained disk pressure retries cleanup after the existing ten-minute cooldown until the measured low watermark is met, without requiring another 5 GiB of growth or less than 10 GiB free.

@@ -124,6 +124,77 @@ class FinishedJobOutput(Home):
         self.assertTrue(out["items"][0]["reason"].startswith("retention-preserved"), out["items"][0])
         self.assertTrue(node.exists())
 
+    def test_build_output_goes_from_a_clone_holding_stashed_or_dirty_work(self):
+        """Uncommitted or stashed tracked work is the clone's business, not its build output's: the source stays, the output rebuilds."""
+        for name, state in (("j0041", "dirty"), ("j0042", "stashed"), ("j0043", "unpushed")):
+            with self.subTest(state=state):
+                repo = self.clone("app-" + name)
+                node = self.put(repo, "node_modules/pkg/index.js").parent.parent
+                self.put(repo, "target/debug/app")
+                self.put(repo, "dist/out.js")
+                self.put(repo, "README.md", b"edited, never committed\n")
+                if state == "stashed":
+                    self.git(repo, "stash", "push", "-qm", "unfinished")
+                elif state == "unpushed":
+                    self.git(repo, "commit", "-qam", "local only")
+                self.put(repo, "src/main.txt", b"unfinished source\n")  # untracked source in every variant
+                job = "J-" + name[1:]
+                self.add_job(job, repo)
+
+                out = self.cli("reap", "--job", job)
+
+                self.assertEqual(out["deleted"], 2, out)
+                self.assertFalse(node.exists(), state)
+                self.assertFalse((repo / "target").exists(), state)
+                self.assertTrue((repo / "dist" / "out.js").exists(), "dist keeps waiting for the clone's expiry")
+                self.assertTrue((repo / "src" / "main.txt").exists(), "no source file is part of the removal")
+                self.assertTrue((repo / "README.md").exists(), "the clone and its work stay")
+                self.assertEqual(bool(self.git(repo, "stash", "list").strip()), state == "stashed")
+
+    def test_tracked_or_nested_output_stays_however_the_clone_is_dirty(self):
+        """The output's own proofs stand: a tracked file inside it, or a repository inside it, preserves the folder."""
+        for name, hide in (("j0044", None), ("j0045", "--assume-unchanged"), ("j0046", "--skip-worktree")):
+            with self.subTest(hide=hide):
+                repo = self.clone("app-" + name)
+                node = self.put(repo, "node_modules/pkg/index.js").parent.parent
+                self.git(repo, "add", "-f", "node_modules/pkg/index.js")
+                self.git(repo, "commit", "-qm", "tracked output")
+                if hide:
+                    self.git(repo, "update-index", hide, "node_modules/pkg/index.js")
+                self.put(repo, "README.md", b"edited, never committed\n")
+                job = "J-" + name[1:]
+                self.add_job(job, repo)
+
+                out = self.cli("reap", "--job", job)
+
+                self.assertEqual(out["deleted"], 0, out)
+                self.assertTrue(out["items"][0]["reason"].split(":")[0] in ("not-git-ignored", "tracked-files"), out["items"][0])
+                self.assertTrue(node.exists())
+        repo = self.clone("app-j0047")
+        node = self.put(repo, "node_modules/pkg/index.js").parent.parent
+        self.git(repo, "init", "-q", str(node / "nested"))
+        self.put(repo, "README.md", b"edited, never committed\n")
+        self.add_job("J-0047", repo)
+        out = self.cli("reap", "--job", "J-0047")
+        self.assertEqual(out["deleted"], 0, out)
+        self.assertTrue(node.exists())
+
+    def test_an_unfinished_jobs_output_stays_whatever_its_clone_holds(self):
+        """Only a finished job's output goes; a running or parked job keeps its build output even with stashed work."""
+        for name, status in (("j0048", "running"), ("j0049", "parked")):
+            with self.subTest(status=status):
+                repo = self.clone("app-" + name)
+                node = self.put(repo, "node_modules/pkg/index.js").parent.parent
+                self.put(repo, "README.md", b"unfinished source\n")
+                self.git(repo, "stash", "push", "-qm", "unfinished")
+                job = "J-" + name[1:]
+                self.add_job(job, repo, status=status)
+
+                error = self.cli("reap", "--job", job, expect=2)
+
+                self.assertIn(f"job-{status}", error["error"])
+                self.assertTrue(node.exists())
+
 
 class ExpiredClones(Home):
     def test_a_clean_pushed_clone_goes_whole_after_expiry(self):

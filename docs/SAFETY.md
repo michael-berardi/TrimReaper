@@ -29,7 +29,11 @@ finishes, in case it is resumed. A **build queue** is any tool that takes a per-
    Immutable, no-unlink and restricted filesystem flags also refuse before removal; they are never cleared. Two protected-name exceptions, both for a whole expired clone: env templates git tracks (`.env.example` ...), which the remote also
    holds, go with it; and under `cloneProtectedCopies: "remove"` the protected copies are read once into an owner-only
    archive (`protected.tar.gz`), then go with it.
-8. **Git proofs.** For build output: git ignores it (or it is untracked `.astro` metadata), tracks nothing in it, and the clone is clean, stash-free and pushed.
+8. **Git proofs.** For build output: git ignores it (or it is untracked `.astro` metadata) and tracks nothing in it. Uncommitted or
+   stashed tracked work, and an unpushed HEAD, are the clone's business, not its output's: they do not preserve build output that
+   rebuilds from the source that stays, and the folder is still proved free of tracked files (a tracked file inside is refused even
+   when `--assume-unchanged` or `--skip-worktree` hides it from `git status`). The clean, stash-free and pushed proofs still gate
+   `dist` and every whole-clone removal.
    For a whole clone: every branch, reflog entry and unreachable commit is on a remote, there are no tags or other refs,
    no linked worktree depends on it, and every ignored file is known build output. Git runs with hooks, fsmonitor,
    includes, filters and global config disabled. Repository config that could run a program is refused before git reads it.
