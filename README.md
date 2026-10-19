@@ -20,7 +20,7 @@ Requires macOS, Python 3.10 or newer, and `git`, `lsof` and `ps`. The `python3` 
 newer one comes from [python.org](https://www.python.org/downloads/) or Homebrew (`brew install python`).
 
 ```sh
-pipx install "git+https://github.com/michael-berardi/TrimReaper@v0.6.0"
+pipx install "git+https://github.com/michael-berardi/TrimReaper@v0.6.1"
 trimreaper --version
 ```
 
@@ -51,7 +51,7 @@ trimreaper tick
 
 `tick` runs once and exits. `trimreaper schedule install` runs it every 30 minutes with launchd (macOS); elsewhere,
 call it from cron or your agent loop. At 85% used, `tick` also runs `trimreaper clean`, targeting 80% used.
-It retries on new disk pressure or a changed job-release event, not a recurring cleanup timer.
+While pressure remains, it retries at most once per ten minutes until the measured 80% goal is met. Changed job-release events can also trigger a retry after that cooldown.
 
 ## Clean the whole machine
 
@@ -102,7 +102,7 @@ Every command prints one JSON document on stdout. Exit status:
 
 | What | When |
 |---|---|
-| `node_modules`, `.next`, `.open-next`, `.turbo`, `.astro`, `target` in a job's clone | 15 minutes after the job finishes, when git ignores the folder and the clone is clean and pushed |
+| `node_modules`, `.next`, `.open-next`, `.turbo`, `.astro`, `target` in a job's clone | 15 minutes after the job finishes, when git ignores the folder (untracked `.astro` metadata is also recognized without an ignore rule) and the clone is clean and pushed |
 | `dist` in a job's clone | Once the clone itself expires (`dist` can hold a release) |
 | The whole clone | `cloneExpiryDays` (3) after every job named in it finished. Unsaved work is archived first |
 | Per-job scratch folders (`cacheRoot/J-NNNN/*`) | Tool caches (with a `CACHEDIR.TAG`) once the job finishes; anything else `evidenceExpiryDays` (14) after it finished |
@@ -134,7 +134,7 @@ they rebuild it when they resume. The pressure check runs during a `tick` that h
   `evidence` (proof kept for the marked-evidence window; set `markedEvidenceExpiryDays=0` for indefinite retention), `customer` (customer data), `release-runtime-rollback` (what a release or
   its rollback needs). `disposable` is the opposite: it allows removal, still subject to every other check.
 - Anything a process has open or names on its command line. A source-only working directory is exempt only for the guarded exact-output route described above.
-- Anything reached through a symlink, on another volume, owned by another user, or outside the configured folders.
+- Anything reached through a symlink, on another volume, owned by another user, outside the configured folders, or carrying immutable, no-unlink or restricted filesystem flags. System-protected temp directories stay; flags are never cleared.
 - Your home folder or a system folder as a root, even if the configuration says so.
 
 ## Archive before delete

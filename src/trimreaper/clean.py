@@ -36,7 +36,7 @@ CLEAN_HOST_NAMES = ("reap_worktree_homes",)
 # >>> trimreaper clean >>>
 CLEAN_TOOL_SECONDS = 900       # one native cleaner; longer is a named timeout
 CLEAN_SIZE_SECONDS = 20        # one size walk; longer is reported as incomplete
-CLEAN_AUTO_SECONDS = 600       # stampede guard only: automatic passes are event-driven (see clean_auto_observe)
+CLEAN_AUTO_SECONDS = 600       # stampede guard: retry sustained pressure at most once per ten minutes
 CLEAN_AUTO_KEY = "clean:auto"
 CLEAN_TOOL_ENV = {"HOMEBREW_NO_AUTO_UPDATE": "1", "HOMEBREW_NO_ENV_HINTS": "1", "HOMEBREW_NO_AUTOREMOVE": "1"}  # cleanup never uninstalls a formula
 # Tools run from the home folder, so a project's own config (.npmrc, a pinned yarn) never changes which cache they clean.
@@ -1186,11 +1186,10 @@ def clean_auto_state(conn) -> dict:
 
 
 def clean_auto_observe(conn, policy: dict, disk: dict | None, event=None) -> str | None:
-    """Hysteresis and new host events, never a periodic retry. `event` is an opaque release-generation token.
+    """Start at high and retry sustained pressure until low, bounded by the stampede cooldown.
 
-    At or below low re-arms a high crossing. Unresolved work can retry on a *changed* job/artifact release token;
-    a token is saved before starting, so unchanged ticks (and failed passes) cannot spin. The cooldown delays
-    new pressure/events but never creates one. Hosts may supply the token as policy.cleanEventToken instead.
+    `event` is an opaque release-generation token. A changed release can retry unresolved work too.
+    A pre-pass stamp prevents unchanged or failed ticks from spinning inside the cooldown.
     """
     if policy.get("cleanAtPercent") == 0:
         return None
@@ -1212,21 +1211,21 @@ def clean_auto_observe(conn, policy: dict, disk: dict | None, event=None) -> str
     if state.get("goalMet") is not True and event is not None and event != state.get("event"):
         return "release"
     if percent < high:
-        return None
+        return "unfinished" if state.get("goalMet") is not True else None
     previous = state.get("freeBytes")
     if previous is None:
-        return None
+        return "pressure"
     floor = float(policy.get("cleanFloorGB", 10)) * 1024 ** 3
     if disk["freeBytes"] < floor and disk["freeBytes"] < previous:
         return "floor"
     growth = float(policy.get("cleanGrowthGB", 5)) * 1024 ** 3
     if disk["freeBytes"] < previous and previous - disk["freeBytes"] >= growth:
         return "growth"
-    return None
+    return "pressure"
 
 
 def clean_auto(conn, policy: dict, actions: list, errors: list, event=None) -> None:
-    """One event-driven safe pass, with a pre-pass stamp and post-pass measured goal state."""
+    """One bounded safe pass, with a pre-pass stamp and post-pass measured goal state."""
     disk = clean_disk()
     reason = clean_auto_observe(conn, policy, disk, event)
     if not reason:

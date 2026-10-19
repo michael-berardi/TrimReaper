@@ -220,8 +220,8 @@ class AutoGoals(unittest.TestCase):
         self.assertIsNone(self.observe(84))
         self.assertEqual(self.observe(85), "crossed")
         self.state()
-        for used in (90, 84, 85):
-            self.assertIsNone(self.observe(used))
+        for used, reason in ((90, 'pressure'), (84, 'unfinished'), (85, 'pressure')):
+            self.assertEqual(self.observe(used), reason)
             self.assertTrue(clean.clean_auto_state(self.conn))
         self.assertIsNone(self.observe(79))
         self.assertEqual(clean.clean_auto_state(self.conn), {})
@@ -236,22 +236,22 @@ class AutoGoals(unittest.TestCase):
 
     def test_release_generation_retries_unresolved_not_unchanged_ticks(self):
         self.state()
-        self.assertIsNone(self.observe(90, "release-1"))
+        self.assertEqual(self.observe(90, "release-1"), "pressure")
         self.assertEqual(self.observe(84, "release-2"), "release")
         self.state(event="release-2", at=10000)
         self.assertIsNone(self.observe(90, "release-3"))
         self.state(event="release-2")
-        self.assertIsNone(self.observe(90, "release-2"))
+        self.assertEqual(self.observe(90, "release-2"), "pressure")
         self.state(goalMet=True)
-        self.assertIsNone(self.observe(90, "release-2"))
+        self.assertEqual(self.observe(90, "release-2"), "pressure")
 
-    def test_elapsed_time_alone_never_retries_and_real_growth_does(self):
+    def test_sustained_pressure_retries_without_growth_and_stops_at_low(self):
         gb = 1024 ** 3
         self.state(freeBytes=20 * gb)
         measured = {"usedBytes": 180 * gb, "freeBytes": 20 * gb}
         for stamp in (10000, 100000, 1000000):
             with mock.patch.object(clean, "now", return_value=stamp):
-                self.assertIsNone(clean.clean_auto_observe(self.conn, self.policy, measured))
+                self.assertEqual(clean.clean_auto_observe(self.conn, self.policy, measured), "pressure")
         self.assertEqual(clean.clean_auto_observe(self.conn, self.policy, disk(185 * gb, 15 * gb)), "growth")
         self.policy["cleanFloorGB"] = 10
         self.assertEqual(clean.clean_auto_observe(self.conn, self.policy, disk(191 * gb, 9 * gb)), "floor")
@@ -283,7 +283,7 @@ class AutoGoals(unittest.TestCase):
         self.assertEqual(clean.clean_auto_state(self.conn)["event"], "release-1")
         self.assertIsNone(self.observe(90, "release-1"))
         self.conn.execute("UPDATE meta SET value=?", (json.dumps({**clean.clean_auto_state(self.conn), "at": 1}),))
-        self.assertIsNone(self.observe(90, "release-1"))
+        self.assertEqual(self.observe(90, "release-1"), "pressure")
 
 
 class CLI(unittest.TestCase):

@@ -711,8 +711,8 @@ def reap_git_clean_walk(repo: str, protected_ok: bool = False) -> tuple[int, str
                 asked.append((name, sub, info))
         ignored = reap_git_ignored(repo, [sub for _, sub, _ in asked]) if asked else set()
         for name, sub, info in asked:
-            if sub in ignored:
-                continue
+            if sub in ignored or (name == ".astro" and stat.S_ISDIR(info.st_mode) and sub not in tracked_dirs):
+                continue  # Astro's untracked metadata output is regenerable even without a project ignore rule.
             if not stat.S_ISDIR(info.st_mode):
                 return True
             enter.append((name, sub, info))
@@ -898,11 +898,12 @@ def reap_git_item_checks(root: str, path: str, needs: tuple, cache: dict | None 
     rel = os.path.relpath(path, root)
     if "ignored" in needs:
         code, _ = reap_git(root, "check-ignore", "-q", "--", rel)
-        if code == 1:
+        known_astro = os.path.basename(path) == ".astro" and "untracked" in needs and os.path.isdir(path) and not os.path.islink(path)
+        if code == 1 and not known_astro:
             raise ReapRefused("not-git-ignored")
-        if code != 0:
+        if code not in (0, 1):
             raise ReapRefused(f"git-error:check-ignore:{code}")
-        passed.append("git-ignored")
+        passed.append("known-regenerable-astro" if code == 1 else "git-ignored")
     if "untracked" in needs:
         code, out = reap_git(root, "ls-files", "-z", "--", rel)
         if code != 0:
@@ -1160,6 +1161,9 @@ def reap_protected_scan(path: str, allow_git: bool = False, markers: bool = Fals
     (a whole clone, protected_ok) every protected name that is not a tracked template is appended: the archive saves those too."""
     if any(reap_protected(part) for part in Path(path).parts):
         raise ReapRefused("protected-scan-ancestor")
+    protected_flags = sum(getattr(stat, flag, 0) for flag in ("SF_NOUNLINK", "SF_IMMUTABLE", "SF_APPEND", "SF_RESTRICTED", "UF_NOUNLINK", "UF_IMMUTABLE", "UF_APPEND"))
+    if getattr(os.lstat(path), "st_flags", 0) & protected_flags:
+        raise ReapRefused("filesystem-protected-flags:root")
     vendored = reap_vendored_templates(path)
     def listing(rel, names):
         current = os.path.join(path, rel) if rel else path
@@ -1201,6 +1205,8 @@ def reap_protected_scan(path: str, allow_git: bool = False, markers: bool = Fals
             if repos is not None:
                 parent = rel.rpartition("/")[0]
                 repos.append(os.path.join(path, parent) if parent else path)
+        if info is not None and getattr(info, "st_flags", 0) & protected_flags:
+            raise ReapRefused("filesystem-protected-flags:" + rel)
         if markers and level > 0 and reap_fold(name).startswith(REAP_MARKER_PREFIX) \
                 and not ((nested_disposable and name == REAP_MARKER_PREFIX + REAP_DISPOSABLE and not stat.S_ISDIR(info.st_mode))
                          or (expiring_evidence and name in (REAP_MARKER_PREFIX + "evidence", REAP_MARKER_PREFIX + REAP_DISPOSABLE)
@@ -4764,14 +4770,26 @@ def evidence_same(info, entry: dict) -> bool:
             and (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns) == (entry["dev"], entry["ino"], entry["bytes"], entry["mtimeNs"]))
 
 
-def evidence_parent(root_fd: int, rel: str) -> int:
-    """The folder holding `rel`, opened from the job folder one component at a time with O_NOFOLLOW."""
+def evidence_parent(root_fd: int, rel: str, marked: bool | None = None) -> int:
+    """Open each ancestor with O_NOFOLLOW and recheck retention/protected names when expiring files."""
     fd = os.dup(root_fd)
     try:
-        for part in Path(rel).parts[:-1]:
-            child = os.open(part, REAP_DIR_FLAGS, dir_fd=fd)
-            os.close(fd)
-            fd = child
+        for part in (*Path(rel).parts[:-1], None):
+            if marked is not None:
+                names = os.listdir(fd)
+                markers = [n for n in names if reap_fold(n).startswith(REAP_MARKER_PREFIX)]
+                if markers:
+                    if not marked or markers != [REAP_MARKER_PREFIX + "evidence"]:
+                        raise ReapRefused("evidence-retention-changed")
+                    mi = os.stat(markers[0], dir_fd=fd, follow_symlinks=False)
+                    if not stat.S_ISREG(mi.st_mode) or mi.st_uid != os.getuid() or mi.st_nlink != 1:
+                        raise ReapRefused("evidence-marker-changed")
+                if any(reap_protected(n) or reap_is_git(n) for n in names):
+                    raise ReapRefused("evidence-protected-name-appeared")
+            if part is not None:
+                child = os.open(part, REAP_DIR_FLAGS, dir_fd=fd)
+                os.close(fd)
+                fd = child
         return fd
     except BaseException:
         os.close(fd)
@@ -4883,10 +4901,12 @@ def evidence_expire_job_owned(conn, job: dict, days: int, dry_run: bool, actor: 
                     if reap_authority(item) != authority:
                         out["stopped"] = "authority-changed"
                         break
+                    if marked and not marked_evidence_job(job["id"]):
+                        raise ReapRefused("marked-evidence-report-or-age-changed")
                     planned = []
                     for entry in files[start:start + EVIDENCE_BATCH]:
                         try:
-                            pfd = evidence_parent(root_fd, entry["rel"])
+                            pfd = evidence_parent(root_fd, entry["rel"], marked=marked)
                         except FileNotFoundError:
                             out["changed"].append(entry["rel"])
                             continue
@@ -4915,7 +4935,7 @@ def evidence_expire_job_owned(conn, job: dict, days: int, dry_run: bool, actor: 
                     reap_durable(manifest)  # every name and hash is on disk before any of its files goes
                     for entry in planned:
                         try:
-                            pfd = evidence_parent(root_fd, entry["rel"])
+                            pfd = evidence_parent(root_fd, entry["rel"], marked=marked)
                         except FileNotFoundError:
                             out["changed"].append(entry["rel"])
                             continue

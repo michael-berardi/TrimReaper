@@ -26,10 +26,10 @@ finishes, in case it is resumed. A **build queue** is any tool that takes a per-
 6. **Producer locks.** A build queue's per-project locks and Cargo's build locks are taken and held through the removal.
 7. **Protected scan.** A names-only walk refuses on `.env*`, `.dev.vars*`, `.wrangler`, `.vercel`, a nested repository,
    a bare git folder, a second retention marker or another volume. Protected entries are never stat'ed, opened or entered.
-   Two exceptions, both for a whole expired clone: env templates git tracks (`.env.example` ...), which the remote also
+   Immutable, no-unlink and restricted filesystem flags also refuse before removal; they are never cleared. Two protected-name exceptions, both for a whole expired clone: env templates git tracks (`.env.example` ...), which the remote also
    holds, go with it; and under `cloneProtectedCopies: "remove"` the protected copies are read once into an owner-only
    archive (`protected.tar.gz`), then go with it.
-8. **Git proofs.** For build output: git ignores it, tracks nothing in it, and the clone is clean, stash-free and pushed.
+8. **Git proofs.** For build output: git ignores it (or it is untracked `.astro` metadata), tracks nothing in it, and the clone is clean, stash-free and pushed.
    For a whole clone: every branch, reflog entry and unreachable commit is on a remote, there are no tags or other refs,
    no linked worktree depends on it, and every ignored file is known build output. Git runs with hooks, fsmonitor,
    includes, filters and global config disabled. Repository config that could run a program is refused before git reads it.
@@ -92,7 +92,7 @@ These also remove files, each with its own checks:
 
 - **Evidence expiry** (`reap --job ... --expire-evidence`, and `tick`) unlinks old screenshots, recordings, traces and
   logs one file at a time. It holds the same owner lock and job authority, writes plan and result receipts, records each
-  file's name and SHA-256 in `evidence-expired.jsonl` first, and skips any folder holding a marker, `.git`, a protected
+  file's name and SHA-256 in `evidence-expired.jsonl` first, rechecks ancestor retention markers and protected names before unlink, and skips any folder holding a marker, `.git`, a protected
   name or a tool cache, except report-backed evidence markers past the separate five-day window. Bulky marked folders use `reap_item`, not the file-unlink route: shared build-queue and discovered Cargo locks, all Git/archive proofs, protected scans and fresh claims/process checks still apply. Retained record names stop a whole-folder removal, including if they appear during removal. Marked expiry never uses the protected-template exception. Automatic scans retry marker-preserved folders hourly.
 - **Its own leftovers**, without receipts: a `.partial-*` staging folder of an archive that crashed more than a day ago;
   older archives of the same clone once a newer one verified (never one that is already the only copy); and a removed

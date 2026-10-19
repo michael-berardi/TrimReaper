@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.1 (2026-10-19)
+
+- Sustained disk pressure retries cleanup after the existing ten-minute cooldown until the measured low watermark is met, without requiring another 5 GiB of growth or less than 10 GiB free.
+- Recognize untracked `.astro` metadata as regenerable output even without an ignore rule; tracked files, dirty source, protected names and all other Git proofs still preserve it.
+- Refuse immutable, no-unlink and restricted filesystem flags before removal instead of repeatedly attempting system-protected temp folders. Never clear those flags.
+- Recheck evidence-file ancestor markers and protected names immediately before unlink; a newly preserving marker stops expiry.
+
 ## 0.6.0 (2026-10-19)
 
 - Marked bulky job-cache evidence expires strictly more than five days after a job finishes, with a separate `markedEvidenceExpiryDays` policy. The job must retain a private `report.md`. Reports, summary/outcome, handoffs, receipts and the job root stay; customer, release/runtime/rollback and protected-archive material do not expire.

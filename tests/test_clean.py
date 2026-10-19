@@ -652,7 +652,7 @@ class Threshold(Home):
     def cleaned(self, out):
         return [a.get("reason") for a in out["actions"] if a.get("did") == "cleaned-at-disk-pressure"]
 
-    def test_automatic_clean_is_event_driven_not_a_timer(self):
+    def test_automatic_clean_retries_pressure_until_low_with_cooldown(self):
         repo = self.clone("app")
         path = repo.parent / "app-old"
         self.git(repo, "worktree", "add", "-b", "old", str(path))
@@ -663,8 +663,8 @@ class Threshold(Home):
         self.assertTrue(path.exists())
         self.assertEqual(self.cleaned(self.tick(85, at=t + 1)), ["crossed"])
         self.assertFalse(path.exists())
-        self.assertEqual(self.cleaned(self.tick(99, at=t + 7200)), [], "no new pressure two hours later: no repeat")
-        self.assertEqual(self.cleaned(self.tick(99, free_gb=44, at=t + 7300)), ["growth"], "6 GB more used")
+        self.assertEqual(self.cleaned(self.tick(99, at=t + 7200)), ["pressure"], "sustained high use retries without 5GB growth")
+        self.assertEqual(self.cleaned(self.tick(99, free_gb=44, at=t + 7300)), [], "cooldown prevents a stampede")
         self.assertEqual(self.cleaned(self.tick(79, free_gb=60, at=t + 7400)), [], "below low watermark: re-armed")
         self.assertEqual(self.cleaned(self.tick(96, free_gb=40, at=t + 7500)), ["crossed"], "the next crossing runs again")
         self.assertEqual(self.cleaned(self.tick(96, free_gb=8, at=t + 7600)), [], "stampede guard: minutes apart")

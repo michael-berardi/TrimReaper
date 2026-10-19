@@ -133,20 +133,20 @@ class HostReleaseEventTests(unittest.TestCase):
             self.conn.execute("INSERT INTO events(ts,kind,data) VALUES(0,'job.status',?)", (data,))
         self.assertEqual(self.token(), 0)
 
-    def test_changed_release_token_retries_but_unchanged_ticks_do_not(self):
+    def test_changed_release_token_and_sustained_pressure_both_retry(self):
         disk = {"usedBytes": 900, "freeBytes": 100, "usedPercent": 90}
         state = {"at": 0, "freeBytes": 100, "goalMet": False, "event": self.token()}
         self.conn.execute("INSERT INTO meta(key,value) VALUES(?,?)", (clean.CLEAN_AUTO_KEY, json.dumps(state)))
         with patch.object(clean, "now", return_value=1000):
             for _ in range(3):
-                self.assertIsNone(clean.clean_auto_observe(self.conn, host.DEFAULT_POLICY, disk, event=self.token()))
+                self.assertEqual(clean.clean_auto_observe(self.conn, host.DEFAULT_POLICY, disk, event=self.token()), "pressure")
             self.event("job.reap_blocked", {})
-            self.assertIsNone(clean.clean_auto_observe(self.conn, host.DEFAULT_POLICY, disk, event=self.token()))
+            self.assertEqual(clean.clean_auto_observe(self.conn, host.DEFAULT_POLICY, disk, event=self.token()), "pressure")
             self.event("job.status", {"from": "running", "to": "done"})
             self.assertEqual(clean.clean_auto_observe(self.conn, host.DEFAULT_POLICY, disk, event=self.token()), "release")
             state["event"] = self.token()
             self.conn.execute("UPDATE meta SET value=? WHERE key=?", (json.dumps(state), clean.CLEAN_AUTO_KEY))
-            self.assertIsNone(clean.clean_auto_observe(self.conn, host.DEFAULT_POLICY, disk, event=self.token()))
+            self.assertEqual(clean.clean_auto_observe(self.conn, host.DEFAULT_POLICY, disk, event=self.token()), "pressure")
 
 
 if __name__ == "__main__":
