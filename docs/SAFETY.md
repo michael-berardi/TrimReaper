@@ -14,7 +14,7 @@ finishes, in case it is resumed. A **build queue** is any tool that takes a per-
    until someone acknowledges it (below).
 2. **Retention.** Only the `disposable` class is ever removed. It comes from a `.ut-retention-disposable` marker on the
    folder, or is derived in a few named cases: build output in a finished job's clone, a tool cache (valid
-   `CACHEDIR.TAG`), an expired clone or scratch folder. Any other marker keeps the folder.
+   `CACHEDIR.TAG`), an expired clone or scratch folder. A separate `markedEvidenceExpiryDays` (5) rule also derives disposable for marked job-cache children strictly after terminal completion plus that window, only with a surviving regular, owned `report.md`. Reports, summary/outcome, handoffs, receipts, customer, release/runtime/rollback and protected-archive material stay. An evidence marker on the job root may expire its bulky children but the root and marker stay. Other preserving markers still win.
 3. **Boundary.** The path is canonical, inside a configured root, named for the job that owns it, and below no protected
    name. The root is never your home, a system folder, or anything that encloses one.
 4. **Fence.** Device and inode of the root and of every folder down to the item are recorded. The removal re-opens that
@@ -93,7 +93,7 @@ These also remove files, each with its own checks:
 - **Evidence expiry** (`reap --job ... --expire-evidence`, and `tick`) unlinks old screenshots, recordings, traces and
   logs one file at a time. It holds the same owner lock and job authority, writes plan and result receipts, records each
   file's name and SHA-256 in `evidence-expired.jsonl` first, and skips any folder holding a marker, `.git`, a protected
-  name or a tool cache.
+  name or a tool cache, except report-backed evidence markers past the separate five-day window. Bulky marked folders use `reap_item`, not the file-unlink route: shared build-queue and discovered Cargo locks, all Git/archive proofs, protected scans and fresh claims/process checks still apply. Retained record names stop a whole-folder removal, including if they appear during removal. Marked expiry never uses the protected-template exception. Automatic scans retry marker-preserved folders hourly.
 - **Its own leftovers**, without receipts: a `.partial-*` staging folder of an archive that crashed more than a day ago;
   older archives of the same clone once a newer one verified (never one that is already the only copy); and a removed
   linked worktree's entry in its main repository (`.git/worktrees/<name>`, only when it points at the folder just

@@ -36,6 +36,8 @@ DEFAULT_POLICY = {
     "cloneExpiryDays": 3,
     # Screenshots, recordings, traces and logs of a finished job expire after this many days; 0 turns expiry off.
     "evidenceExpiryDays": 14,
+    # Marked bulky job-cache evidence expires separately; reports and receipts remain.
+    "markedEvidenceExpiryDays": 5,
     # An archive goes this many days after it became the only copy of its clone.
     "archiveExpiryDays": 30,
     # "archive": save work no remote holds before an expired folder goes; anything else keeps such folders.
@@ -170,7 +172,7 @@ def check_policy(policy: dict) -> None:
     merged = {**DEFAULT_POLICY, **policy}
     if not isinstance(merged["autoReap"], bool):
         raise HostError(f"policy autoReap must be true or false, not {json.dumps(merged['autoReap'])}")
-    for key in ("cloneExpiryDays", "evidenceExpiryDays", "archiveExpiryDays"):
+    for key in ("cloneExpiryDays", "evidenceExpiryDays", "markedEvidenceExpiryDays", "archiveExpiryDays"):
         value = merged[key]
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             raise HostError(f"policy {key} must be a whole number of days (0 = never), not {json.dumps(value)}")

@@ -1145,7 +1145,8 @@ def reap_vendored_templates(path: str) -> dict:
 
 def reap_protected_scan(path: str, allow_git: bool = False, markers: bool = False, budget: int = REAP_WALK_ENTRIES,
                         repos: list | None = None, nested_disposable: bool = False, templates: frozenset = frozenset(),
-                        protected_ok: bool = False, git_dirs: list | None = None, secrets: list | None = None) -> int:
+                        protected_ok: bool = False, git_dirs: list | None = None, secrets: list | None = None,
+                        expiring_evidence: bool = False) -> int:
     """Names only, descriptor-relative (reap_fd_walk). Preserve the item if a protected name (.wrangler, .vercel, .env*,
     .dev.vars*) or, unless `allow_git`, a nested git repository sits anywhere inside it. The walk raises on seeing a
     protected name and never scans it, so it cannot enter the state it protects. Symlinks are named, not followed, and a
@@ -1162,6 +1163,11 @@ def reap_protected_scan(path: str, allow_git: bool = False, markers: bool = Fals
     vendored = reap_vendored_templates(path)
     def listing(rel, names):
         current = os.path.join(path, rel) if rel else path
+        if expiring_evidence:
+            if reap_cache_retention(current) not in ("unmarked", REAP_DISPOSABLE, "evidence"):
+                raise ReapRefused("marked-evidence-preserving-marker:" + (rel or "."))
+            if any(marked_evidence_keep(n) for n in names):
+                raise ReapRefused("marked-evidence-kept-record:" + (rel or "."))
         if (rel or allow_git) and reap_fold(os.path.basename(current)) == "target" and reap_cache_retention(current) != REAP_DISPOSABLE \
                 and reap_target_release_bearing(current):
             # Also protect a release-bearing target when an enclosing clone/cache is
@@ -1175,6 +1181,8 @@ def reap_protected_scan(path: str, allow_git: bool = False, markers: bool = Fals
             git_dirs.append(rel or ".")
     def visit(rel, name, info, level, device):
         if reap_protected(name):
+            if expiring_evidence:
+                raise ReapRefused(f"protected-leaf:{rel}")
             if protected_ok:
                 if secrets is not None and os.path.join(path, rel) not in templates:
                     secrets.append(rel)  # named for the archive (it copies them owner-only before the clone goes); never opened here
@@ -1194,7 +1202,9 @@ def reap_protected_scan(path: str, allow_git: bool = False, markers: bool = Fals
                 parent = rel.rpartition("/")[0]
                 repos.append(os.path.join(path, parent) if parent else path)
         if markers and level > 0 and reap_fold(name).startswith(REAP_MARKER_PREFIX) \
-                and not (nested_disposable and name == REAP_MARKER_PREFIX + REAP_DISPOSABLE and not stat.S_ISDIR(info.st_mode)):
+                and not ((nested_disposable and name == REAP_MARKER_PREFIX + REAP_DISPOSABLE and not stat.S_ISDIR(info.st_mode))
+                         or (expiring_evidence and name in (REAP_MARKER_PREFIX + "evidence", REAP_MARKER_PREFIX + REAP_DISPOSABLE)
+                             and stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and info.st_nlink == 1)):
             raise ReapRefused(f"retention-ambiguous:nested-marker:{rel}")  # a whole clone may hold build output a build queue marked
         if stat.S_ISDIR(info.st_mode) and info.st_dev != device:
             raise ReapRefused(f"mountpoint:{rel}")
@@ -1326,8 +1336,77 @@ def reap_target_release_bearing(path: str) -> bool:
         return True
 
 
+def marked_evidence_expiry_days(policy: dict) -> int:
+    value = policy.get("markedEvidenceExpiryDays", 5)
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+
+def marked_evidence_keep(name: str) -> bool:
+    """Durable job records and retained material are never part of marked-evidence expiry."""
+    name = reap_fold(name)
+    return (bool(re.match(r"^(?:report|summary|outcome|handoff|receipts?)(?:$|[-_.])", name))
+            or name == "evidence-expired.jsonl" or name == "protected-archive"
+            or bool(re.search(r"(?:^|[-_.])(?:releases?|runtime|rollback|customer)(?:$|[-_.])", name))
+            or name.endswith((".app", ".dmg", ".pkg", ".ipa", ".sig", ".asc")))
+
+
+def marked_evidence_job(job_id: str) -> bool:
+    """Only terminal jobs strictly older than the separate window, with a private surviving report."""
+    days = marked_evidence_expiry_days(load_policy())
+    if not days:
+        return False
+    with db() as conn:
+        job = row(conn, "SELECT * FROM jobs WHERE id=?", (job_id,))
+    if not job or job["status"] not in REAP_TERMINAL or not job.get("finished_at") or job["finished_at"] >= now() - days * 86400:
+        return False
+    try:
+        fd = os.open(str(reap_cache_root() / job_id), REAP_ROOT_FLAGS)
+        try:
+            info = os.stat("report.md", dir_fd=fd, follow_symlinks=False)
+            return stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and info.st_nlink == 1
+        finally:
+            os.close(fd)
+    except OSError:
+        return False
+
+
+def reap_marked_evidence_item(item: dict) -> bool:
+    """A bounded exception for job-cache children only; all ordinary authority and deletion proofs still apply."""
+    if item.get("class") != "job-cache-subdir" or not item.get("owner") or marked_evidence_keep(os.path.basename(item["path"])):
+        return False
+    root = reap_canon(reap_cache_root() / item["owner"])
+    if item.get("root") != root or os.path.dirname(item["path"]) != root or not marked_evidence_job(item["owner"]):
+        return False
+    parent, own = reap_cache_retention(root), reap_cache_retention(item["path"])
+    return "evidence" in (parent, own) and all(c in ("unmarked", REAP_DISPOSABLE, "evidence") for c in (parent, own))
+
+
+def reap_marked_evidence_locks(path: str) -> tuple[list, list]:
+    """Discover cooperating repository/build and Cargo locks without entering Git or protected state."""
+    projects, cargo = {path, os.path.dirname(path)}, set()
+    def listing(rel, names):
+        current = os.path.join(path, rel)
+        if any(reap_is_git(n) for n in names):
+            projects.add(current)
+        for name in names:
+            if name in (".cargo-lock", ".cargo-build-lock"):
+                cargo.add(Path(current) / name)
+    def visit(rel, name, info, level, device):
+        if reap_protected(name):
+            raise ReapRefused("protected-leaf:" + rel)
+        if info is not None and info.st_dev != device:
+            raise ReapRefused("mountpoint:" + rel)
+        return not reap_is_git(name)
+    reap_fd_walk(path, visit, REAP_WALK_ENTRIES, blind=reap_is_git, listing=listing)
+    return [reap_queue_lock(p) for p in sorted(projects)], sorted(cargo)
+
+
 def reap_item_retention(item: dict) -> str:
     """A marker decides; without one, `disposable` is derived only in the three self-cleaning cases (see REAP_DERIVED_KINDS)."""
+    if item.get("class") == "job-cache-subdir" and marked_evidence_keep(os.path.basename(item["path"])):
+        return "evidence"
+    if reap_marked_evidence_item(item):
+        return REAP_DISPOSABLE
     if item.get("class") in ("job-cache-subdir", "job-derived-output") and item.get("owner") \
             and reap_inside(item["path"], reap_canon(reap_cache_root() / item["owner"])):
         parent = reap_cache_retention(str(reap_cache_root() / item["owner"]))
@@ -3530,7 +3609,7 @@ def reap_authority(item: dict) -> dict:
     ids = list(dict.fromkeys(item.get("jobs") or []))
     # Scratch tasks and release versions are independent siblings, not claims on their collection root.
     # Repository output still uses its source root so a source consumer preserves its build output.
-    independent = item["class"] in ("agent-scratch", "release-evidence")
+    independent = item["class"] in ("agent-scratch", "release-evidence", "job-cache-subdir")
     scope = item["path"] if independent or item["class"] == "job-clone-root" else item["root"]
     if item["class"] not in ("release-target", "agent-scratch", "release-evidence") and item["owner"] not in ids:
         raise ReapRefused("owner-not-recorded")
@@ -3609,7 +3688,7 @@ def reap_open_fence(fence: list[tuple[str, int, int]]) -> int:
 
 
 def reap_empty_directory(fd: int, dev: int, depth: int, rel: str, tally: dict, allow_git: bool, templates: frozenset = frozenset(), base: str = "",
-                         protected_ok: bool = False) -> None:
+                         protected_ok: bool = False, expiring_evidence: bool = False) -> None:
     """Unlink everything below an open directory. A protected name (or `.git`, unless allowed) that appeared after the final
     scan stops the walk before it is entered or unlinked; so do another device, another owner, a swapped entry and
     REAP_MAX_DEPTH."""
@@ -3620,7 +3699,18 @@ def reap_empty_directory(fd: int, dev: int, depth: int, rel: str, tally: dict, a
         raise ReapRefused(f"foreign-owner:{rel or '.'}")
     if stat.S_IMODE(info.st_mode) & 0o700 != 0o700:
         os.fchmod(fd, stat.S_IMODE(info.st_mode) | 0o700)  # a read-only directory blocks unlinking its own entries
-    for name in os.listdir(fd):
+    names = os.listdir(fd)
+    if expiring_evidence:
+        if any(marked_evidence_keep(n) for n in names):
+            raise ReapRefused("marked-evidence-kept-record-appeared:" + (rel or "."))
+        markers = [n for n in names if reap_fold(n).startswith(REAP_MARKER_PREFIX)]
+        if len(markers) > 1 or any(n not in (REAP_MARKER_PREFIX + "evidence", REAP_MARKER_PREFIX + REAP_DISPOSABLE) for n in markers):
+            raise ReapRefused("marked-evidence-preserving-marker-appeared:" + (rel or "."))
+        for marker in markers:
+            mi = os.stat(marker, dir_fd=fd, follow_symlinks=False)
+            if not stat.S_ISREG(mi.st_mode) or mi.st_uid != os.getuid() or mi.st_nlink != 1:
+                raise ReapRefused("marked-evidence-marker-changed")
+    for name in names:
         sub = f"{rel}/{name}" if rel else name
         if reap_protected(name) and protected_ok:
             pass  # removed below like any other entry (whole clone, cloneProtectedCopies=remove)
@@ -3647,7 +3737,7 @@ def reap_empty_directory(fd: int, dev: int, depth: int, rel: str, tally: dict, a
                 raise ReapRefused(f"swapped:{sub}")
             try:
                 reap_expect(child, entry.st_dev, entry.st_ino, f"swapped:{sub}")
-                reap_empty_directory(child, dev, depth + 1, sub, tally, allow_git, templates, base, protected_ok)
+                reap_empty_directory(child, dev, depth + 1, sub, tally, allow_git, templates, base, protected_ok, expiring_evidence)
             finally:
                 os.close(child)
             again = os.stat(name, dir_fd=fd, follow_symlinks=False)
@@ -3660,7 +3750,7 @@ def reap_empty_directory(fd: int, dev: int, depth: int, rel: str, tally: dict, a
 
 
 def reap_remove_tree(fence: list[tuple[str, int, int]], tally: dict, allow_git: bool = False, templates: frozenset = frozenset(), base: str = "",
-                     protected_ok: bool = False) -> None:
+                     protected_ok: bool = False, expiring_evidence: bool = False) -> None:
     parent = reap_open_fence(fence)
     try:
         name, dev, ino = fence[-1]
@@ -3670,7 +3760,7 @@ def reap_remove_tree(fence: list[tuple[str, int, int]], tally: dict, allow_git: 
             raise ReapRefused("identity-changed")
         try:
             reap_expect(fd, dev, ino, "identity-changed")
-            reap_empty_directory(fd, dev, 1, "", tally, allow_git, templates, base, protected_ok)
+            reap_empty_directory(fd, dev, 1, "", tally, allow_git, templates, base, protected_ok, expiring_evidence)
         finally:
             os.close(fd)
         info = os.stat(name, dir_fd=parent, follow_symlinks=False)
@@ -3683,13 +3773,13 @@ def reap_remove_tree(fence: list[tuple[str, int, int]], tally: dict, allow_git: 
 
 
 def reap_remove_and_verify(fence: list, path: str, before: list[dict], result: dict, allow_git: bool, templates: frozenset = frozenset(),
-                           protected_ok: bool = False) -> None:
+                           protected_ok: bool = False, expiring_evidence: bool = False) -> None:
     """Remove the item and, however the removal ends (done, stopped, OSError or anything else), re-take the preserved
     identities. A difference is `preserved-state-changed`, the removal's own cause stays with it, and the sweep stops."""
     checks, tally, cause = result["checks"], {"removed": 0}, "removal-interrupted"
     try:
-        if templates or protected_ok:  # whole clones only; every other item keeps the original call
-            reap_remove_tree(fence, tally, allow_git, templates, path, protected_ok)
+        if templates or protected_ok or expiring_evidence:
+            reap_remove_tree(fence, tally, allow_git, templates, path, protected_ok, expiring_evidence)
         else:
             reap_remove_tree(fence, tally, allow_git)
         cause = None
@@ -4047,6 +4137,9 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
             if retention != REAP_DISPOSABLE:
                 raise ReapRefused(f"retention-preserved:{retention}")
             checks.append("retention-disposable")
+            expiring_evidence = reap_marked_evidence_item(item)
+            if expiring_evidence:
+                checks.append("marked-evidence-expired-report-kept")
             evidence = reap_authority(item)
             checks.extend(["owner-terminal", "no-other-claim"])
             allow_git = item["class"] in ("job-cache-subdir", "agent-scratch", "job-clone-root", "release-evidence")
@@ -4070,6 +4163,11 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
                     locks.extend(reap_cargo_locks(item["path"]))
                 stack.enter_context(reap_locks(locks, create=apply))  # held through the removal and the result receipt
                 checks.append("producer-locks")
+            elif expiring_evidence:
+                queue_locks, cargo_locks = reap_marked_evidence_locks(item["path"])
+                stack.enter_context(reap_locks(queue_locks, create=apply))
+                stack.enter_context(reap_locks(cargo_locks, create=False))
+                checks.append("marked-evidence-producer-locks")
             elif item["class"] == "job-cache-subdir" and reap_cachedir_tagged(item["path"]):
                 # a Cargo target dir kept in a job folder: its existing build locks are held through the removal too
                 stack.enter_context(reap_locks(reap_cargo_locks(item["path"]), create=False))
@@ -4079,7 +4177,8 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
             try:
                 templates = reap_tracked_templates(item["path"]) if whole_clone else frozenset()
                 reap_protected_scan(item["path"], allow_git=allow_git, markers=True, repos=repos if allow_git else None, nested_disposable=whole_clone,
-                                    templates=templates, protected_ok=protected_ok, secrets=secrets if protected_ok else None)
+                                    templates=templates, protected_ok=protected_ok, secrets=secrets if protected_ok else None,
+                                    expiring_evidence=expiring_evidence)
                 if whole_clone:  # exactly one repository, the clone itself: a nested repository keeps the whole clone
                     if set(repos) != {item["path"]}:
                         raise ReapRefused("nested-git-in-clone")
@@ -4114,7 +4213,7 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
                 archive = reap_archive_settles(item, str(refusal), reap_archive_eligible(item))
                 repos, git_dirs = [], []
                 reap_protected_scan(item["path"], allow_git=True, markers=True, repos=repos, git_dirs=git_dirs, nested_disposable=whole_clone,
-                                    templates=templates, protected_ok=protected_ok)
+                                    templates=templates, protected_ok=protected_ok, expiring_evidence=expiring_evidence)
                 proved = set(repos)
                 result["archive"] = {"reason": archive["reason"], "repositories": len(proved), "gitDirs": len(set(git_dirs))}
                 checks.append("archive-settles-refusal")
@@ -4165,7 +4264,7 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
                     raise ReapRefused("tracked-templates-changed")
             reap_protected_scan(item["path"], allow_git=allow_git, markers=True, repos=again if allow_git else None, nested_disposable=whole_clone,
                                 templates=templates, protected_ok=protected_ok,
-                                git_dirs=again_dirs if archive is not None else None)  # last look inside, just before the removal
+                                git_dirs=again_dirs if archive is not None else None, expiring_evidence=expiring_evidence)  # last look
             if set(again) != proved or (archive is not None and sorted(set(again_dirs)) != sorted(set(git_dirs))):
                 raise ReapRefused("nested-git-changed")
             if made is not None:  # the archive took time: a process, a file, an ignored folder or a ref may have moved since
@@ -4203,7 +4302,7 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
                 try:
                     removal_templates = dict.fromkeys(templates)
                     removal_templates.update(reap_vendored_templates(item["path"]))
-                    reap_remove_and_verify(fence, item["path"], before, result, allow_git, removal_templates, protected_ok)
+                    reap_remove_and_verify(fence, item["path"], before, result, allow_git, removal_templates, protected_ok, expiring_evidence)
                 finally:
                     if made is not None and since and not had_stamp and not result.get("removed"):
                         # Nothing was removed (the removal refused before its first byte): the clone is still the primary copy and the archive's
@@ -4593,7 +4692,8 @@ def evidence_name(name: str) -> bool:
     return reap_fold(name).endswith(EVIDENCE_SUFFIXES) and not reap_fold(name).startswith(REAP_MARKER_PREFIX)
 
 
-def evidence_walk(root: str, cutoff: float, deadline: float) -> tuple[list[dict], list[str]]:
+def evidence_walk(root: str, cutoff: float, deadline: float, marked: bool = False,
+                  marked_cutoff: float | None = None) -> tuple[list[dict], list[str]]:
     """Expirable files below one job folder, from names and lstat only (no file is opened). Returns (files, kept) where
     kept names each folder skipped whole and why. Raises ReapRefused on a changed identity, an exhausted budget or an
     unreadable folder: an incomplete walk expires nothing."""
@@ -4601,7 +4701,7 @@ def evidence_walk(root: str, cutoff: float, deadline: float) -> tuple[list[dict]
     if not stat.S_ISDIR(top.st_mode):
         raise ReapRefused("evidence-root-not-a-directory")
     files, kept, listed, uid = [], [], 0, os.getuid()
-    def walk(fd, rel, level):
+    def walk(fd, rel, level, active_cutoff):
         nonlocal listed
         with os.scandir(fd) as entries:
             names = sorted(entry.name for entry in entries)
@@ -4610,8 +4710,12 @@ def evidence_walk(root: str, cutoff: float, deadline: float) -> tuple[list[dict]
             raise ReapRefused("evidence-scan-incomplete")
         folded = {reap_fold(n) for n in names}
         if any(f.startswith(REAP_MARKER_PREFIX) for f in folded):
-            kept.append(f"{rel or '.'}:retention-marker")
-            return
+            # Only the separately verified, report-backed five-day rule can pass an evidence marker.
+            current = os.path.join(root, rel)
+            if not marked or reap_cache_retention(current) != "evidence":
+                kept.append(f"{rel or '.'}:retention-marker")
+                return
+            active_cutoff = marked_cutoff if marked_cutoff is not None else cutoff
         if any(reap_is_git(n) or reap_protected(n) for n in names) or ("objects" in folded and folded & {"head", "refs", "packed-refs", "reftable"}):
             kept.append(f"{rel or '.'}:git-or-protected")
             return
@@ -4624,7 +4728,7 @@ def evidence_walk(root: str, cutoff: float, deadline: float) -> tuple[list[dict]
             if stat.S_ISDIR(info.st_mode):
                 if info.st_dev != top.st_dev:
                     kept.append(f"{sub}:mountpoint")
-                elif reap_fold(name) in EVIDENCE_KEEP_DIRS:
+                elif reap_fold(name) in EVIDENCE_KEEP_DIRS or marked_evidence_keep(name):
                     kept.append(f"{sub}:kept-folder")
                 elif reap_fold(name) in EVIDENCE_SKIP_DIRS:
                     kept.append(f"{sub}:build-output")
@@ -4636,18 +4740,18 @@ def evidence_walk(root: str, cutoff: float, deadline: float) -> tuple[list[dict]
                         opened = os.fstat(child)
                         if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
                             raise ReapRefused("walk-identity-changed")
-                        walk(child, sub, level + 1)
+                        walk(child, sub, level + 1, active_cutoff)
                     finally:
                         os.close(child)
-            elif (stat.S_ISREG(info.st_mode) and evidence_name(name) and info.st_uid == uid and info.st_nlink == 1
-                  and info.st_mtime <= cutoff):
+            elif (stat.S_ISREG(info.st_mode) and evidence_name(name) and not marked_evidence_keep(name) and info.st_uid == uid and info.st_nlink == 1
+                  and info.st_mtime <= active_cutoff):
                 files.append({"rel": sub, "dev": info.st_dev, "ino": info.st_ino, "bytes": info.st_size, "mtimeNs": info.st_mtime_ns})
     fd = os.open(root, REAP_ROOT_FLAGS)
     try:
         opened = os.fstat(fd)
         if (opened.st_dev, opened.st_ino) != (top.st_dev, top.st_ino):
             raise ReapRefused("walk-identity-changed")
-        walk(fd, "", 0)
+        walk(fd, "", 0, cutoff)
     except OSError as error:
         raise ReapRefused("evidence-scan-unreadable:" + reap_named(error))
     finally:
@@ -4688,6 +4792,28 @@ def evidence_expire_job(conn, job: dict, days: int, dry_run: bool, actor: str) -
         return evidence_expire_job_owned(conn, job, days, dry_run, actor)
 
 
+def marked_evidence_expire_job(conn, job: dict, dry_run: bool) -> dict:
+    """Existing guarded folder path, limited to expired marked job-cache children. Keeps the job root and records."""
+    items = [i for i in reap_job_items(job, [])[0] if reap_marked_evidence_item(i)]
+    out = {"days": marked_evidence_expiry_days(load_policy()), "items": [], "dfDeltaBytes": 0}
+    if not items:
+        return {**out, **reap_summarize([])}
+    with ExitStack() as stack:
+        if not dry_run:
+            stack.enter_context(reap_cleanup_owner("marked-evidence:" + job["id"]))
+            fd = reap_job_lock(job["id"])
+            stack.callback(os.close, fd)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                raise ReapRefused("reap-already-running")
+        before = reap_free_bytes()
+        results, stopped = reap_sweep(items, "dry-run" if dry_run else "delete", {"run": uuid.uuid4().hex[:12]})
+        after = reap_free_bytes()
+    return {**out, **reap_summarize(results), "items": results, "stopped": stopped,
+            "dfDeltaBytes": after - before if after is not None and before is not None else None}
+
+
 def evidence_expire_job_owned(conn, job: dict, days: int, dry_run: bool, actor: str) -> dict:
     """Expire one finished job's bulky evidence. The job must be finished `days` ago and pass reap_job_blocker (the
     caller checks) and reap_authority (checked here and again before every batch); no process may hold a cwd,
@@ -4695,7 +4821,9 @@ def evidence_expire_job_owned(conn, job: dict, days: int, dry_run: bool, actor: 
     cutoff = now() - days * 86400
     out = {"job": job["id"], "dryRun": dry_run, "days": days, "files": 0, "bytes": 0, "expired": 0, "expiredBytes": 0,
            "kept": [], "changed": [], "reason": None}
-    if not job.get("finished_at") or job["finished_at"] > cutoff:
+    if job.get("status") not in REAP_TERMINAL:
+        return {**out, "reason": "job-not-terminal"}
+    if not job.get("finished_at") or (job["finished_at"] > cutoff and not marked_evidence_job(job["id"])):
         return {**out, "reason": f"finished-less-than-{days}-days-ago"}
     cache_root = reap_canon(reap_cache_root())
     reap_vet_root(cache_root)
@@ -4710,9 +4838,14 @@ def evidence_expire_job_owned(conn, job: dict, days: int, dry_run: bool, actor: 
         return {**out, "reason": "job-folder-not-a-real-directory"}
     item = {"class": "job-cache-subdir", "owner": job["id"], "jobs": [job["id"]], "root": root, "path": root}
     authority = reap_authority(item)
+    out["markedEvidence"] = marked_evidence_expire_job(conn, job, dry_run)
+    if out["markedEvidence"].get("stopped"):
+        return {**out, "stopped": out["markedEvidence"]["stopped"]}
     deadline = time.monotonic() + EVIDENCE_JOB_SECONDS
     try:
-        files, kept = evidence_walk(root, cutoff, deadline)
+        marked = marked_evidence_job(job["id"])
+        files, kept = evidence_walk(root, cutoff if days else float("-inf"), deadline, marked=marked,
+                                   marked_cutoff=now() - marked_evidence_expiry_days(load_policy()) * 86400) if days or marked else ([], [])
     except ReapRefused as refusal:
         if str(refusal) != "evidence-scan-incomplete":
             raise
@@ -4827,28 +4960,32 @@ def evidence_expiry_tick(conn, policy: dict, live: list, actions: list, errors: 
     """Rides on autoReap: finished jobs older than evidenceExpiryDays whose worker is gone, oldest first, a few per tick.
     A job folder is walked again at most weekly once it came out complete, hourly while it did not."""
     days = evidence_expiry_days(policy)
-    if not policy.get("autoReap", False) or not days:
+    enabled = [d for d in (days, marked_evidence_expiry_days(policy)) if d]
+    if not policy.get("autoReap", False) or not enabled:
         return
+    scan_days = min(enabled)
     try:
         reap_home()
     except HostError:
         return  # state moved without a reaper home (tests, a second instance): reaping is off, silently
     live_ids, due = {s["id"] for s in live}, []
     for job in rows(conn, "SELECT * FROM jobs WHERE status IN ('done','failed','cancelled') AND finished_at IS NOT NULL AND finished_at<=? ORDER BY finished_at",
-                    (now() - days * 86400,)):
+                    (now() - scan_days * 86400,)):
         if len(due) >= EVIDENCE_TICK_SCANS:
             break
         key = "evidence-expiry:" + job["id"]
         stored = row(conn, "SELECT value FROM meta WHERE key=?", (key,))
         try:
-            next_at = float(json.loads(stored["value"]).get("next", 0)) if stored else 0.0
+            saved = json.loads(stored["value"]) if stored else {}
+            next_at = float(saved.get("next", 0)) if saved.get("expiryRule") == [days, marked_evidence_expiry_days(policy)] else 0.0
         except (ValueError, AttributeError, TypeError):
             next_at = 0.0
         if now() < next_at or reap_job_blocker(conn, job, live_ids):
             continue
         if not os.path.isdir(reap_cache_root() / job["id"]):  # nothing to expire: no lease, no journal line
             conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",
-                         (key, json.dumps({"at": now(), "next": now() + EVIDENCE_RECHECK_SECONDS, "expired": 0, "reason": "no-job-folder"}, sort_keys=True)))
+                         (key, json.dumps({"at": now(), "next": now() + EVIDENCE_RECHECK_SECONDS, "expired": 0, "reason": "no-job-folder",
+                                          "expiryRule": [days, marked_evidence_expiry_days(policy)]}, sort_keys=True)))
             continue
         due.append(job)
     if not due:
@@ -4872,16 +5009,21 @@ def evidence_expiry_owned(conn, days: int, due: list, actions: list, errors: lis
             if out.get("reason") == "scan-incomplete":
                 wait = 86400
             elif not out.get("stopped") and not out.get("changed") and out.get("reason") != "reap-already-running":
-                wait = EVIDENCE_RECHECK_SECONDS
+                # Marked evidence gets an hourly retry, including while it ages through its separate five-day window.
+                wait = EVIDENCE_RETRY_SECONDS if any("retention-marker" in k for k in out.get("kept", [])) else EVIDENCE_RECHECK_SECONDS
         except (HostError, OSError, ValueError, sqlite3.Error, ReapRefused) as error:
             errors.append({"evidence-expiry": job["id"], "error": str(error)})
             out = None
         conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",
                      (key, json.dumps({"at": now(), "next": now() + wait, "expired": out["expired"] if out else 0,
-                                       "reason": out.get("reason") if out else "error"}, sort_keys=True)))
-        if out and out["expired"]:
+                                       "reason": out.get("reason") if out else "error",
+                                       "expiryRule": [days, marked_evidence_expiry_days(load_policy())]}, sort_keys=True)))
+        marked = (out or {}).get("markedEvidence") or {}
+        if out and (out["expired"] or marked.get("deleted")):
             worked += 1
-            actions.append({"did": "expired-evidence", "job": job["id"], "files": out["expired"], "bytes": out["expiredBytes"]})
+            actions.append({"did": "expired-evidence", "job": job["id"], "files": out["expired"], "bytes": out["expiredBytes"],
+                            "markedDirectories": marked.get("deleted", 0), "markedBytes": marked.get("reclaimedBytes", 0),
+                            "markedDfDeltaBytes": marked.get("dfDeltaBytes", 0)})
         held = getattr(REAP_CLEANUP_OWNER, "held", None)
         if held and held.get("stopped"):
             return  # no next job until this handoff is acknowledged (reap-owner-status, reap-acknowledge)
@@ -5330,8 +5472,9 @@ def tool_reap_owned(params: dict) -> dict:
             raise HostError(f"{job_id} is not reapable: {blocker}", "only finished jobs whose worker is gone are reaped; run reap-status for the state of every job")
         if params.get("expireEvidence"):
             days = evidence_expiry_days(load_policy())
-            if not days:
-                raise HostError("evidence expiry is off (policy evidenceExpiryDays=0)", f"{REAP_CLI} policy-set evidenceExpiryDays=14 turns it on")
+            if not days and not marked_evidence_expiry_days(load_policy()):
+                raise HostError("evidence expiry is off (both evidenceExpiryDays and markedEvidenceExpiryDays=0)",
+                                f"{REAP_CLI} policy-set markedEvidenceExpiryDays=5 turns marked expiry on")
             try:
                 return evidence_expire_job(conn, job, days, bool(params.get("dryRun")), actor_of(params))
             except ReapRefused as refusal:

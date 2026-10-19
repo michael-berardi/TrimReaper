@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.0 (2026-10-19)
+
+- Marked bulky job-cache evidence expires strictly more than five days after a job finishes, with a separate `markedEvidenceExpiryDays` policy. The job must retain a private `report.md`. Reports, summary/outcome, handoffs, receipts and the job root stay; customer, release/runtime/rollback and protected-archive material do not expire.
+- Marked folders use the existing guarded reaper, producer/Cargo locks and per-item receipts. Protected leaves and unfinished claims, including ancestor claims, still preserve the candidate. `reap --expire-evidence` and automatic ticks use the same rule; zero disables it.
+
 ## 0.5.3 (2026-10-19)
 
 - A live scratch task or release-evidence version no longer pins every sibling in its shared collection. Exact, descendant and ancestor job claims still preserve the candidate, including parked jobs and machine-recorded path claims.

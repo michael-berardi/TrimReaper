@@ -20,7 +20,7 @@ Requires macOS, Python 3.10 or newer, and `git`, `lsof` and `ps`. The `python3` 
 newer one comes from [python.org](https://www.python.org/downloads/) or Homebrew (`brew install python`).
 
 ```sh
-pipx install "git+https://github.com/michael-berardi/TrimReaper@v0.5.3"
+pipx install "git+https://github.com/michael-berardi/TrimReaper@v0.6.0"
 trimreaper --version
 ```
 
@@ -107,6 +107,7 @@ Every command prints one JSON document on stdout. Exit status:
 | The whole clone | `cloneExpiryDays` (3) after every job named in it finished. Unsaved work is archived first |
 | Per-job scratch folders (`cacheRoot/J-NNNN/*`) | Tool caches (with a `CACHEDIR.TAG`) once the job finishes; anything else `evidenceExpiryDays` (14) after it finished |
 | Screenshots, recordings, traces and logs in a job's scratch | `evidenceExpiryDays` after the job finished. Each file's name and SHA-256 are logged first |
+| Marked bulky job-cache evidence | Strictly more than `markedEvidenceExpiryDays` (5) after the job finished, only with an existing `report.md`. Reports, summary/outcome, handoffs and receipts stay. Retained material, protected names and active claims still prevent removal |
 | Agent scratch folders (`scratchRoot/*`) | Once nothing in them changed for `evidenceExpiryDays`. Active or parked job claims preserve that task, not unrelated siblings. Off until you set `scratchRoot` |
 | Its own archives | `archiveExpiryDays` (30) after the archive became the only copy |
 | Old release builds and release evidence | Off until configured: [docs/CONFIGURATION.md](docs/CONFIGURATION.md) |
@@ -128,9 +129,9 @@ they rebuild it when they resume. The pressure check runs during a `tick` that h
   does not enter or read them. Two exceptions: env *templates* that git tracks (`.env.example`, `.env.sample`,
   `.dev.vars.template` ...) go with an expired clone, since the remote holds the same file; and with
   `cloneProtectedCopies` set to `"remove"`, the local copies are archived owner-only, then go with the clone.
-- A folder that carries a retention marker other than `disposable`: a file named `.ut-retention-<class>` at its top
+- A folder that carries a retention marker other than `disposable`, except expired per-job `evidence` under the five-day rule above: a file named `.ut-retention-<class>` at its top
   level (`ut` is from UltraTerm, where the format started). Write one with `trimreaper mark <folder> <class>`:
-  `evidence` (proof of work you want kept), `customer` (customer data), `release-runtime-rollback` (what a release or
+  `evidence` (proof kept for the marked-evidence window; set `markedEvidenceExpiryDays=0` for indefinite retention), `customer` (customer data), `release-runtime-rollback` (what a release or
   its rollback needs). `disposable` is the opposite: it allows removal, still subject to every other check.
 - Anything a process has open or names on its command line. A source-only working directory is exempt only for the guarded exact-output route described above.
 - Anything reached through a symlink, on another volume, owned by another user, or outside the configured folders.
@@ -188,7 +189,7 @@ error that names it:
 - Low on disk? `clean` with a dry run first, then without. Leave models and other reported items to a person.
 - Read `trimreaper status --items` before asking a person why the disk is full. `summary.reasonActions` says what would
   free each kept folder.
-- Never delete agent output with `rm -rf`. Mark folders you need to keep (`trimreaper mark <folder> evidence`).
+- Never delete agent output with `rm -rf`. Mark evidence that needs the five-day window (`trimreaper mark <folder> evidence`); retain each job's `report.md`, handoff, summary/outcome and receipts. Customer and release/runtime/rollback markers never expire through this rule.
 
 ## MCP server
 
