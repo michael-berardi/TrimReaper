@@ -20,7 +20,9 @@ finishes, in case it is resumed. A **build queue** is any tool that takes a per-
 4. **Fence.** Device and inode of the root and of every folder down to the item are recorded. The removal re-opens that
    chain with `O_NOFOLLOW` and stops at any difference, so a folder swapped for a symlink is never followed.
 5. **Authority.** The job store is asked fresh: every job named by the folder is finished, and no unfinished job declares
-   the folder or waits on its owner. Asked again before the removal and after any archive.
+   the folder or waits on its owner. Asked again before the removal and after any archive. Independent scratch tasks and
+   release-evidence versions are checked at their own path, not their shared collection root. Exact, descendant and ancestor
+   claims (cwd, worktrees and machine-recorded paths), including parked jobs, preserve them; a sibling's claim does not.
 6. **Producer locks.** A build queue's per-project locks and Cargo's build locks are taken and held through the removal.
 7. **Protected scan.** A names-only walk refuses on `.env*`, `.dev.vars*`, `.wrangler`, `.vercel`, a nested repository,
    a bare git folder, a second retention marker or another volume. Protected entries are never stat'ed, opened or entered.

@@ -20,7 +20,7 @@ Requires macOS, Python 3.10 or newer, and `git`, `lsof` and `ps`. The `python3` 
 newer one comes from [python.org](https://www.python.org/downloads/) or Homebrew (`brew install python`).
 
 ```sh
-pipx install "git+https://github.com/michael-berardi/TrimReaper@v0.5.2"
+pipx install "git+https://github.com/michael-berardi/TrimReaper@v0.5.3"
 trimreaper --version
 ```
 
@@ -107,7 +107,7 @@ Every command prints one JSON document on stdout. Exit status:
 | The whole clone | `cloneExpiryDays` (3) after every job named in it finished. Unsaved work is archived first |
 | Per-job scratch folders (`cacheRoot/J-NNNN/*`) | Tool caches (with a `CACHEDIR.TAG`) once the job finishes; anything else `evidenceExpiryDays` (14) after it finished |
 | Screenshots, recordings, traces and logs in a job's scratch | `evidenceExpiryDays` after the job finished. Each file's name and SHA-256 are logged first |
-| Agent scratch folders (`scratchRoot/*`) | Once nothing in them changed for `evidenceExpiryDays`. Off until you set `scratchRoot` |
+| Agent scratch folders (`scratchRoot/*`) | Once nothing in them changed for `evidenceExpiryDays`. Active or parked job claims preserve that task, not unrelated siblings. Off until you set `scratchRoot` |
 | Its own archives | `archiveExpiryDays` (30) after the archive became the only copy |
 | Old release builds and release evidence | Off until configured: [docs/CONFIGURATION.md](docs/CONFIGURATION.md) |
 

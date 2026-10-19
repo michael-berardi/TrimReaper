@@ -2513,6 +2513,8 @@ def reap_scratch_idle(path: str) -> bool:
                     listed += 1
                     if listed > AGENT_SCRATCH_IDLE_ENTRIES:
                         return False
+                    if reap_protected(entry.name):
+                        return False  # protected leaves are never entered, even by the idle audit
                     info = os.lstat(entry.path)
                     if info.st_mtime > cutoff:
                         return False
@@ -2888,8 +2890,9 @@ def reap_clone_base_paths() -> list[str]:
 
 
 def reap_declared_paths(job: dict) -> list[str]:
-    """Paths a job declared as its own: its cwd and meta.worktrees (never free text from its prompt or brief)."""
-    declared = [job.get("cwd")] + list(job_meta(job).get("worktrees") or [])
+    """Machine-recorded cwd, worktrees and path claims, never free text from a prompt or brief."""
+    meta = job_meta(job)
+    declared = [job.get("cwd")] + list(meta.get("worktrees") or []) + list(meta.get("paths") or [])
     return [reap_canon(Path(str(p)).expanduser()) for p in declared if isinstance(p, str) and p.strip().startswith(("/", "~"))]
 
 
@@ -3525,7 +3528,10 @@ def reap_authority(item: dict) -> dict:
             except ValueError:
                 released[r["key"].split(":", 2)[2]] = {"by": "?"}
     ids = list(dict.fromkeys(item.get("jobs") or []))
-    scope = item["path"] if item["class"] == "job-clone-root" else item["root"]  # a whole clone's root is its clone base: claims are judged on the clone
+    # Scratch tasks and release versions are independent siblings, not claims on their collection root.
+    # Repository output still uses its source root so a source consumer preserves its build output.
+    independent = item["class"] in ("agent-scratch", "release-evidence")
+    scope = item["path"] if independent or item["class"] == "job-clone-root" else item["root"]
     if item["class"] not in ("release-target", "agent-scratch", "release-evidence") and item["owner"] not in ids:
         raise ReapRefused("owner-not-recorded")
     for job_id in ids:
@@ -3556,7 +3562,8 @@ def reap_authority(item: dict) -> dict:
     for job in jobs.values():
         if job["status"] in REAP_TERMINAL:
             continue
-        if any(reap_inside(d, scope) for d in reap_declared_paths(job)) and not reap_pressure_allows(item, job):
+        if any(reap_inside(d, scope) or (independent and reap_inside(scope, d))
+               for d in reap_declared_paths(job)) and not reap_pressure_allows(item, job):
             raise ReapRefused(f"claimed-by:{job['id']}({job['status']})")
         wait = job_wait(job)
         if wait and wait["job"] in ids:

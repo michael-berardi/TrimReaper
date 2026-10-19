@@ -253,6 +253,75 @@ class ScratchAndEvidence(Home):
         self.assertTrue(busy.exists())
         self.assertTrue(kept.exists())
 
+    def test_live_scratch_sibling_does_not_pin_idle_tasks(self):
+        root = self.home / ".cache" / "agent-scratch"
+        idle = self.put(root, "idle-task/out.log").parent
+        live = self.put(root, "live-task/out.log").parent
+        self.age(idle, 20)
+        self.age(live, 20)
+        self.add_job("J-0031", live, status="running")
+
+        out = self.cli("reap", "--scratch")
+
+        self.assertFalse(idle.exists(), out)
+        self.assertTrue(live.exists(), out)
+        held = next(i for i in out["items"] if i["path"] == str(live))
+        self.assertEqual(held["reason"], "claimed-by:J-0031(running)")
+
+    def test_running_and_parked_ancestor_or_descendant_claims_preserve_scratch(self):
+        root = self.home / ".cache" / "agent-scratch"
+        for s, status in enumerate(("running", "parked")):
+            for c, claim in enumerate(("ancestor", "exact", "descendant")):
+                with self.subTest(status=status, claim=claim):
+                    task = self.put(root, f"task-{status}-{claim}/nested/out.log").parent.parent
+                    self.age(task, 20)
+                    cwd = root if claim == "ancestor" else task / "nested" if claim == "descendant" else task
+                    job = f"J-{320 + s * 3 + c:04d}"
+                    self.add_job(job, cwd, status=status)
+                    out = self.cli("reap", "--scratch")
+                    self.assertTrue(task.exists(), out)
+                    held = next(i for i in out["items"] if i["path"] == str(task))
+                    self.assertEqual(held["reason"], f"claimed-by:{job}({status})")
+                    self.cli("job", "status", job, "done")
+
+    def test_machine_recorded_scratch_claim_is_not_inferred_from_the_cwd(self):
+        root = self.home / ".cache" / "agent-scratch"
+        held = self.put(root, "held-task/out.log").parent
+        sibling = self.put(root, "other-task/out.log").parent
+        self.age(held, 20)
+        self.age(sibling, 20)
+        self.add_job("J-0035", self.dev / "unrelated", status="parked")
+        with closing(self.state()) as conn, conn:
+            conn.execute("UPDATE jobs SET meta=? WHERE id='J-0035'", (json.dumps({"paths": [str(held)]}),))
+        out = self.cli("reap", "--scratch")
+        self.assertTrue(held.exists(), out)
+        self.assertFalse(sibling.exists(), out)
+        self.assertEqual(next(i for i in out["items"] if i["path"] == str(held))["reason"],
+                         "claimed-by:J-0035(parked)")
+
+    def test_idle_probe_never_enters_a_protected_leaf(self):
+        task = self.home / ".cache" / "agent-scratch" / "protected-task"
+        self.put(task, ".wrangler/state/db")
+        self.age(task, 20)
+        original = os.scandir
+        def checked(path):
+            self.assertNotIn(".wrangler", str(path))
+            return original(path)
+        with mock.patch.object(core.os, "scandir", side_effect=checked):
+            self.assertFalse(core.reap_scratch_idle(str(task)))
+
+    def test_release_claim_is_per_version_and_keeps_ancestor_claims(self):
+        root = self.home / ".cache" / "releases"
+        old = self.put(root, "1.0.0/report.txt").parent
+        live = self.put(root, "2.0.0/report.txt").parent
+        self.add_job("J-0033", live, status="running")
+        item = {"path": str(old), "root": str(root), "owner": "release-evidence",
+                "jobs": [], "class": "release-evidence"}
+        core.reap_authority(item)
+        self.add_job("J-0034", root, status="parked")
+        with self.assertRaisesRegex(core.ReapRefused, r"claimed-by:J-0034\(parked\)"):
+            core.reap_authority(item)
+
     def test_old_screenshots_and_logs_expire_with_a_manifest_reports_stay(self):
         folder = self.home / ".cache" / "trimreaper" / "jobs" / "J-0030"
         shot = self.put(folder, "screens/home.png", b"\x89PNG" + b"0" * 2000)

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.3 (2026-10-19)
+
+- A live scratch task or release-evidence version no longer pins every sibling in its shared collection. Exact, descendant and ancestor job claims still preserve the candidate, including parked jobs and machine-recorded path claims.
+- Scratch idle audits refuse protected leaves before entering them.
+
 ## 0.5.2 (2026-10-18)
 
 - Measure goals from `df -kP` Used and Available columns. On APFS, Python's total-minus-free value can include shared-container allocation and is not the volume's Used value. Failed or malformed probes expose a named fallback with unknown goal progress, never false success.
