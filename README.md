@@ -107,7 +107,7 @@ Every command prints one JSON document on stdout. Exit status:
 | The whole clone | `cloneExpiryDays` (3) after every job named in it finished. Unsaved work is archived first |
 | Per-job scratch folders (`cacheRoot/J-NNNN/*`) | Tool caches (with a `CACHEDIR.TAG`) once the job finishes; anything else `evidenceExpiryDays` (14) after it finished |
 | Screenshots, recordings, traces and logs in a job's scratch | `evidenceExpiryDays` after the job finished. Each file's name and SHA-256 are logged first |
-| Marked bulky job-cache evidence | Strictly more than `markedEvidenceExpiryDays` (5) after the job finished, only with an existing `report.md`. Reports, summary/outcome, handoffs and receipts stay. Retained material, protected names and active claims still prevent removal |
+| Marked bulky job-cache evidence | Strictly more than `markedEvidenceExpiryDays` (5) after the job finished, only with an existing, non-empty `report.md`. Reports, summary/outcome, handoffs and receipts stay. Retained material, protected names and active claims still prevent removal |
 | Agent scratch folders (`scratchRoot/*`) | Once nothing in them changed for `evidenceExpiryDays`. Active or parked job claims preserve that task, not unrelated siblings. Off until you set `scratchRoot` |
 | Its own archives | `archiveExpiryDays` (30) after the archive became the only copy |
 | Old release builds and release evidence | Off until configured: [docs/CONFIGURATION.md](docs/CONFIGURATION.md) |

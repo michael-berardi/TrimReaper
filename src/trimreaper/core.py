@@ -1369,11 +1369,26 @@ def marked_evidence_expiry_days(policy: dict) -> int:
 
 def marked_evidence_keep(name: str) -> bool:
     """Durable job records and retained material are never part of marked-evidence expiry."""
-    name = reap_fold(name)
-    return (bool(re.match(r"^(?:report|summary|outcome|handoff|receipts?)(?:$|[-_.])", name))
+    # camelCase is the same class of record as a hyphenated name: "AppleCerts" is "apple certs", and
+    # "SubscriptionKey_X.p8" is "subscription key x.p8", so a word boundary exists where the writer put a capital.
+    name = reap_fold(re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", name))
+    # Records in any position and any number: "final-report.md", "review-receipt.md" and "handoffs" are one record.
+    records = r"reports?|summar(?:y|ies)|outcomes?|handoffs?|receipts?"
+    # Retained classes, matched by prefix and after any non-alphanumeric edge so "Old Customer List" and
+    # "customerdata" keep their data. Identity and signing material is in the same class (2026-10-19 review).
+    retained = (r"release|runtime|rollback|customer|credential|secret|signing|entitlement|notariz|keychain|provisioning|"
+                r"authkey|password|passwd|certificate|cert|token|keys?|ssh|gpg|gnupg|id_rsa|id_dsa|id_ecdsa|id_ed25519|"
+                r"known_hosts|authorized_keys|netrc|npmrc|pypirc|htpasswd|keystore|kube|aws|service[-_ ]?accounts?|"
+                r"adminsdk|gcloud|firebase|oauth")
+    edge = r"(?:^|[^a-z0-9])"
+    # A key, certificate or profile is never evidence whatever it is called: the extension is the class.
+    secret_files = (".app", ".dmg", ".pkg", ".ipa", ".zip", ".tgz", ".xcarchive", ".sig", ".asc", ".p8", ".p12",
+                    ".pem", ".pfx", ".cer", ".crt", ".key", ".csr", ".jks", ".keystore", ".p7b", ".p7c", ".srl",
+                    ".mobileprovision", ".ovpn", ".ppk")
+    return (bool(re.search(rf"{edge}(?:{records})(?:$|[^a-z0-9])", name))
             or name == "evidence-expired.jsonl" or name == "protected-archive"
-            or bool(re.search(r"(?:^|[-_.])(?:releases?|runtime|rollback|customer)(?:$|[-_.])", name))
-            or name.endswith((".app", ".dmg", ".pkg", ".ipa", ".sig", ".asc")))
+            or bool(re.search(rf"{edge}(?:{retained})", name))
+            or name.endswith(secret_files))
 
 
 def marked_evidence_job(job_id: str) -> bool:
@@ -1389,7 +1404,8 @@ def marked_evidence_job(job_id: str) -> bool:
         fd = os.open(str(reap_cache_root() / job_id), REAP_ROOT_FLAGS)
         try:
             info = os.stat("report.md", dir_fd=fd, follow_symlinks=False)
-            return stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and info.st_nlink == 1
+            # A surviving report is the job's durable record: an empty placeholder is not one.
+            return stat.S_ISREG(info.st_mode) and info.st_size > 0 and info.st_uid == os.getuid() and info.st_nlink == 1
         finally:
             os.close(fd)
     except OSError:
@@ -1438,6 +1454,23 @@ def reap_evidence_marker_void(job_id: str | None) -> bool:
         job = row(conn, "SELECT status, finished_at FROM jobs WHERE id=?", (job_id,))
     return (bool(job) and job["status"] == "cancelled" and bool(job["finished_at"])
             and now() - job["finished_at"] >= days * 86400)
+
+
+def reap_no_retained_names(path: str) -> bool:
+    """True only when no retained-class name (a record, signing or credential name, a key or certificate extension, an
+    identity file) appears anywhere below a whole-folder candidate. A job-cache subdirectory is removed as a unit, so its
+    top-level name alone cannot prove it holds no key material (2026-10-19 review). A walk that cannot complete, or a name
+    it cannot judge, keeps the folder: over-retention is the safe answer."""
+    hit = []
+    def listing(rel, names):
+        kept = [n for n in names if marked_evidence_keep(n)]
+        if kept:
+            hit.append(kept[0])
+    try:
+        reap_fd_walk(path, lambda rel, name, info, level, device: True, REAP_WALK_ENTRIES, listing=listing)
+    except (OSError, ReapRefused):
+        return False
+    return not hit
 
 
 def reap_item_retention(item: dict) -> str:
@@ -1489,7 +1522,7 @@ def reap_item_retention(item: dict) -> str:
         return REAP_DISPOSABLE
     if cls == "job-cache-subdir" and reap_fold(os.path.basename(item["path"])) not in EVIDENCE_KEEP_DIRS and item.get("owner") \
             and reap_cache_retention(str(reap_cache_root() / item["owner"])) in ("unmarked", REAP_DISPOSABLE):  # only a preserving parent marker keeps it all
-        if reap_cachedir_tagged(item["path"]) or reap_scratch_expired(item["owner"]):
+        if (reap_cachedir_tagged(item["path"]) or reap_scratch_expired(item["owner"])) and reap_no_retained_names(item["path"]):
             return REAP_DISPOSABLE
     if cls == "agent-scratch" and reap_scratch_idle(item["path"]):
         return REAP_DISPOSABLE
@@ -5192,7 +5225,7 @@ def scope_release_tick(conn, actions: list) -> None:
 
 
 def reap_tick(conn, policy: dict, live: list, actions: list, errors: list) -> None:
-    if not policy.get("autoReap", True):
+    if not policy.get("autoReap", False):
         return
     try:
         reap_home()
