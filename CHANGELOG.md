@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.5 (2026-10-20)
+
+- A cancelled job's `evidence` marker on its own cache no longer keeps that cache forever. The acceptance or verification the marker was written for can never complete once the job is cancelled, so the cache keeps the normal `evidenceExpiryDays` window instead. Done, failed, parked and running jobs keep their markers exactly as written, and every other proof (protected leaves, retained classes, live producers) still runs.
+
 ## 0.6.4 (2026-10-20)
 
 - `reapOpenTerminalGraceHours` (default `0`, off) implements the rule hosts already documented: once a finished job finished that long ago and its worker terminal has been idle as long, that still-open terminal stops holding the job's folders. The terminal is never closed or touched, a resumed terminal (or unknown idleness) keeps the old wait, and every other proof (a live process using the folder, a retention marker, git state, a terminal shared with live work) still runs. The grace is one snapshot: ids and idle seconds come from the same read.

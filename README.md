@@ -132,7 +132,9 @@ they rebuild it when they resume. The pressure check runs during a `tick` that h
 - A folder that carries a retention marker other than `disposable`, except expired per-job `evidence` under the five-day rule above: a file named `.ut-retention-<class>` at its top
   level (`ut` is from UltraTerm, where the format started). Write one with `trimreaper mark <folder> <class>`:
   `evidence` (proof kept for the marked-evidence window; set `markedEvidenceExpiryDays=0` for indefinite retention), `customer` (customer data), `release-runtime-rollback` (what a release or
-  its rollback needs). `disposable` is the opposite: it allows removal, still subject to every other check.
+  its rollback needs). An `evidence` marker on a job's own cache cannot outlive the job's promise: once that job is
+  cancelled and `evidenceExpiryDays` has passed, the cache keeps only the normal window instead of forever. `disposable`
+  is the opposite: it allows removal, still subject to every other check.
 - Anything a process has open or names on its command line. A source-only working directory is exempt only for the guarded exact-output route described above.
 - Anything reached through a symlink, on another volume, owned by another user, outside the configured folders, or carrying immutable, no-unlink or restricted filesystem flags. System-protected temp directories stay; flags are never cleared.
 - Your home folder or a system folder as a root, even if the configuration says so.

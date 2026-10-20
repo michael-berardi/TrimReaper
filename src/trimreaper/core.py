@@ -1427,6 +1427,19 @@ def reap_marked_evidence_locks(path: str) -> tuple[list, list]:
     return [reap_queue_lock(p) for p in sorted(projects)], sorted(cargo)
 
 
+def reap_evidence_marker_void(job_id: str | None) -> bool:
+    """A cancelled job's `evidence` marker on its own cache has lost its premise: the acceptance or verification it was
+    written for can never complete, so the marker keeps that cache only for the normal evidence window instead of forever.
+    A done, failed, parked or running job keeps its marker as written."""
+    days = evidence_expiry_days(load_policy())
+    if not job_id or not days:
+        return False
+    with db() as conn:
+        job = row(conn, "SELECT status, finished_at FROM jobs WHERE id=?", (job_id,))
+    return (bool(job) and job["status"] == "cancelled" and bool(job["finished_at"])
+            and now() - job["finished_at"] >= days * 86400)
+
+
 def reap_item_retention(item: dict) -> str:
     """A marker decides; without one, `disposable` is derived only in the three self-cleaning cases (see REAP_DERIVED_KINDS)."""
     if item.get("class") == "job-cache-subdir" and marked_evidence_keep(os.path.basename(item["path"])):
@@ -1437,6 +1450,8 @@ def reap_item_retention(item: dict) -> str:
             and reap_inside(item["path"], reap_canon(reap_cache_root() / item["owner"])):
         parent = reap_cache_retention(str(reap_cache_root() / item["owner"]))
         if parent not in ("unmarked", REAP_DISPOSABLE):
+            if parent == "evidence" and reap_evidence_marker_void(item["owner"]):
+                return REAP_DISPOSABLE
             return parent  # an explicit preserving job-folder marker applies to every child
     if item.get("class") == "job-derived-output":
         for parent in (item.get("source"), item["root"]):

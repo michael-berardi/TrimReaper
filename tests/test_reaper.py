@@ -647,6 +647,37 @@ class ExpiredJobCache(Home):
         self.assertTrue(child.exists())
 
 
+class CancelledEvidenceMarker(Home):
+    """A cancelled job's `evidence` marker on its own cache cannot wait for an acceptance that will never happen: the
+    cache keeps the normal evidence window, and a done job keeps the marker exactly as written."""
+
+    config_extra = {"policy": {"evidenceExpiryDays": 14, "cloneArchive": "keep"}}
+
+    def cache(self, job="J-0080", status="cancelled", ago=15 * DAY):
+        self.add_job(job, status=status, finished_ago=ago)
+        root = self.home / ".cache/trimreaper/jobs" / job
+        self.put(root, ".ut-retention-evidence", b"Retain through the completed acceptance.\n")
+        child = self.put(root, "resume-02z/keep.bin").parent
+        return root, child
+
+    def test_cancelled_jobs_evidence_cache_expires_on_the_normal_window(self):
+        root, child = self.cache()
+        out = self.cli("reap", "--job", "J-0080")
+        self.assertEqual(out["deleted"], 1, out)
+        self.assertFalse(child.exists())
+        self.assertTrue((root / ".ut-retention-evidence").exists())
+
+    def test_a_done_jobs_evidence_marker_still_keeps_its_cache(self):
+        _, child = self.cache(status="done")
+        self.assertEqual(self.cli("reap", "--job", "J-0080")["deleted"], 0)
+        self.assertTrue(child.exists())
+
+    def test_a_recently_cancelled_job_keeps_it_for_the_window(self):
+        _, child = self.cache(ago=5 * DAY)
+        self.assertEqual(self.cli("reap", "--job", "J-0080")["deleted"], 0)
+        self.assertTrue(child.exists())
+
+
 class VendoredProtectedTemplates(Home):
     config_extra = {"policy": {"evidenceExpiryDays": 1, "cloneArchive": "keep"}}
 
