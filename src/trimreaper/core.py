@@ -75,6 +75,8 @@ REAP_MARKER_PREFIX = ".ut-retention-"                  # every candidate is disp
 # the operator set for screenshots and logs. Any retention marker (evidence, customer, release...) still wins, a marker in
 # the job folder preserves the whole job unless it is disposable, and `protected-archive` is never derived.
 REAP_DERIVED_KINDS = ("node_modules", ".next", ".open-next", ".turbo", ".astro", "target")
+# Astro writes these into .astro/ before any build output exists; an unignored .astro holding none of them is not its cache.
+REAP_ASTRO_FILES = ("data-store.json", "content-assets.mjs", "content-modules.mjs", "types.d.ts")
 # Disk pressure: clones of jobs that are parked or interrupted can hold a full disk while nothing runs in them. At or above
 # diskWarnPercent, the regenerable build output of a job
 # that is not starting or running is reapable too: such a job rebuilds it when it runs. Every per-item gate still applies (protected
@@ -902,20 +904,34 @@ def reap_git_item_checks(root: str, path: str, needs: tuple, cache: dict | None 
     rel = os.path.relpath(path, root)
     if "ignored" in needs:
         code, _ = reap_git(root, "check-ignore", "-q", "--", rel)
-        known_astro = os.path.basename(path) == ".astro" and "untracked" in needs and os.path.isdir(path) and not os.path.islink(path)
+        known_astro = os.path.basename(path) == ".astro" and "untracked" in needs \
+            and os.path.isdir(path) and not os.path.islink(path) and reap_astro_cache(path)
         if code == 1 and not known_astro:
             raise ReapRefused("not-git-ignored")
         if code not in (0, 1):
             raise ReapRefused(f"git-error:check-ignore:{code}")
         passed.append("known-regenerable-astro" if code == 1 else "git-ignored")
     if "untracked" in needs:
-        code, out = reap_git(root, "ls-files", "-z", "--", rel)
+        # Case-folded and literal: a case-insensitive filesystem shows the index entry `Node_Modules/x` as `node_modules/x`,
+        # and a case-sensitive pathspec would call that folder untracked and remove the tracked work living in it.
+        code, out = reap_git(root, "ls-files", "-z", "--", ":(icase,literal)" + rel)
         if code != 0:
             raise ReapRefused(f"git-error:ls-files:{code}")
         if out:
             raise ReapRefused("tracked-files")
         passed.append("git-untracked")
     return passed
+
+
+def reap_astro_cache(path: str) -> bool:
+    """True when Astro's own generated cache files are in the folder: an unignored `.astro` is output only when Astro wrote it.
+    A folder of the same name holding anything else is untracked user work and keeps the full proofs."""
+    try:
+        names = set(os.listdir(path))
+    except OSError:
+        return False
+    return any(name in names for name in REAP_ASTRO_FILES)
+
 
 
 def reap_linked_worktree(root: str) -> bool:

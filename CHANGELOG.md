@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.3 (2026-10-19)
+
+- The untracked-`.astro` proof now needs Astro's own cache files inside the folder (`data-store.json`, `content-assets.mjs`, `content-modules.mjs` or `types.d.ts`) rather than only its name: a clone that is no longer preserved by its own dirt would otherwise hand over untracked work kept under a `.astro` name.
+- The tracked-file proof matches the index case-insensitively and literally. On a case-insensitive filesystem the index entry `NODE_MODULES/x` is the file inside `node_modules/`, and a case-sensitive pathspec called that folder untracked.
+
 ## 0.6.2 (2026-10-19)
 
 - A finished job's regenerable build output (`node_modules`, `.next`, `.open-next`, `.turbo`, `.astro`, `target`) no longer waits for a clean, stash-free, pushed clone: its own git-ignored and untracked proofs still stand, and a tracked, nested, protected or release-bearing folder still preserves it. `dist` and whole-clone removal keep the full proofs.

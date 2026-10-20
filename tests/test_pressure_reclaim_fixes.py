@@ -48,6 +48,36 @@ class AstroOutput(Home):
         self.assertEqual(self.cli('reap', '--job', 'J-0080')['deleted'], 0)
         self.assertTrue((repo / '.astro').exists())
 
+    def test_unignored_astro_astro_did_not_write_is_untracked_work(self):
+        """The name alone is not the proof: without Astro's own cache files, `.astro` is untracked work and a dirty clone no
+        longer preserves its output, so it must keep the full proofs instead of riding the untracked-astro proof."""
+        repo = self.clone('site-j0081')
+        self.add_job('J-0081', repo)
+        self.put(repo, '.astro/notes.txt', b'mine\n')
+        self.put(repo, 'README.md', b'edited\n')
+        out = self.cli('reap', '--job', 'J-0081')
+        self.assertEqual(out['deleted'], 0, out)
+        self.assertTrue((repo / '.astro/notes.txt').exists())
+        self.assertIn('not-git-ignored', out['reasons'])
+
+
+class CaseFoldedIndex(Home):
+    """A case-insensitive filesystem shows one folder under several spellings; the index only names one of them."""
+
+    def test_case_variant_index_entry_inside_build_output_is_still_tracked(self):
+        repo = self.clone('app-j0082')
+        self.put(repo, 'node_modules/x', b'tracked by mistake\n')
+        if not os.path.isdir(repo / 'NODE_MODULES'):
+            self.skipTest('case-sensitive filesystem')
+        self.git(repo, 'add', '-f', 'NODE_MODULES/x')
+        self.git(repo, 'commit', '-qm', 'case variant')
+        self.git(repo, 'push', '-q')
+        self.add_job('J-0082', repo)
+        out = self.cli('reap', '--job', 'J-0082')
+        self.assertEqual(out['deleted'], 0, out)
+        self.assertTrue((repo / 'node_modules/x').exists())
+        self.assertIn('tracked-files', out['reasons'])
+
 
 class ProtectedFlagAndLateRetention(Home):
     def test_system_nounlink_flag_refuses_before_entering_root(self):
