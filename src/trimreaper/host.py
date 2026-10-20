@@ -56,6 +56,9 @@ DEFAULT_POLICY = {
     "cleanFloorGB": 10,
     # Parked/blocked jobs give up their derived build output after this many hours without a report; 0 = only under pressure.
     "parkedReapHours": 24,
+    # A finished job whose worker terminal is still open stops holding that job's folders once the job finished this many
+    # hours ago and the terminal has been idle as long; the terminal itself is never closed. 0 = such a job keeps them.
+    "reapOpenTerminalGraceHours": 0,
     # A linked git worktree no job owns goes after this many days without a change (and every other check); 0 keeps them all.
     "worktreeIdleDays": 7,
     "projectIdleHours": 48,
@@ -176,6 +179,9 @@ def check_policy(policy: dict) -> None:
         value = merged[key]
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             raise HostError(f"policy {key} must be a whole number of days (0 = never), not {json.dumps(value)}")
+    value = merged["reapOpenTerminalGraceHours"]
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        raise HostError(f"policy reapOpenTerminalGraceHours must be 0 (never) or more hours, not {json.dumps(value)}")
     value = merged["diskWarnPercent"]
     if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 100:
         raise HostError(f"policy diskWarnPercent must be a whole number from 1 to 100, not {json.dumps(value)}")

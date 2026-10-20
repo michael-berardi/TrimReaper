@@ -3135,7 +3135,7 @@ def reap_output_item(owner: str, path: str) -> dict | None:
     return item
 
 
-def reap_output_terminal_blocker(conn, job: dict, live_ids: set | None) -> str | None:
+def reap_output_terminal_blocker(conn, job: dict, live_ids: set | None, idle: dict | None = None) -> str | None:
     """Fresh terminal proof without treating continuation/waiting on SOURCE as an output claim."""
     if job["status"] not in REAP_OUTPUT_TERMINAL:
         return "job-" + job["status"]
@@ -3176,7 +3176,7 @@ def reap_output_terminal_blocker(conn, job: dict, live_ids: set | None) -> str |
         return "terminal-state-unknown"
     terminal = job.get("terminal_id")
     if terminal:
-        if terminal in live_ids:
+        if terminal in live_ids and not reap_open_terminal_past_grace(job, idle):
             return "worker-terminal-still-open"
         record = row(conn, "SELECT status FROM cleanup_records WHERE terminal_id=?", (terminal,))
         if record and record["status"] != "closed":
@@ -4367,12 +4367,59 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
 
 # ---- job level: when a job's artifacts become reapable --------------------------------------------------------------
 
+def reap_live_snapshot() -> tuple:
+    """Live terminal ids and how long each has been idle, or (None, None) when the host cannot be asked (then no
+    terminal-bound job is reapable). Both come from one snapshot so a job's terminal proof cannot mix two moments."""
+    try:
+        live = live_all()
+    except (HostError, OSError):
+        return None, None
+    idle = {}
+    for terminal in live:
+        try:
+            idle[terminal["id"]] = max(0.0, float(terminal.get("idleSeconds") or 0))
+        except (TypeError, ValueError):
+            idle.pop(terminal["id"], None)  # unknown idleness never counts as idle
+    return {s["id"] for s in live}, idle
+
+
 def reap_live_ids() -> set | None:
     """Ids of live terminals, or None when the terminal host cannot be asked (then no terminal-bound job is reapable)."""
-    try:
-        return {s["id"] for s in live_all()}
-    except (HostError, OSError):
-        return None
+    return reap_live_snapshot()[0]
+
+
+def reap_idle_map(live: list) -> dict:
+    """Seconds each live terminal has been idle, from a snapshot the caller already holds."""
+    idle = {}
+    for terminal in live:
+        try:
+            idle[terminal["id"]] = max(0.0, float(terminal.get("idleSeconds") or 0))
+        except (TypeError, ValueError):
+            continue
+    return idle
+
+
+def reap_open_terminal_grace_hours(policy: dict | None = None) -> float:
+    """`reapOpenTerminalGraceHours`: how long a finished job's still-open worker terminal may stay idle before it stops
+    holding that job's folders (0 keeps every folder of a job whose terminal is open)."""
+    value = (policy or load_policy()).get("reapOpenTerminalGraceHours", 0)
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0 else 0.0
+
+
+def reap_open_terminal_past_grace(job: dict, idle: dict | None, policy: dict | None = None) -> bool:
+    """The documented rule: once the job finished `reapOpenTerminalGraceHours` ago AND its worker terminal has been idle
+    as long, that open terminal no longer holds the job's folders. The terminal itself is never closed or touched, and
+    every other proof (a live process using the folder, a retention marker, git state, the item's own settled mtime)
+    still runs. Unknown idleness or a resumed terminal keep the old wait."""
+    terminal = job.get("terminal_id")
+    hours = reap_open_terminal_grace_hours(policy)
+    finished = job.get("finished_at")
+    if not terminal or not hours or not idle or not isinstance(finished, (int, float)) or isinstance(finished, bool):
+        return False
+    grace = hours * 3600
+    idle_for = idle.get(terminal)
+    return (isinstance(idle_for, (int, float)) and not isinstance(idle_for, bool) and idle_for >= grace
+            and 0 < finished <= now() - grace)
 
 
 def reap_terminal_cleanup_state(conn, terminal: str) -> str:
@@ -4439,7 +4486,7 @@ def reap_class_git_needs(item: dict) -> tuple:
     return tuple(spec.get("git") or ())
 
 
-def reap_job_blocker(conn, job: dict, live_ids: set | None) -> str | None:
+def reap_job_blocker(conn, job: dict, live_ids: set | None, idle: dict | None = None) -> str | None:
     """Why a job's artifacts may not be touched yet; None when the job is finished, settled and its worker is gone."""
     if job["status"] not in REAP_TERMINAL:
         return f"job-{job['status']}"
@@ -4452,7 +4499,7 @@ def reap_job_blocker(conn, job: dict, live_ids: set | None) -> str | None:
     if terminal:
         if live_ids is None:
             return "terminal-state-unknown"
-        if terminal in live_ids:
+        if terminal in live_ids and not reap_open_terminal_past_grace(job, idle):
             return "worker-terminal-still-open:" + reap_terminal_cleanup_state(conn, terminal)
         record = row(conn, "SELECT status FROM cleanup_records WHERE terminal_id=?", (terminal,))
         if record and record["status"] in ("verified", "closing", "awaiting-final-reply", "unknown"):
@@ -4639,13 +4686,13 @@ def reap_job_owned(conn, job: dict, dry_run: bool, actor: str, clones: list | No
     return out
 
 
-def reap_one(conn, job: dict, live_ids: set | None, clones: list, errors: list) -> dict | None:
+def reap_one(conn, job: dict, live_ids: set | None, clones: list, errors: list, live_idle: dict | None = None) -> dict | None:
     """One finished job through the guarded reaper if it is due; the outcome, or None when it is not due or nothing ran."""
     state = reap_state(conn, job["id"])
     if reap_state_wait(state):
         return None
-    outputs_only = bool(reap_job_blocker(conn, job, live_ids))
-    if outputs_only and (reap_output_terminal_blocker(conn, job, live_ids) or not any(
+    outputs_only = bool(reap_job_blocker(conn, job, live_ids, live_idle))
+    if outputs_only and (reap_output_terminal_blocker(conn, job, live_ids, live_idle) or not any(
             reap_output_registry_present(i["path"]) for i in reap_job_items(job, clones)[0])):
         return None
     try:
@@ -4686,7 +4733,8 @@ def reap_closed_job(conn, policy: dict, job_id: str | None, actions: list, error
     except HostError:
         return  # state moved without a reaper home (tests, a second instance): reaping is off, silently
     try:
-        outcome = reap_one(conn, job, reap_live_ids(), reap_clone_roots(), errors)
+        live_ids, live_idle = reap_live_snapshot()
+        outcome = reap_one(conn, job, live_ids, reap_clone_roots(), errors, live_idle)
     except (HostError, OSError, sqlite3.Error) as error:
         errors.append({"reap": job_id, "error": str(error)})
         return
@@ -5017,7 +5065,7 @@ def evidence_expiry_tick(conn, policy: dict, live: list, actions: list, errors: 
         reap_home()
     except HostError:
         return  # state moved without a reaper home (tests, a second instance): reaping is off, silently
-    live_ids, due = {s["id"] for s in live}, []
+    live_ids, live_idle, due = {s["id"] for s in live}, reap_idle_map(live), []
     for job in rows(conn, "SELECT * FROM jobs WHERE status IN ('done','failed','cancelled') AND finished_at IS NOT NULL AND finished_at<=? ORDER BY finished_at",
                     (now() - scan_days * 86400,)):
         if len(due) >= EVIDENCE_TICK_SCANS:
@@ -5029,7 +5077,7 @@ def evidence_expiry_tick(conn, policy: dict, live: list, actions: list, errors: 
             next_at = float(saved.get("next", 0)) if saved.get("expiryRule") == [days, marked_evidence_expiry_days(policy)] else 0.0
         except (ValueError, AttributeError, TypeError):
             next_at = 0.0
-        if now() < next_at or reap_job_blocker(conn, job, live_ids):
+        if now() < next_at or reap_job_blocker(conn, job, live_ids, live_idle):
             continue
         if not os.path.isdir(reap_cache_root() / job["id"]):  # nothing to expire: no lease, no journal line
             conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",
@@ -5148,7 +5196,7 @@ def reap_tick(conn, policy: dict, live: list, actions: list, errors: list) -> No
     except (OSError, ValueError) as error:
         errors.append({"reap": "archive-partials", "error": str(error)})
     try:
-        live_ids = {s["id"] for s in live}
+        live_ids, live_idle = {s["id"] for s in live}, reap_idle_map(live)
         try:
             reap_terminal_handoff_tick(conn, live_ids, errors)
         except (HostError, OSError, ValueError, sqlite3.Error) as error:
@@ -5157,7 +5205,7 @@ def reap_tick(conn, policy: dict, live: list, actions: list, errors: list) -> No
         for job in rows(conn, "SELECT * FROM jobs WHERE status IN ('done','failed','cancelled','interrupted') ORDER BY finished_at"):
             if reap_state_wait(reap_state(conn, job["id"])):
                 continue
-            if not reap_job_blocker(conn, job, live_ids) or not reap_output_terminal_blocker(conn, job, live_ids):
+            if not reap_job_blocker(conn, job, live_ids, live_idle) or not reap_output_terminal_blocker(conn, job, live_ids, live_idle):
                 due.append(job)
         if not due:
             idle = rows(conn, "SELECT * FROM jobs WHERE status IN ('parked','blocked','interrupted')")
@@ -5215,11 +5263,12 @@ def reap_tick_owned(conn, policy: dict, live: list, actions: list, errors: list,
     except HostError:
         return  # state moved without a reaper home (tests, a second instance): reaping is off, silently
     live_ids, started, attempted, reaped = {s["id"] for s in live}, time.monotonic(), 0, False
+    live_idle = reap_idle_map(live)
     cleanup_owner = getattr(REAP_CLEANUP_OWNER, "held", None)
     for job in reap_output_job_order(due, clones):
         if attempted >= REAP_TICK_JOBS or time.monotonic() - started > REAP_TICK_SECONDS:
             break
-        outcome = reap_one(conn, job, live_ids, clones, errors)
+        outcome = reap_one(conn, job, live_ids, clones, errors, live_idle)
         held = cleanup_owner or getattr(REAP_CLEANUP_OWNER, "held", None)
         if held and held.get("stopped") and not outcome:
             return
@@ -5509,13 +5558,13 @@ def tool_reap_owned(params: dict) -> dict:
                 log_event(conn, "release.reaped", None, actor_of(params), {"reclaimedBytes": out["reclaimedBytes"], "deleted": out["deleted"], "installed": out["installed"], "rollback": out["rollback"]})
         return out
     job_id = require(params, "job")
-    live_ids = reap_live_ids()
+    live_ids, live_idle = reap_live_snapshot()
     with db() as conn:
         job = row(conn, "SELECT * FROM jobs WHERE id=?", (job_id,))
         if not job:
             raise HostError(f"no job {job_id}")
-        blocker = reap_job_blocker(conn, job, live_ids)
-        outputs_only = bool(blocker) and not reap_output_terminal_blocker(conn, job, live_ids) and any(
+        blocker = reap_job_blocker(conn, job, live_ids, live_idle)
+        outputs_only = bool(blocker) and not reap_output_terminal_blocker(conn, job, live_ids, live_idle) and any(
             reap_output_registry_present(i["path"]) for i in reap_job_items(job, reap_clone_roots())[0])
         if blocker and (not outputs_only or params.get("expireEvidence")):
             raise HostError(f"{job_id} is not reapable: {blocker}", "only finished jobs whose worker is gone are reaped; run reap-status for the state of every job")
@@ -5548,7 +5597,7 @@ def reap_audit_item(item: dict, blocker: str | None, ctx: dict, deadline: float)
     if blocker and os.path.basename(item["path"]) in REAP_OUTPUT_KINDS and reap_output_registry_present(item["path"]):
         with db() as conn:
             job = row(conn, "SELECT * FROM jobs WHERE id=?", (item["owner"],))
-            if job and not reap_output_terminal_blocker(conn, job, reap_live_ids()):
+            if job and not reap_output_terminal_blocker(conn, job, *reap_live_snapshot()):
                 blocker = None  # exact-output authority still runs; source roots never enter this branch
     if blocker in ("job-parked", "job-blocked", "job-interrupted") and item.get("class") == "job-clone-regenerable" \
             and item.get("kind") in REAP_DERIVED_KINDS:
@@ -5693,7 +5742,7 @@ def reap_audit(only: str | None, limit: int, include_items: bool, budget: int, p
     started = time.monotonic()
     deadline = started + budget
     job_deadline = started + budget * 0.8  # the rest of the budget is for the releases and agent scratch
-    live_ids = reap_live_ids()
+    live_ids, live_idle = reap_live_snapshot()
     clones = reap_clone_roots()
     ctx: dict = {"run": "audit"}
     try:
@@ -5731,7 +5780,7 @@ def reap_audit(only: str | None, limit: int, include_items: bool, budget: int, p
                     if persist:
                         reap_audit_remember(conn, job, None, [])
                     continue
-                blocker = reap_job_blocker(conn, job, live_ids)
+                blocker = reap_job_blocker(conn, job, live_ids, live_idle)
                 if not blocker and "table" not in ctx:
                     blocker = ctx.get("table_error") or "process-table-unavailable"
                 item_deadline = max(job_deadline, time.monotonic() + REAP_AUDIT_JOB_SECONDS)  # a job that was started is finished: its items are never starved

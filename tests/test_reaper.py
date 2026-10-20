@@ -553,6 +553,46 @@ class IdleJobOutput(Home):
         self.assertTrue((repo / "target").exists())
 
 
+class OpenWorkerTerminalGrace(Home):
+    """`reapOpenTerminalGraceHours`: a finished job whose worker terminal is still open stops holding that job's folders
+    once the job finished that long ago AND the terminal has been idle as long. The terminal is never closed."""
+
+    config_extra = {"policy": {"reapOpenTerminalGraceHours": 24}}
+
+    def graced_job(self, finished_ago=25 * 3600):
+        repo = self.clone("app-j0070")
+        target = self.put(repo, "target/debug/app").parent.parent
+        self.add_job("J-0070", repo, finished_ago=finished_ago)
+        with closing(self.state()) as conn, conn:
+            conn.execute("UPDATE jobs SET terminal_id='live' WHERE id='J-0070'")
+        return repo, target
+
+    def reap_live(self, idle_seconds, expect=0):
+        policy = {**core.load_policy(), "reapOpenTerminalGraceHours": 24}
+        with mock.patch.object(core, "live_all", return_value=[{"id": "live", "idleSeconds": idle_seconds}]), \
+                mock.patch.object(core, "load_policy", return_value=policy):
+            return self.cli("reap", "--job", "J-0070", expect=expect)
+
+    def test_open_terminal_idle_past_the_grace_no_longer_holds_the_output(self):
+        repo, target = self.graced_job()
+        out = self.reap_live(26 * 3600)
+        self.assertEqual(out["deleted"], 1, out)
+        self.assertFalse(target.exists())
+        self.assertTrue((repo / "README.md").exists())
+
+    def test_a_terminal_idle_for_less_than_the_grace_keeps_holding_it(self):
+        _, target = self.graced_job()
+        error = self.reap_live(3600, expect=2)
+        self.assertIn("worker-terminal-still-open", error["error"])
+        self.assertTrue(target.exists())
+
+    def test_a_job_that_finished_less_than_the_grace_ago_keeps_holding_it(self):
+        _, target = self.graced_job(finished_ago=3600)
+        error = self.reap_live(26 * 3600, expect=2)
+        self.assertIn("worker-terminal-still-open", error["error"])
+        self.assertTrue(target.exists())
+
+
 class ExpiredJobCache(Home):
     config_extra = {"policy": {"evidenceExpiryDays": 1, "cloneArchive": "keep"}}
 
