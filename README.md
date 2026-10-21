@@ -107,7 +107,7 @@ Every command prints one JSON document on stdout. Exit status:
 | `node_modules`, `.next`, `.open-next`, `.turbo`, `.astro`, `target` in a job's clone | 15 minutes after the job finishes, when git ignores the folder (untracked `.astro` metadata is also recognized without an ignore rule) and tracks nothing in it. Uncommitted or stashed work in the clone does not preserve build output that rebuilds from the source that stays |
 | `dist` in a job's clone | Once the clone itself expires (`dist` can hold a release) |
 | The whole clone | `cloneExpiryDays` (3) after every job named in it finished. Unsaved work is archived first |
-| Per-job scratch folders (`cacheRoot/J-NNNN/*`) | Tool caches (with a `CACHEDIR.TAG`) once the job finishes; anything else `evidenceExpiryDays` (14) after it finished |
+| Per-job scratch folders (`cacheRoot/J-NNNN/*`) | Tool caches (with a `CACHEDIR.TAG`) once the job finishes; anything else `evidenceExpiryDays` (14) after it finished. An interrupted job whose work a durable continuation took over counts as finished, from its verified interruption clock |
 | Screenshots, recordings, traces and logs in a job's scratch | `evidenceExpiryDays` after the job finished. Each file's name and SHA-256 are logged first |
 | Marked bulky job-cache evidence | Strictly more than `markedEvidenceExpiryDays` (5) after the job finished, only with an existing, non-empty `report.md`. Reports, summary/outcome, handoffs and receipts stay. Retained material, protected names and active claims still prevent removal |
 | Agent scratch folders (`scratchRoot/*`) | Once nothing in them changed for `evidenceExpiryDays`. Active or parked job claims preserve that task, not unrelated siblings. Off until you set `scratchRoot` |
@@ -127,6 +127,11 @@ they rebuild it when they resume. The pressure check runs during a `tick` that h
 
 - Anything of a job that is queued, approved, running, blocked, parked or interrupted, or that another job waits on
   (`job add ... --waits-on`). Exceptions are the guarded exact-output and disk-pressure rules above; neither grants permission to delete source.
+  One more exception: an interrupted job whose work a durable continuation took over (the host recorded the continuation it
+  queued, the job's own interruption clock is verified, and the whole continuation chain has finished) is treated as finished
+  work, so the ordinary evidence and clone windows release its scratch and its checkout, aged from the chain's last finish.
+  A continuation that is still queued, waiting for approval or working keeps the source's folders. Every other proof still
+  applies, and a live job that claims the folder keeps it.
 - `.env*`, `.dev.vars*`, `.wrangler` and `.vercel` local files. A clone that holds one is kept whole, and TrimReaper
   does not enter or read them. Two exceptions: env *templates* that git tracks (`.env.example`, `.env.sample`,
   `.dev.vars.template` ...) go with an expired clone, since the remote holds the same file; and with
