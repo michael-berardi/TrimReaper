@@ -2817,9 +2817,10 @@ def reap_interruption_clock(conn, job: dict) -> float | None:
         event = row(conn, "SELECT ts FROM events WHERE subject=? AND kind='job.interrupted' ORDER BY id DESC LIMIT 1", (job["id"],))
         event_stamp, finished = event.get("ts") if event else None, job.get("finished_at")
         started = job.get("started_at")
-        started = started if isinstance(started, (int, float)) and not isinstance(started, bool) else 0
+        if started is not None and (not isinstance(started, (int, float)) or isinstance(started, bool)):
+            return None  # a start clock that cannot be read proves nothing
         if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (event_stamp, finished)) \
-                and abs(event_stamp - finished) < 1 and started < event_stamp:
+                and abs(event_stamp - finished) < 1 and (started or 0) < event_stamp:
             stamp = event_stamp  # older hosts record interruption in the event log, not meta
     stamp = reap_iso_clock(stamp)
     if not isinstance(stamp, (int, float)) or isinstance(stamp, bool) or not 0 < stamp <= now():
@@ -2827,31 +2828,84 @@ def reap_interruption_clock(conn, job: dict) -> float | None:
     return stamp
 
 
-def reap_continuation_ids(conn, job_id: str) -> list[str] | None:
-    """The jobs this job's work continued in, or None when a record cannot be read.
+REAP_SUCCESSOR_CACHE: dict = {}
 
-    Two records: the continuation the host queued for it (an interrupted job's continuation, a failed job's redrive child),
-    keyed by the job id, and the successor that accepted its scope, which the host keys by the source's terminal id, so it
-    is found by the job the record names. A released scope does not end the chain: the successor is still followed, because
-    the heir that released it may still be working."""
-    ids = []
-    record = row(conn, "SELECT value FROM meta WHERE key=?", ("interrupt-heir:" + job_id,))
-    heir = record.get("value") if record else None
-    if isinstance(heir, str) and heir.strip():
-        ids.append(heir.strip())
+
+def reap_state_key(conn) -> str:
+    """The store this connection reads, so a cached read is never taken from another one."""
+    try:
+        return "|".join(str(entry[2]) for entry in conn.execute("PRAGMA database_list").fetchall() if entry[2])
+    except Exception:
+        return ""
+
+
+def reap_successor_records(conn) -> list[dict] | None:
+    """The scope handoff records, parsed once per short window: the key suffix is not relied on, the record names its job."""
+    stamp, key = time.monotonic(), reap_state_key(conn)
+    cached = REAP_SUCCESSOR_CACHE.get(("records", key))
+    if cached is not None and REAP_SUCCESSOR_CACHE.get(("at", key), 0) > stamp - 30:
+        return cached
+    records = []
     for record in rows(conn, "SELECT key, value FROM meta WHERE key LIKE 'cleanup:successor:%'"):
         try:
             proof = json.loads(record["value"])
         except (ValueError, TypeError, KeyError):
             return None  # a record that cannot be read proves nothing
-        if not isinstance(proof, dict):
+        if not isinstance(proof, dict) or not isinstance(proof.get("job"), str) or not proof["job"].strip():
             return None
+        records.append(proof)
+    REAP_SUCCESSOR_CACHE[("records", key)] = records
+    REAP_SUCCESSOR_CACHE[("at", key)] = stamp
+    return records
+
+
+def reap_resume_records(conn) -> list[dict] | None:
+    """The jobs that name a source in their own resume or redrive record, parsed once per short window."""
+    stamp, key = time.monotonic(), reap_state_key(conn)
+    cached = REAP_SUCCESSOR_CACHE.get(("resume", key))
+    if cached is not None and REAP_SUCCESSOR_CACHE.get(("resumeAt", key), 0) > stamp - 30:
+        return cached
+    records = []
+    for job in rows(conn, "SELECT id, meta FROM jobs"):
+        meta = job_meta(job)
+        for name in ("resume", "redrive", "automaticRecovery"):
+            entry = meta.get(name)
+            if isinstance(entry, dict) and isinstance(entry.get("from"), str) and entry["from"].strip():
+                records.append({"job": job["id"], "from": entry["from"].strip()})
+    REAP_SUCCESSOR_CACHE[("resume", key)] = records
+    REAP_SUCCESSOR_CACHE[("resumeAt", key)] = stamp
+    return records
+
+
+def reap_continuation_ids(conn, job_id: str) -> list[str] | None:
+    """The jobs this job's work continued in, or None when a record cannot be read.
+
+    Three records: the continuation the host queued for it (an interrupted job's continuation, a failed job's redrive child),
+    keyed by the job id; the successor that accepted its scope, which the host keys by the source's terminal id, so it is
+    found by the job the record names; and the job that names this one in its own resume or redrive record, which survives a
+    second redrive that overwrote the first record. A released scope does not end the chain: the successor is still followed,
+    because the heir that released it may still be working."""
+    ids = []
+    record = row(conn, "SELECT value FROM meta WHERE key=?", ("interrupt-heir:" + job_id,))
+    heir = record.get("value") if record else None
+    if isinstance(heir, str) and heir.strip():
+        ids.append(heir.strip())
+    records = reap_successor_records(conn)
+    if records is None:
+        return None  # a record that cannot be read proves nothing
+    for proof in records:
         if proof.get("job") != job_id:
             continue
         successor = proof.get("successor")
         if not isinstance(successor, str) or not successor.strip():
             return None
         ids.append(successor.strip())
+    resumed = reap_resume_records(conn)
+    if resumed is None:
+        return None
+    for record in resumed:
+        if record.get("from") == job_id:
+            ids.append(record["job"])
     return list(dict.fromkeys(ids))
 
 
@@ -2890,7 +2944,9 @@ def reap_chain_clock(conn, job: dict, depth: int = 0, seen: set | None = None) -
     if not isinstance(created, (int, float)) or isinstance(created, bool) or base < created:
         return None
     started = job.get("started_at")
-    if isinstance(started, (int, float)) and not isinstance(started, bool) and base < started:
+    if started is not None and (not isinstance(started, (int, float)) or isinstance(started, bool)):
+        return None  # a start clock that cannot be read proves nothing
+    if isinstance(started, (int, float)) and base < started:
         return None
     latest = base
     for successor_id in successors:
@@ -2902,7 +2958,7 @@ def reap_chain_clock(conn, job: dict, depth: int = 0, seen: set | None = None) -
             return None
         if successor_created < created:
             return None  # the continuation was queued before this job existed: it cannot be this job's continuation
-        if isinstance(started, (int, float)) and not isinstance(started, bool) and successor_created < started:
+        if isinstance(started, (int, float)) and successor_created < started:
             return None
         later = reap_chain_clock(conn, successor, depth + 1, seen)
         if later is None:
@@ -3826,6 +3882,7 @@ def reap_authority(item: dict) -> dict:
         return reap_output_authority(item)
     with db() as conn:
         jobs = {j["id"]: j for j in rows(conn, "SELECT * FROM jobs")}
+        REAP_SUCCESSOR_CACHE.clear()  # this pass decides on the records as they are now, not on a cached read
         # An interrupted job whose work a durable continuation took over is not a live claimer any more: the continuation holds
         # the work and declares its own paths. Without that record the job keeps claiming, as before.
         continued = {j["id"] for j in jobs.values() if reap_continued_interrupted(conn, j) is not None}
@@ -3861,9 +3918,9 @@ def reap_authority(item: dict) -> dict:
         if job["status"] not in REAP_TERMINAL:
             # A continued interrupted owner is finished work for its own windows, but every proof the job blocker makes
             # (settle window, live worker terminal, cleanup record, live sibling, awaited-by) still has to hold, freshly.
-            if job_id in continued:
-                if continued_blocked.get(job_id) is not None:
-                    raise ReapRefused(f"claimed-by:{job_id}({job['status']})")
+            # When it does not, the pressure path may still release the derived output, exactly as before.
+            if job_id in continued and continued_blocked.get(job_id) is None:
+                pass
             elif not reap_pressure_allows(item, job):
                 raise ReapRefused(f"claimed-by:{job_id}({job['status']})")
         # A source whose scope moved to an accepted successor stays claimed while that successor is unfinished:
@@ -3888,11 +3945,11 @@ def reap_authority(item: dict) -> dict:
     for job in jobs.values():
         if job["status"] in REAP_TERMINAL:
             continue
-        if job["id"] in continued and continued_blocked.get(job["id"]) is None:
-            continue  # a continued job whose own proofs hold is not a live claimer any more
-        if any(reap_inside(d, scope) or (independent and reap_inside(scope, d))
-               for d in reap_declared_paths(job)) and not reap_pressure_allows(item, job):
-            raise ReapRefused(f"claimed-by:{job['id']}({job['status']})")
+        continued_here = job["id"] in continued and continued_blocked.get(job["id"]) is None
+        if not continued_here:
+            if any(reap_inside(d, scope) or (independent and reap_inside(scope, d))
+                   for d in reap_declared_paths(job)) and not reap_pressure_allows(item, job):
+                raise ReapRefused(f"claimed-by:{job['id']}({job['status']})")
         wait = job_wait(job)
         if wait and wait["job"] in ids:
             raise ReapRefused(f"awaited-by:{job['id']}({job['status']})")
