@@ -76,11 +76,18 @@ The walk is bounded per folder, and the bound is on the record. `agentScratchIdl
 one folder's walk may list, `agentScratchIdleMaxBytes` (0: no byte bound) how many bytes it may see, and
 `agentScratchIdleMaxSeconds` (10) how long one walk may take; the walk also stops at the reaper's own depth cap (128
 levels). A walk that runs out of its budget is not idle: the folder is kept, and the receipt records the reason, the
-entries and bytes the walk spent, the seconds it took and the budget it had. A budget that cannot be read fails closed:
-it becomes the strictest value there is, never a more permissive one. The walk's own failures keep a folder that would
-otherwise be idle: an entry it cannot read, a root that is not a folder, a root that was swapped under the walk, a tree
-deeper than the walk may go, and expiry turned off. The proof is taken again before the removal, and a folder that
-changed in between is kept.
+entries and bytes the walk spent, the seconds it took and the budget it had. A budget stop can hide a protected name or
+a recent change further on, so raising the budget can turn `idle-budget-exceeded` into `idle-protected-leaf`. A budget
+that cannot be read fails closed: it becomes the strictest value there is, never a more permissive one. The walk's own
+failures keep a folder that would otherwise be idle: an entry it cannot read, a root that is not a folder, a root that
+was swapped under the walk, a tree deeper than the walk may go, and expiry turned off. The proof is taken again before
+the removal, and a folder that changed in between is kept.
+
+Every folder the reaper keeps says why, except the ones another gate keeps (a marker, a claim, a protected name, a git
+proof): an unmarked folder kept by its idle proof names it (`idle-recent-change`, `idle-budget-exceeded`,
+`idle-budget-time-exceeded`, `idle-budget-bytes-exceeded`, `idle-unreadable`, `idle-protected-leaf`, `idle-too-deep`,
+`idle-expiry-off`). A folder that aged out between the listing and the removal is refused as `retention-changed` and
+goes on the next pass.
 
 A folder marked `disposable` should be marked when the work is done, not when the folder is created: the marker makes
 the folder disposable whatever the proof says.

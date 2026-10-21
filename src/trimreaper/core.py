@@ -2752,8 +2752,8 @@ def reap_scratch_idle_proof(path: str, policy: dict | None = None, seconds: floa
             raise ReapRefused("walk-root-changed")
     except ReapRefused as refusal:
         proof["reason"] = str(refusal)
-    except OSError:
-        proof["reason"] = "unreadable"
+    except OSError as error:
+        proof["reason"], proof["detail"] = "unreadable", f"oserror:{getattr(error, 'errno', 0)}"
     proof["elapsed"] = round(time.monotonic() - started, 3)
     if proof["reason"] and proof["reason"] not in ("recent-change", "protected-leaf", "budget-exceeded", "budget-time-exceeded",
                                                    "budget-bytes-exceeded", "too-deep"):
@@ -4482,7 +4482,7 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
     apply = mode == "delete"
     result = {"path": item.get("path"), "owner": item.get("owner"), "class": item.get("class"), "kind": item.get("kind"),
               "ownership": item.get("ownership"), "retention": item.get("retention"), "bytes": None, "bytesIncomplete": False, "sizeReason": None, "archive": None, "checks": [], "preserved": [],
-              "idleProof": None, "outcome": "refused", "reason": None}
+              "outcome": "refused", "reason": None}
     checks = result["checks"]
     cleanup_owner = getattr(REAP_CLEANUP_OWNER, "held", None)
     with ExitStack() as stack:
@@ -4503,6 +4503,7 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
                 # not taken now: the next pass lists it as disposable and removes it, so a removal receipt always says so.
                 proof = reap_scratch_idle_proof(item["path"], seconds=item.get("idleSeconds"))
                 item["idleProof"], result["idleProof"] = proof, proof
+                item["idleSeconds"] = max(0.0, float(item.get("idleSeconds") or 0) - proof["elapsed"])  # what is left of it
                 if proof["idle"]:
                     raise ReapRefused("retention-changed")
                 raise ReapRefused(reap_item_idle_reason(item))
@@ -4536,6 +4537,8 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
             retention = reap_retention(item)  # established now, from the directory itself: the declared value is only a claim
             if item.get("class") == "agent-scratch":
                 result["idleProof"] = item.get("idleProof")  # the proof this call just took, with the budget it spent
+                if isinstance(item.get("idleProof"), dict):
+                    item["idleSeconds"] = max(0.0, float(item.get("idleSeconds") or 0) - item["idleProof"].get("elapsed", 0.0))
             if retention != REAP_DISPOSABLE:
                 if item.get("class") == "agent-scratch" and retention == "unmarked":
                     raise ReapRefused(reap_item_idle_reason(item))
@@ -6012,7 +6015,7 @@ def reap_audit_item(item: dict, blocker: str | None, ctx: dict, deadline: float)
         finally:
             REAP_PRESSURE.on = previous_pressure
         entry = {"state": "reapable" if done["outcome"] == "would-delete" else "blocked", "blocking": done["reason"]}
-        if done.get("idle"):
+        if done.get("idleProof"):
             entry["idleProof"] = done["idleProof"]  # the folder's own idle proof: its reason and the budget the walk spent
         if done.get("archive"):
             entry["archive"] = str(done["archive"].get("reason", "")).split(":")[0]  # reapable once archived first
