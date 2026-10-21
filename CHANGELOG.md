@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.7 (2026-10-21)
+
+- The audit's cached view is a hint, never an authority. When a sizing pass runs out of budget, the jobs it did not reach are shown from an earlier pass for up to a day, and every path in that view is now proved again, metadata only, before it can count. A path that is gone counts for nothing at all; a path that cannot be read, that was replaced or that is a link now is kept, is never reported as reapable and is never sized again. Nothing else moves: the fresh audit, every removal gate and every authority stay exactly as they were.
+
 ## 0.6.6 (2026-10-20)
 
 - The names that keep a job's material are a class, not a spelling. A record (`report`, `summary`, `outcome`, `handoff`, `receipts`) in any position and any number, a camelCase name (`AppleCerts`, `SubscriptionKey_X.p8`), a retained class (customer, release, runtime, rollback, credential, secret, signing, entitlement, keychain, provisioning, certificate, token, key, ssh, gpg, cloud and OAuth material) and a key, certificate or profile extension (`.p8`, `.pem`, `.pfx`, `.cer`, `.crt`, `.key`, `.csr`, `.jks`, `.keystore`, `.p7b`, `.p7c`, `.srl`, `.mobileprovision`, `.ovpn`, `.ppk`, `.app`, `.dmg`, `.pkg`, `.ipa`, `.zip`, `.tgz`, `.xcarchive`, `.sig`, `.asc`) are all retained. A folder is kept whole when such a name appears anywhere below it, because a job cache subdirectory is removed as a unit and its top-level name alone cannot prove it holds no key material. Over-retention is the safe answer: a name that cannot be judged keeps the folder.

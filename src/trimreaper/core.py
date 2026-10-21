@@ -5680,7 +5680,7 @@ def reap_audit_item(item: dict, blocker: str | None, ctx: dict, deadline: float)
     if size is None or not complete:
         entry["sizeIncomplete"] = True
         entry["sizeReason"] = size_reason or "size-unknown"
-    return {**base, **entry, "mtime": iso(info.st_mtime)}
+    return {**base, **entry, "mtime": iso(info.st_mtime), "dev": info.st_dev, "ino": info.st_ino}
 
 
 # Every reason an item is kept, as an action the operator (or a later tick) can take. reap-status prints the line for each reason
@@ -5722,6 +5722,10 @@ REAP_REASON_ACTIONS = {
     "size-time-limit": "sizing hit its time limit this pass: the reaper's own pass doubles the budget each attempt (up to 8x) until it completes",
     "size-entry-limit": "too many entries to size this pass: the reaper's own pass doubles the entry budget each attempt (up to 8x) until it completes",
     "audit-pending": "not audited yet this cycle: reap-status resumes at its cursor on the next call and tick",
+    "audit-path-unreadable": "the path could not be read again after the cached audit: kept; the next pass audits it anew",
+    "audit-path-unknown": "the path could not be proved again after the cached audit: kept; the next pass audits it anew",
+    "audit-path-changed": "the path is a different object than the cached audit saw: kept; the next pass audits it anew",
+    "audit-path-symlink": "the path is a link now, not the audited folder: kept; the next pass audits it anew",
 }
 
 
@@ -5763,7 +5767,7 @@ def reap_audit_cursor(conn) -> dict:
 
 def reap_audit_remember(conn, job: dict, blocker: str | None, entries: list) -> None:
     """The job's audit, compact, for the passes whose budget ends before they reach it (shown as cached, never as a block)."""
-    keep = ("path", "class", "kind", "state", "blocking", "bytes", "sizeIncomplete", "sizeReason", "archive", "mtime")
+    keep = ("path", "class", "kind", "state", "blocking", "bytes", "sizeIncomplete", "sizeReason", "archive", "mtime", "dev", "ino")
     conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", ("reap:audit:" + job["id"], json.dumps(
         {"at": now(), "status": job["status"], "blocking": blocker, "entries": [{k: e[k] for k in keep if k in e} for e in entries]})))
 
@@ -5777,6 +5781,36 @@ def reap_audit_cached(conn, job: dict) -> dict | None:
     if not isinstance(found, dict) or found.get("status") != job["status"] or now() - found.get("at", 0) > REAP_AUDIT_CACHE_SECONDS:
         return None
     return found
+
+
+def reap_audit_revalidate(entry: dict) -> dict | None:
+    """Metadata-only proof that a cached entry still names the same object. A path that is gone is dropped: it counts for
+    nothing, neither as reapable nor as bytes. A path that cannot be read, is a link now, or is a different object than
+    the one the cached audit saw is kept but never reapable and never sized again: a cached audit is a hint, never an
+    authority, and the revalidation reads no content and enters no folder."""
+    path = entry.get("path")
+    if not path:
+        return None
+    try:
+        info = os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except PermissionError:
+        return {**entry, "state": "blocked", "blocking": "audit-path-unreadable", "bytes": 0,
+                "sizeIncomplete": True, "sizeReason": "path-unreadable"}
+    except OSError:
+        return {**entry, "state": "blocked", "blocking": "audit-path-unknown", "bytes": 0,
+                "sizeIncomplete": True, "sizeReason": "path-unknown"}
+    if stat.S_ISLNK(info.st_mode):
+        return {**entry, "state": "blocked", "blocking": "audit-path-symlink", "bytes": 0,
+                "sizeIncomplete": True, "sizeReason": "path-symlink"}
+    known = "dev" in entry and "ino" in entry
+    same_object = not known or (entry["dev"] == info.st_dev and entry["ino"] == info.st_ino)
+    same_time = not entry.get("mtime") or entry["mtime"] == iso(info.st_mtime)
+    if not (same_object and same_time):
+        return {**entry, "state": "blocked", "blocking": "audit-path-changed", "bytes": 0,
+                "sizeIncomplete": True, "sizeReason": "path-changed"}
+    return entry
 
 
 def reap_audit(only: str | None, limit: int, include_items: bool, budget: int, persist: bool = False, after: str | None = None) -> dict:
@@ -5799,6 +5833,7 @@ def reap_audit(only: str | None, limit: int, include_items: bool, budget: int, p
         ctx["table_error"] = str(refusal)
     listed, categories, reasons, reason_bytes, incomplete, seen = [], {}, {}, {}, [], set()
     pending, cached_jobs, last_done, cycle_done, handoff, fresh = [], 0, None, True, [], 0
+    gone_paths, unknown_paths = 0, 0
     with db() as conn:
         jobs = rows(conn, "SELECT * FROM jobs WHERE id=?", (only,)) if only else rows(conn, "SELECT * FROM jobs ORDER BY id")
         known = {j["id"] for j in rows(conn, "SELECT id FROM jobs")}
@@ -5815,7 +5850,15 @@ def reap_audit(only: str | None, limit: int, include_items: bool, budget: int, p
                 if cached is None:
                     pending.append(job["id"])
                     continue
-                blocker, entries, note = cached.get("blocking"), [e for e in cached["entries"] if e["path"] not in seen], cached
+                blocker, entries, note = cached.get("blocking"), [], cached
+                for entry in [e for e in cached["entries"] if e["path"] not in seen]:
+                    kept = reap_audit_revalidate(entry)
+                    if kept is None:
+                        gone_paths += 1
+                    else:
+                        if kept.get("state") != entry.get("state"):
+                            unknown_paths += 1
+                        entries.append(kept)
                 cached_jobs += 1
             else:
                 fresh += 1
@@ -5879,6 +5922,9 @@ def reap_audit(only: str | None, limit: int, include_items: bool, budget: int, p
     if pending or cached_jobs:
         incomplete.append(f"audit budget of {budget}s reached: {len(pending)} job(s) not audited yet (pending, not blocked), {cached_jobs} shown from an earlier pass; "
                           "the next reap-status call and the tick resume at the persisted cursor")
+    if gone_paths or unknown_paths:
+        incomplete.append(f"cached audit: {gone_paths} path(s) are gone and {unknown_paths} path(s) could not be proved again "
+                          "(unreadable, replaced or a link now): none of them is counted as reapable")
     return {"metadataOnly": True, "deleted": 0, "at": iso(), "elapsedSeconds": round(time.monotonic() - started, 1), "dfFreeBytes": reap_free_bytes(),
             "summary": {"categories": categories, "unreapedBytes": sum(c["bytes"] for c in categories.values()),
                         "reapableBytes": sum(c["reapableBytes"] for c in categories.values()),

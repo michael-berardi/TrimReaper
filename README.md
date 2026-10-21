@@ -49,6 +49,8 @@ trimreaper reap --job J-0042
 trimreaper tick
 ```
 
+`trimreaper status --items` is a metadata-only audit: it deletes nothing. When a pass runs out of time, the jobs it did not reach are shown from an earlier pass and marked `cached`; every path in that earlier view is proved again (metadata only) before it counts, so a path that is gone is never reported as reapable.
+
 `tick` runs once and exits. `trimreaper schedule install` runs it every 30 minutes with launchd (macOS); elsewhere,
 call it from cron or your agent loop. At 85% used, `tick` also runs `trimreaper clean`, targeting 80% used.
 While pressure remains, it retries at most once per ten minutes until the measured 80% goal is met. Changed job-release events can also trigger a retry after that cooldown.

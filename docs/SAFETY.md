@@ -50,6 +50,15 @@ finishes, in case it is resumed. A **build queue** is any tool that takes a per-
 15. **After.** The identities of protected files next to the item are re-taken. Any difference stops the whole sweep.
     The result receipt is written while the locks are still held.
 
+## The metadata-only audit
+
+`trimreaper status --items` removes nothing and takes no lock it would have to create. When a sizing pass runs out of budget,
+the jobs it did not reach are shown from an earlier pass, marked `cached`. That view is a hint, never an authority: every path
+in it is proved again, metadata only, before it can count as reapable. A path that is gone counts for nothing; a path that
+cannot be read, that was replaced or that is a link now is kept, is never reported as reapable and is never sized again. The
+revalidation reads no content, enters no folder and spends no sizing budget. No removal gate changes: the audit never
+authorizes a removal, and every removal is proved again, freshly, by the reaper itself.
+
 ## Narrow exact-output route
 
 `job-derived-output` still uses `reap_item`, receipts, descriptor removal and all final checks. Unlike a source-root
