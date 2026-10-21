@@ -12,7 +12,7 @@ Paths are absolute or start with `~/`. Here `~` is the reap home (`home`), not t
 | `cloneBases` | `[{"path": "~/dev"}]` | Folders that hold job clones. A clone is a direct child whose name carries a job number (`app-j0042`, `j0042-app`). With `"prefix": ".j"` a base only counts children whose names start with the prefix. |
 | `cacheRoot` | `~/.cache/trimreaper/jobs` | Per-job scratch: `cacheRoot/J-0042/<anything>`. |
 | `archiveRoot` | `~/.cache/trimreaper/archive` | Where unsaved work is archived before an expired folder goes. Created owner-only (0700). |
-| `scratchRoot` | off | Agent scratch outside any job: `scratchRoot/<task>`. Each folder goes once nothing in it changed for `evidenceExpiryDays`. |
+| `scratchRoot` | off | Agent scratch outside any job: `scratchRoot/<task>`. Each folder goes once nothing in it changed for `evidenceExpiryDays`. The idle proof covers the whole tree: every entry's mtime is read, never following a link, and the folder's own per-folder budget bounds the walk. |
 | `releaseRoot` | off | Release candidates: `releaseRoot/<version>/...`. A Rust `target` folder of a version older than the installed one goes when it carries the `disposable` marker (a build queue writes it; `trimreaper mark <folder> disposable` by hand). |
 | `releaseEvidenceRoot` | off | Per-version release evidence: `releaseEvidenceRoot/<version>` for the app, `releaseEvidenceRoot/<product>-<version>` for its components. App versions older than the installed one go, except the rollback; each component keeps its newest two. |
 | `release.installedApp`, `release.rollbackApp` | unset | macOS app bundles whose versions are kept: the installed version, the single rollback, and anything newer than installed. While either is unknown, every release candidate and every app-version evidence folder is kept. |
@@ -41,6 +41,8 @@ Paths are absolute or start with `~/`. Here `~` is the reap home (`home`), not t
 | `cleanFloorGB` | `10` | At or above the high watermark, further decline below this free-space floor counts as new pressure. |
 | `projectIdleHours` | `48` | A project's dependency and output folders (`node_modules`, `.next`, `.venv` ...) are removed by `clean` after this many hours without a change in the project; a copy named after a finished job needs 6. `0` keeps them all. |
 | `worktreeIdleDays` | `7` | A linked git worktree no job owns is removed by `clean` after this many days without a change, and every other check. `0` keeps them all. |
+| `agentScratchIdleMaxEntries` | `200000` | How many entries one agent-scratch folder's idle walk may list. A folder that outgrows its budget is kept, and the receipt names the budget the walk spent. A whole number of at least 1. |
+| `agentScratchIdleMaxBytes` | `0` | How many bytes one agent-scratch folder's idle walk may see. `0` is no byte bound at all: bytes bound no work, so the entry budget is what limits the walk. A folder that outgrows a bound you set is kept, and the receipt names the bound and what the walk spent. A whole number of at least 0. |
 
 ## Jobs
 
