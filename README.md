@@ -131,7 +131,8 @@ they rebuild it when they resume. The pressure check runs during a `tick` that h
   queued, the job's own interruption clock is verified, and the whole continuation chain has finished) is treated as finished
   work, so the ordinary evidence and clone windows release its scratch and its checkout, aged from the chain's last finish.
   A continuation that is still queued, waiting for approval or working keeps the source's folders. Every other proof still
-  applies, and a live job that claims the folder keeps it.
+  applies, and a live job that claims the folder keeps it. Its own evidence files (screenshots, recordings, traces, logs) still
+  expire only through the host's evidence tick, which walks the finished jobs.
 - `.env*`, `.dev.vars*`, `.wrangler` and `.vercel` local files. A clone that holds one is kept whole, and TrimReaper
   does not enter or read them. Two exceptions: env *templates* that git tracks (`.env.example`, `.env.sample`,
   `.dev.vars.template` ...) go with an expired clone, since the remote holds the same file; and with
