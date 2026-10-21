@@ -2,7 +2,7 @@
 
 ## 0.6.7 (2026-10-21)
 
-- The audit's cached view is a hint, never an authority. When a sizing pass runs out of budget, the jobs it did not reach are shown from an earlier pass for up to a day, and every path in that view is now proved again, metadata only, before it can count. A path that is gone counts for nothing at all; a path that cannot be read, that was replaced or that is a link now is kept, is never reported as reapable and is never sized again. Nothing else moves: the fresh audit, every removal gate and every authority stay exactly as they were.
+- The audit's cached view is a hint, never an authority. When a sizing pass runs out of budget, the jobs it did not reach are shown from an earlier pass for up to a day, and every path in that view is now proved again, metadata only, before it can count. A path that is gone counts for nothing at all; a path that cannot be read, that was replaced or that is a link now is kept, is never reported as reapable and is never sized again. Older cached entries without device, inode or mtime proof are also kept with unknown size until a fresh audit refreshes them. Nothing else moves: the fresh audit, every removal gate and every authority stay exactly as they were.
 
 ## 0.6.6 (2026-10-20)
 

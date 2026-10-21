@@ -5804,9 +5804,11 @@ def reap_audit_revalidate(entry: dict) -> dict | None:
     if stat.S_ISLNK(info.st_mode):
         return {**entry, "state": "blocked", "blocking": "audit-path-symlink", "bytes": 0,
                 "sizeIncomplete": True, "sizeReason": "path-symlink"}
-    known = "dev" in entry and "ino" in entry
-    same_object = not known or (entry["dev"] == info.st_dev and entry["ino"] == info.st_ino)
-    same_time = not entry.get("mtime") or entry["mtime"] == iso(info.st_mtime)
+    if any(entry.get(key) is None for key in ("dev", "ino", "mtime")):
+        return {**entry, "state": "blocked", "blocking": "audit-path-unknown", "bytes": 0,
+                "sizeIncomplete": True, "sizeReason": "path-unknown"}
+    same_object = entry["dev"] == info.st_dev and entry["ino"] == info.st_ino
+    same_time = entry["mtime"] == iso(info.st_mtime)
     if not (same_object and same_time):
         return {**entry, "state": "blocked", "blocking": "audit-path-changed", "bytes": 0,
                 "sizeIncomplete": True, "sizeReason": "path-changed"}

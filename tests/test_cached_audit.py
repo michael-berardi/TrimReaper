@@ -152,6 +152,51 @@ class CachedAudit(Home):
         self.assertEqual(item["bytes"], 0)
         self.assertEqual(after["summary"]["reapableBytes"], kept["bytes"])
 
+    def test_a_legacy_cache_without_identity_is_never_reapable(self):
+        with closing(self.state()) as conn, conn:
+            stored = conn.execute("SELECT value FROM meta WHERE key='reap:audit:J-0101'").fetchone()
+            cached = json.loads(stored[0])
+            for entry in cached["entries"]:
+                entry.pop("dev")
+                entry.pop("ino")
+            conn.execute("UPDATE meta SET value=? WHERE key='reap:audit:J-0101'", (json.dumps(cached),))
+
+        after = self.audit()
+
+        self.assertEqual(after["summary"]["reapableBytes"], 0)
+        for path in (self.repo / "target", self.repo / "node_modules"):
+            item = self.entry(after, path)
+            self.assertEqual(item["state"], "blocked")
+            self.assertEqual(item["blocking"], "audit-path-unknown")
+            self.assertEqual(item["bytes"], 0)
+        fresh = core.reap_audit(None, 40, True, 60, persist=True)
+        self.assertEqual(fresh["summary"]["reapableBytes"], self.first["summary"]["reapableBytes"])
+        self.assertEqual(self.audit()["summary"]["reapableBytes"], self.first["summary"]["reapableBytes"])
+
+    def test_identity_is_checked_even_when_the_mtime_matches(self):
+        target = self.repo / "target"
+        before = self.entry(self.first, target)
+        target.rename(self.repo / "old-target")  # retain the old inode so it cannot be reused
+        target.mkdir()
+        old = os.lstat(self.repo / "old-target")
+        os.utime(target, ns=(old.st_atime_ns, old.st_mtime_ns))
+
+        item = self.entry(self.audit(), target)
+
+        self.assertEqual(item["mtime"], before["mtime"])
+        self.assertEqual(item["state"], "blocked")
+        self.assertEqual(item["blocking"], "audit-path-changed")
+        self.assertEqual(item["bytes"], 0)
+
+    def test_missing_metadata_cannot_prove_a_cached_object(self):
+        before = self.entry(self.first, self.repo / "target")
+        for key in ("dev", "ino", "mtime"):
+            with self.subTest(key=key):
+                entry = {k: value for k, value in before.items() if k != key}
+                result = core.reap_audit_revalidate(entry)
+                self.assertEqual(result["blocking"], "audit-path-unknown")
+                self.assertEqual(result["bytes"], 0)
+
     def test_the_cached_audit_spends_no_sizing_budget(self):
         sized: list[str] = []
         real = core.reap_metadata_size
