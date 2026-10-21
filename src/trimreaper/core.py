@@ -1398,7 +1398,8 @@ def marked_evidence_job(job_id: str) -> bool:
         return False
     with db() as conn:
         job = row(conn, "SELECT * FROM jobs WHERE id=?", (job_id,))
-    if not job or job["status"] not in REAP_TERMINAL or not job.get("finished_at") or job["finished_at"] >= now() - days * 86400:
+        clock = reap_job_finished_clock(conn, job) if job else None
+    if not job or not clock or clock >= now() - days * 86400:
         return False
     try:
         fd = os.open(str(reap_cache_root() / job_id), REAP_ROOT_FLAGS)
@@ -1752,13 +1753,19 @@ def reap_archive_on() -> bool:
 
 
 def reap_jobs_finished_before(ids: list, seconds: float) -> bool:
-    """Every job named finished (done/failed/cancelled) at least `seconds` ago."""
+    """Every job named finished (done/failed/cancelled, or interrupted with a durable continuation) at least `seconds` ago."""
     ids = [i for i in ids if i]
     if not ids:
         return False
     with db() as conn:
-        found = [row(conn, "SELECT status, finished_at FROM jobs WHERE id=?", (i,)) for i in ids]
-    return all(j and j["status"] in REAP_TERMINAL and j["finished_at"] and now() - j["finished_at"] >= seconds for j in found)
+        found = [row(conn, "SELECT * FROM jobs WHERE id=?", (i,)) for i in ids]
+        for job in found:
+            if not job:
+                return False
+            clock = reap_job_finished_clock(conn, job)
+            if not clock or now() - clock < seconds:
+                return False
+    return True
 
 
 def reap_archive_eligible(item: dict) -> bool:
@@ -2629,23 +2636,34 @@ def reap_archive_create_owned(item: dict, plan: dict, repos: list, git_dirs: lis
 
 def reap_recent_users(scope: str, ids: list, seconds: float) -> list[str]:
     """Finished jobs that are not among `ids` but declared a cwd or worktree inside `scope` and finished less than `seconds` ago
-    (or have no finish time yet): a later job that worked in an earlier job's clone extends that clone's expiry."""
+    (or have no finish time yet): a later job that worked in an earlier job's clone extends that clone's expiry. An interrupted
+    job whose continuation chain has finished counts with its chain's last finish, so a clone it worked in does not expire early."""
     marks = ",".join("?" * len(REAP_TERMINAL))
+    cutoff = now() - seconds
     with db() as conn:
-        recent = rows(conn, f"SELECT * FROM jobs WHERE status IN ({marks}) AND (finished_at IS NULL OR finished_at > ?)", (*REAP_TERMINAL, now() - seconds))
+        recent = rows(conn, f"SELECT * FROM jobs WHERE status IN ({marks}) AND (finished_at IS NULL OR finished_at > ?)", (*REAP_TERMINAL, cutoff))
+        for job in rows(conn, "SELECT * FROM jobs WHERE status='interrupted'"):
+            clock = reap_continued_interrupted(conn, job)
+            if clock is not None and clock > cutoff:
+                recent.append(job)
     return [j["id"] for j in recent if j["id"] not in ids and any(reap_inside(d, scope) for d in reap_declared_paths(j))]
 
 
 def reap_clone_expired(ids: list, scope: str | None = None) -> bool:
-    """Every job the clone is named for finished (done/failed/cancelled) at least cloneExpiryDays ago, and (with `scope`, the clone's
-    path) no other job that declared that folder as its cwd or worktree finished more recently than that."""
+    """Every job the clone is named for finished (done/failed/cancelled, or interrupted with a durable continuation) at least
+    cloneExpiryDays ago, and (with `scope`, the clone's path) no other job that declared that folder as its cwd or worktree
+    finished more recently than that."""
     days = load_policy().get("cloneExpiryDays", 3)
     if not ids or not isinstance(days, int) or isinstance(days, bool) or days <= 0:
         return False
     with db() as conn:
-        found = [row(conn, "SELECT status, finished_at FROM jobs WHERE id=?", (i,)) for i in ids]
-    if not all(j and j["status"] in REAP_TERMINAL and j["finished_at"] and now() - j["finished_at"] >= days * 86400 for j in found):
-        return False
+        found = [row(conn, "SELECT * FROM jobs WHERE id=?", (i,)) for i in ids]
+        for job in found:
+            if not job:
+                return False
+            clock = reap_job_finished_clock(conn, job)
+            if not clock or now() - clock < days * 86400:
+                return False
     return not (scope and reap_recent_users(scope, ids, days * 86400))
 
 
@@ -2754,14 +2772,180 @@ def reap_cachedir_tagged(path: str) -> bool:
         return False
 
 
+# ---- an interrupted job whose work a durable continuation took over ---------------------------------------------------
+# A job whose worker terminal vanished without a report stays `interrupted`: it never reported, so the ordinary terminal rules
+# do not release its folders, and it kept them for good. A host that continues such a job records the continuation it queued
+# (the same durable record it re-points the interrupted job's dependents with). With that record the old job holds nothing the
+# continuation still needs, so its artifacts age exactly like a finished job's: the evidence window releases its scratch, the
+# clone window releases its checkout. Every other proof (retention, protected leaves, git, other jobs' claims, a live worker
+# terminal, producer locks) still runs. Without a provable interruption, without a continuation record, or with a record naming
+# a continuation that does not exist, the job keeps everything, exactly as before.
+
+def reap_iso_clock(stamp):
+    """A zoned ISO-8601 clock as seconds since the epoch; a number unchanged; None when it is neither."""
+    if isinstance(stamp, str):
+        # UltraTerm interruption records use ISO timestamps. Require an explicit timezone;
+        # never infer local time, parse numeric strings or substitute a creation/update clock.
+        try:
+            match = re.fullmatch(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d{1,6})?(Z|[+-]\d{2}:\d{2})", stamp)
+            if not match:
+                raise ValueError("not a zoned ISO timestamp")
+            clock = time.strptime(match[1], "%Y-%m-%dT%H:%M:%S")
+            zone = match[3]
+            if clock.tm_sec > 59 or (zone != "Z" and (int(zone[1:3]) > 23 or int(zone[4:6]) > 59)):
+                raise ValueError("invalid timestamp")
+            # Gregorian ordinal arithmetic avoids local timezone/DST inference and adds
+            # no new module dependency to the byte-for-byte embedded engine.
+            year = clock.tm_year - 1
+            days = 365 * year + year // 4 - year // 100 + year // 400 + clock.tm_yday - 1 - 719162
+            offset = 0 if zone == "Z" else (int(zone[1:3]) * 60 + int(zone[4:6])) * 60 * (1 if zone[0] == "+" else -1)
+            return days * 86400 + clock.tm_hour * 3600 + clock.tm_min * 60 + clock.tm_sec + float(match[2] or 0) - offset
+        except (ValueError, OverflowError):
+            return None
+    return stamp
+
+
+def reap_interruption_clock(conn, job: dict) -> float | None:
+    """When the worker of an interrupted job vanished: the job's own interruption record, or the matching
+    job.interrupted event. Never an unrelated finish clock; None when nothing proves the interruption."""
+    if job.get("status") != "interrupted":
+        return None
+    meta = job_meta(job)
+    interrupted = meta.get("interrupted")
+    stamp = interrupted.get("at") if isinstance(interrupted, dict) else None
+    if "interrupted" not in meta:
+        event = row(conn, "SELECT ts FROM events WHERE subject=? AND kind='job.interrupted' ORDER BY id DESC LIMIT 1", (job["id"],))
+        event_stamp, finished = event.get("ts") if event else None, job.get("finished_at")
+        started = job.get("started_at")
+        started = started if isinstance(started, (int, float)) and not isinstance(started, bool) else 0
+        if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (event_stamp, finished)) \
+                and abs(event_stamp - finished) < 1 and started < event_stamp:
+            stamp = event_stamp  # older hosts record interruption in the event log, not meta
+    stamp = reap_iso_clock(stamp)
+    if not isinstance(stamp, (int, float)) or isinstance(stamp, bool) or not 0 < stamp <= now():
+        return None
+    return stamp
+
+
+def reap_continuation_ids(conn, job_id: str) -> list[str] | None:
+    """The jobs this job's work continued in, or None when a record cannot be read.
+
+    Two records: the continuation the host queued for it (an interrupted job's continuation, a failed job's redrive child),
+    keyed by the job id, and the successor that accepted its scope, which the host keys by the source's terminal id, so it
+    is found by the job the record names. A released scope does not end the chain: the successor is still followed, because
+    the heir that released it may still be working."""
+    ids = []
+    record = row(conn, "SELECT value FROM meta WHERE key=?", ("interrupt-heir:" + job_id,))
+    heir = record.get("value") if record else None
+    if isinstance(heir, str) and heir.strip():
+        ids.append(heir.strip())
+    for record in rows(conn, "SELECT key, value FROM meta WHERE key LIKE 'cleanup:successor:%'"):
+        try:
+            proof = json.loads(record["value"])
+        except (ValueError, TypeError, KeyError):
+            return None  # a record that cannot be read proves nothing
+        if not isinstance(proof, dict):
+            return None
+        if proof.get("job") != job_id:
+            continue
+        successor = proof.get("successor")
+        if not isinstance(successor, str) or not successor.strip():
+            return None
+        ids.append(successor.strip())
+    return list(dict.fromkeys(ids))
+
+
+def reap_chain_clock(conn, job: dict, depth: int = 0, seen: set | None = None) -> float | None:
+    """The latest finish in a job's continuation chain, or None while any job in that chain is still live.
+
+    Every job in the chain counts, whatever its status: the continuation the host queued for it and the successor that
+    accepted its scope. A job that is queued, approved, running, blocked or parked is still live, so the work it holds is
+    not finished and the source keeps everything. A missing job, a cycle, a chain deeper than the cap or a clock that
+    cannot be proved keeps everything too."""
+    if depth > 8:
+        return None
+    job_id = job.get("id")
+    if not isinstance(job_id, str) or not job_id:
+        return None
+    seen = seen if seen is not None else set()
+    if job_id in seen:
+        return None  # a cycle proves nothing
+    seen.add(job_id)
+    successors = reap_continuation_ids(conn, job_id)
+    if successors is None:
+        return None
+    if job.get("status") == "interrupted":
+        base = reap_interruption_clock(conn, job)
+        if base is None or not successors:
+            return None  # an interrupted job without a continuation never finished
+    elif job.get("status") in REAP_TERMINAL:
+        base = job.get("finished_at")
+        if not isinstance(base, (int, float)) or isinstance(base, bool) or base <= 0:
+            return None
+    else:
+        return None  # a live job in the chain
+    # The clock must belong to this job's own lifetime: after the job was created, and after it started when the host
+    # recorded a start. A job with no recorded start is anchored on its creation.
+    created = job.get("created_at")
+    if not isinstance(created, (int, float)) or isinstance(created, bool) or base < created:
+        return None
+    started = job.get("started_at")
+    if isinstance(started, (int, float)) and not isinstance(started, bool) and base < started:
+        return None
+    latest = base
+    for successor_id in successors:
+        successor = row(conn, "SELECT * FROM jobs WHERE id=?", (successor_id,))
+        if not successor:
+            return None
+        successor_created = successor.get("created_at")
+        if not isinstance(successor_created, (int, float)) or isinstance(successor_created, bool):
+            return None
+        if successor_created < created:
+            return None  # the continuation was queued before this job existed: it cannot be this job's continuation
+        if isinstance(started, (int, float)) and not isinstance(started, bool) and successor_created < started:
+            return None
+        later = reap_chain_clock(conn, successor, depth + 1, seen)
+        if later is None:
+            return None
+        latest = max(latest, later)
+    return latest
+
+
+def reap_continued_interrupted(conn, job: dict) -> float | None:
+    """The clock from which an interrupted job's artifacts may age, else None.
+
+    The continuation record is the host's own: the id of the job it queued to continue the interrupted one. The whole
+    continuation chain must have finished: a continuation that is still queued, waiting for approval or working may still
+    need the source's folders, so the source keeps everything until that work is done. The clock is the latest finish in
+    the chain (the source's own interruption, then every continuation's), so nothing ages before the last work stopped.
+
+    A record that names a continuation that does not exist, or a chain that never ends, proves nothing: the job keeps
+    everything, exactly as before."""
+    if job.get("status") != "interrupted":
+        return None
+    return reap_chain_clock(conn, job)
+
+
+def reap_job_finished_clock(conn, job: dict) -> float | None:
+    """When a job's artifacts may start aging: its finish time, or the clock of an interrupted job whose whole continuation
+    chain has finished. None while the job is still live (nothing may age)."""
+    if job.get("status") in REAP_TERMINAL:
+        return job.get("finished_at")
+    return reap_continued_interrupted(conn, job)
+
+
 def reap_scratch_expired(job_id: str | None) -> bool:
-    """The job finished (done/failed/cancelled) at least evidenceExpiryDays ago."""
+    """The job finished (done/failed/cancelled, or interrupted with a durable continuation) at least
+    evidenceExpiryDays ago."""
     days = evidence_expiry_days(load_policy())
     if not job_id or not days:
         return False
     with db() as conn:
-        job = row(conn, "SELECT status, finished_at FROM jobs WHERE id=?", (job_id,))
-    return bool(job) and job["status"] in REAP_TERMINAL and bool(job["finished_at"]) and now() - job["finished_at"] >= days * 86400
+        job = row(conn, "SELECT * FROM jobs WHERE id=?", (job_id,))
+        if not job:
+            return False
+        clock = reap_job_finished_clock(conn, job)
+    return bool(clock) and now() - clock >= days * 86400
 
 
 # ---- protected leaves: identities before and after, from lstat and listings only -------------------------------------
@@ -3191,33 +3375,9 @@ def reap_output_terminal_blocker(conn, job: dict, live_ids: set | None, idle: di
     if job["status"] == "interrupted":
         # Explicit clocks supersede finished_at. Older hosts need a matching
         # interruption event, never an unrelated stale finish clock.
-        interrupted = job_meta(job).get("interrupted")
-        stamp = interrupted.get("at") if isinstance(interrupted, dict) else None
-        if "interrupted" not in job_meta(job):
-            event = row(conn, "SELECT ts FROM events WHERE subject=? AND kind='job.interrupted' ORDER BY id DESC LIMIT 1", (job["id"],))
-            event_stamp, finished = event.get("ts") if event else None, job.get("finished_at")
-            if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (event_stamp, finished)) \
-                    and abs(event_stamp - finished) < 1 and (job.get("started_at") or 0) < event_stamp:
-                stamp = event_stamp  # older hosts record interruption in the event log, not meta
-    if isinstance(stamp, str):
-        # UltraTerm interruption records use ISO timestamps. Require an explicit timezone;
-        # never infer local time, parse numeric strings or substitute a creation/update clock.
-        try:
-            match = re.fullmatch(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d{1,6})?(Z|[+-]\d{2}:\d{2})", stamp)
-            if not match:
-                raise ValueError("not a zoned ISO timestamp")
-            clock = time.strptime(match[1], "%Y-%m-%dT%H:%M:%S")
-            zone = match[3]
-            if clock.tm_sec > 59 or (zone != "Z" and (int(zone[1:3]) > 23 or int(zone[4:6]) > 59)):
-                raise ValueError("invalid timestamp")
-            # Gregorian ordinal arithmetic avoids local timezone/DST inference and adds
-            # no new module dependency to the byte-for-byte embedded engine.
-            year = clock.tm_year - 1
-            days = 365 * year + year // 4 - year // 100 + year // 400 + clock.tm_yday - 1 - 719162
-            offset = 0 if zone == "Z" else (int(zone[1:3]) * 60 + int(zone[4:6])) * 60 * (1 if zone[0] == "+" else -1)
-            stamp = days * 86400 + clock.tm_hour * 3600 + clock.tm_min * 60 + clock.tm_sec + float(match[2] or 0) - offset
-        except (ValueError, OverflowError):
-            stamp = None
+        stamp = reap_interruption_clock(conn, job)
+    else:
+        stamp = reap_iso_clock(stamp)
     if not isinstance(stamp, (int, float)) or isinstance(stamp, bool) or not 0 < stamp <= now() - REAP_SETTLE_SECONDS:
         return "output-terminal-time-unverified"
     if live_ids is None:
@@ -3666,6 +3826,13 @@ def reap_authority(item: dict) -> dict:
         return reap_output_authority(item)
     with db() as conn:
         jobs = {j["id"]: j for j in rows(conn, "SELECT * FROM jobs")}
+        # An interrupted job whose work a durable continuation took over is not a live claimer any more: the continuation holds
+        # the work and declares its own paths. Without that record the job keeps claiming, as before.
+        continued = {j["id"] for j in jobs.values() if reap_continued_interrupted(conn, j) is not None}
+        # A continued job is finished work for its own windows, but every proof the job blocker makes (settle window, live
+        # worker terminal, cleanup record, live sibling, awaited-by) still has to hold, freshly, on this very pass.
+        live_ids = reap_live_ids() if continued else None
+        continued_blocked = {j["id"]: reap_job_blocker(conn, j, live_ids) for j in jobs.values() if j["id"] in continued}
         successors = {}
         for record in rows(conn, "SELECT value FROM meta WHERE key LIKE 'cleanup:successor:%'"):
             try:
@@ -3691,8 +3858,14 @@ def reap_authority(item: dict) -> dict:
         job = jobs.get(job_id)
         if not job:
             raise ReapRefused(f"owner-unknown:{job_id}")
-        if job["status"] not in REAP_TERMINAL and not reap_pressure_allows(item, job):
-            raise ReapRefused(f"claimed-by:{job_id}({job['status']})")
+        if job["status"] not in REAP_TERMINAL:
+            # A continued interrupted owner is finished work for its own windows, but every proof the job blocker makes
+            # (settle window, live worker terminal, cleanup record, live sibling, awaited-by) still has to hold, freshly.
+            if job_id in continued:
+                if continued_blocked.get(job_id) is not None:
+                    raise ReapRefused(f"claimed-by:{job_id}({job['status']})")
+            elif not reap_pressure_allows(item, job):
+                raise ReapRefused(f"claimed-by:{job_id}({job['status']})")
         # A source whose scope moved to an accepted successor stays claimed while that successor is unfinished:
         # the successor inherits the source's worktrees and evidence.
         chain, seen = successors.get(job_id), {job_id}
@@ -3715,6 +3888,8 @@ def reap_authority(item: dict) -> dict:
     for job in jobs.values():
         if job["status"] in REAP_TERMINAL:
             continue
+        if job["id"] in continued and continued_blocked.get(job["id"]) is None:
+            continue  # a continued job whose own proofs hold is not a live claimer any more
         if any(reap_inside(d, scope) or (independent and reap_inside(scope, d))
                for d in reap_declared_paths(job)) and not reap_pressure_allows(item, job):
             raise ReapRefused(f"claimed-by:{job['id']}({job['status']})")
@@ -4536,13 +4711,20 @@ def reap_class_git_needs(item: dict) -> tuple:
 
 def reap_job_blocker(conn, job: dict, live_ids: set | None, idle: dict | None = None) -> str | None:
     """Why a job's artifacts may not be touched yet; None when the job is finished, settled and its worker is gone."""
-    if job["status"] not in REAP_TERMINAL:
+    # An interrupted job whose work a durable continuation took over is finished work: the same windows apply, from the
+    # interruption clock. Every other check below still runs for it.
+    clock = reap_job_finished_clock(conn, job)
+    continued = job["status"] not in REAP_TERMINAL and clock is not None
+    if job["status"] not in REAP_TERMINAL and clock is None:
         return f"job-{job['status']}"
-    if not job.get("finished_at"):
+    if not clock:
         return "settling"
     terminal = job.get("terminal_id")
     closed = bool(terminal) and bool(row(conn, "SELECT 1 FROM cleanup_records WHERE terminal_id=? AND status='closed'", (terminal,)))
-    if now() - job["finished_at"] < (REAP_CLOSED_SETTLE_SECONDS if closed else REAP_SETTLE_SECONDS):
+    # A continued interrupted job ages from its chain's last finish, which is not this terminal's close: it waits the
+    # ordinary settle window, never the shorter one a closed terminal earns.
+    settle = REAP_SETTLE_SECONDS if continued else (REAP_CLOSED_SETTLE_SECONDS if closed else REAP_SETTLE_SECONDS)
+    if now() - clock < settle:
         return "settling"
     if terminal:
         if live_ids is None:
@@ -4965,8 +5147,12 @@ def evidence_expire_job_owned(conn, job: dict, days: int, dry_run: bool, actor: 
     out = {"job": job["id"], "dryRun": dry_run, "days": days, "files": 0, "bytes": 0, "expired": 0, "expiredBytes": 0,
            "kept": [], "changed": [], "reason": None}
     if job.get("status") not in REAP_TERMINAL:
-        return {**out, "reason": "job-not-terminal"}
-    if not job.get("finished_at") or (job["finished_at"] > cutoff and not marked_evidence_job(job["id"])):
+        clock = reap_job_finished_clock(conn, job)
+        if clock is None:
+            return {**out, "reason": "job-not-terminal"}
+    else:
+        clock = job.get("finished_at")
+    if not clock or (clock > cutoff and not marked_evidence_job(job["id"])):
         return {**out, "reason": f"finished-less-than-{days}-days-ago"}
     cache_root = reap_canon(reap_cache_root())
     reap_vet_root(cache_root)

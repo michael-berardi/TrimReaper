@@ -112,6 +112,13 @@ The engine reads and writes:
 - `meta` keys starting `reaper:`, `reap:` and `evidence-expiry:` (its own pacing and audit state);
 - `meta` keys `cleanup:successor:<job>` (read: a JSON `{"job", "successor"}` handing a finished job's folders to a
   successor job, which keeps them while it is unfinished) and `cleanup:released:<job>` (written when that chain ends);
+- `meta` key `interrupt-heir:<job>` (read: the id of the continuation the host queued for an interrupted job). With that
+  record, a verified interruption clock and a continuation chain that has finished, the interrupted job is finished work for
+  the evidence and clone windows, aged from the chain's last finish; without them, the job keeps everything. A record naming
+  a job that does not exist proves nothing, and a continuation that is still queued or running keeps the source's folders;
+- `meta` keys `cleanup:successor:*` (read: the scope handoff records). The key suffix is not relied on: the record is found by
+  the job it names in its `job` field, and the successor it names is followed in the chain. One record that cannot be read
+  disables the whole rule, so a host that writes these records must write them as a JSON object;
 - `jobs.cwd` and the `jobs.meta` JSON: reads `cwd` and `worktrees` (declared folders) and `waitingOn`, writes `reap` (its last word on the job).
 
 ## Entry points
