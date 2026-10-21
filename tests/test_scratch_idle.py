@@ -156,6 +156,9 @@ class ScratchIdle(Home):
         self.assertEqual(proof["reason"], "idle")
         self.assertEqual(proof["entries"], 40)
         self.assertEqual(proof["budget"]["entries"], 100)
+        out = self.cli("reap", "--scratch")
+        self.assertEqual(out["deleted"], 1, out)
+        self.assertFalse(task.exists())
 
     def test_the_budget_is_read_from_the_policy(self):
         self.write_config({"policy": {"agentScratchIdleMaxEntries": 25, "agentScratchIdleMaxBytes": 4096,
@@ -198,11 +201,15 @@ class ScratchIdle(Home):
         self.assertEqual(proof["reason"], "budget-bytes-exceeded", proof)
 
     def test_the_policy_refuses_an_unusable_budget(self):
-        for value in (0, -1, True, 1.5, "10"):
-            with self.subTest(value=value):
-                self.write_config({"policy": {"agentScratchIdleMaxEntries": value}})
+        for key, value in (("agentScratchIdleMaxEntries", 0), ("agentScratchIdleMaxEntries", -1),
+                           ("agentScratchIdleMaxEntries", True), ("agentScratchIdleMaxEntries", 1.5),
+                           ("agentScratchIdleMaxEntries", "10"), ("agentScratchIdleMaxBytes", -1),
+                           ("agentScratchIdleMaxBytes", "4096"), ("agentScratchIdleMaxSeconds", 0),
+                           ("agentScratchIdleMaxSeconds", "10")):
+            with self.subTest(key=key, value=value):
+                self.write_config({"policy": {key: value}})
                 error = self.cli("config", expect=2)
-                self.assertIn("agentScratchIdleMaxEntries", error["error"])
+                self.assertIn(key, error["error"])
 
     # ---- the walk's own failures -------------------------------------------------------------------------------------
 
@@ -224,6 +231,7 @@ class ScratchIdle(Home):
     def test_a_protected_name_keeps_the_folder_and_is_never_stat_ed_or_opened(self):
         task = self.scratch("protected-task")
         self.put(task, ".wrangler/state/db")
+        self.put(task, "ordinary.txt")
         self.age(task, 20)
         original_stat, original_lstat = core.os.stat, core.os.lstat
         original_open, original_scandir = core.os.open, core.os.scandir
@@ -255,6 +263,7 @@ class ScratchIdle(Home):
         self.assertEqual(proof["reason"], "protected-leaf")
         self.assertEqual([name for name in seen if name.startswith(".wrangler")], [])
         self.assertEqual([name for name in opened if name.startswith(".wrangler")], [])
+        self.assertIn("ordinary.txt", seen)  # the control: the walk does read the names around the protected one
 
     def test_a_root_that_is_not_a_folder_is_not_idle(self):
         other = self.scratch("not-a-folder")
@@ -296,7 +305,7 @@ class ScratchIdle(Home):
         self.assertEqual(len(result), 1, self.receipts())
         self.assertNotIn("idleProof", result[0])
 
-    def test_the_audit_shows_the_proof_of_a_kept_folder(self):
+    def test_the_dry_run_shows_the_proof_of_a_kept_folder(self):
         task = self.scratch("busy-task")
         self.put(task, "inner.txt")
 
@@ -304,6 +313,18 @@ class ScratchIdle(Home):
 
         entry = next(i for i in out["items"] if i["path"] == str(task))
         self.assertEqual(entry["reason"], "idle-recent-change")
+        self.assertEqual(entry["idleProof"]["reason"], "recent-change")
+        self.assertIn("budget", entry["idleProof"])
+
+    def test_the_audit_carries_the_proof_of_a_kept_folder(self):
+        task = self.scratch("audited-task")
+        self.put(task, "inner.txt")
+        item = next(i for i in core.reap_agent_scratch_items() if i["path"] == str(task))
+        ctx = {"run": "test", "sizeBudget": 60}
+
+        entry = core.reap_audit_item(item, None, ctx, time.monotonic() + 60)
+
+        self.assertEqual(entry["blocking"], "idle-recent-change")
         self.assertEqual(entry["idleProof"]["reason"], "recent-change")
         self.assertIn("budget", entry["idleProof"])
 
