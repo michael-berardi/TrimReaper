@@ -57,7 +57,7 @@ class ScratchIdle(Home):
         self.assertTrue(task.exists())
         held = next(i for i in out["items"] if i["path"] == str(task))
         self.assertEqual(held["reason"], "idle-recent-change")
-        self.assertEqual(held["idle"]["reason"], "recent-change")
+        self.assertEqual(held["idleProof"]["reason"], "recent-change")
 
     def test_a_change_deep_in_the_tree_keeps_the_folder(self):
         # The walk covers the whole tree: a change five levels down is seen, not only the top of it.
@@ -110,13 +110,13 @@ class ScratchIdle(Home):
         self.assertTrue(task.exists())
         held = next(i for i in out["items"] if i["path"] == str(task))
         self.assertEqual(held["reason"], "idle-budget-exceeded")
-        self.assertEqual(held["idle"]["reason"], "budget-exceeded")
-        self.assertEqual(held["idle"]["budget"]["entries"], 10)
+        self.assertEqual(held["idleProof"]["reason"], "budget-exceeded")
+        self.assertEqual(held["idleProof"]["budget"]["entries"], 10)
         result = [r for r in self.receipts() if r.get("phase") == "result" and r.get("path") == str(task)]
         self.assertEqual(len(result), 1, self.receipts())
-        self.assertEqual(result[0]["idle"]["reason"], "budget-exceeded")
-        self.assertEqual(result[0]["idle"]["entries"], 11)
-        self.assertEqual(result[0]["idle"]["budget"]["entries"], 10)
+        self.assertEqual(result[0]["idleProof"]["reason"], "budget-exceeded")
+        self.assertEqual(result[0]["idleProof"]["entries"], 11)
+        self.assertEqual(result[0]["idleProof"]["budget"]["entries"], 10)
 
     def test_the_byte_budget_keeps_a_folder_and_is_named(self):
         self.write_config({"policy": {"agentScratchIdleMaxBytes": 4}})
@@ -130,7 +130,7 @@ class ScratchIdle(Home):
         self.assertTrue(task.exists())
         held = next(i for i in out["items"] if i["path"] == str(task))
         self.assertEqual(held["reason"], "idle-budget-bytes-exceeded")
-        self.assertEqual(held["idle"]["budget"]["bytes"], 4)
+        self.assertEqual(held["idleProof"]["budget"]["bytes"], 4)
 
     def test_the_time_budget_keeps_a_folder_and_is_named(self):
         task = self.scratch("slow-task")
@@ -163,7 +163,7 @@ class ScratchIdle(Home):
         budget = core.reap_scratch_idle_budget()
         self.assertEqual(budget, {"entries": 25, "bytes": 4096, "seconds": 3})
 
-    def test_an_unreadable_entry_budget_keeps_every_folder(self):
+    def test_the_host_refuses_an_entry_budget_it_cannot_use(self):
         self.write_config({"policy": {"agentScratchIdleMaxEntries": 0}})
         task = self.scratch("zero-budget")
         self.put(task, "inner.txt")
@@ -221,14 +221,15 @@ class ScratchIdle(Home):
         self.assertEqual(proof["reason"], "unreadable")
         self.assertTrue(task.exists())
 
-    def test_a_protected_name_keeps_the_folder_and_is_never_stat_ed(self):
+    def test_a_protected_name_keeps_the_folder_and_is_never_stat_ed_or_opened(self):
         task = self.scratch("protected-task")
         self.put(task, ".wrangler/state/db")
         self.age(task, 20)
         original_stat, original_lstat = core.os.stat, core.os.lstat
-        seen = []
+        original_open, original_scandir = core.os.open, core.os.scandir
+        seen, opened = [], []
 
-        def checked(name, *args, **kwargs):
+        def checked_stat(name, *args, **kwargs):
             seen.append(os.path.basename(str(name)))
             return original_stat(name, *args, **kwargs)
 
@@ -236,12 +237,24 @@ class ScratchIdle(Home):
             seen.append(os.path.basename(str(name)))
             return original_lstat(name, *args, **kwargs)
 
-        with mock.patch.object(core.os, "stat", side_effect=checked), mock.patch.object(core.os, "lstat", side_effect=checked_lstat):
+        def checked_open(name, *args, **kwargs):
+            opened.append(os.path.basename(str(name)))
+            return original_open(name, *args, **kwargs)
+
+        def checked_scandir(name=".", *args, **kwargs):
+            opened.append(os.path.basename(str(name)))
+            return original_scandir(name, *args, **kwargs)
+
+        with mock.patch.object(core.os, "stat", side_effect=checked_stat), \
+                mock.patch.object(core.os, "lstat", side_effect=checked_lstat), \
+                mock.patch.object(core.os, "open", side_effect=checked_open), \
+                mock.patch.object(core.os, "scandir", side_effect=checked_scandir):
             proof = core.reap_scratch_idle_proof(str(task))
 
         self.assertFalse(proof["idle"], proof)
         self.assertEqual(proof["reason"], "protected-leaf")
         self.assertEqual([name for name in seen if name.startswith(".wrangler")], [])
+        self.assertEqual([name for name in opened if name.startswith(".wrangler")], [])
 
     def test_a_root_that_is_not_a_folder_is_not_idle(self):
         other = self.scratch("not-a-folder")
@@ -266,8 +279,22 @@ class ScratchIdle(Home):
         self.assertEqual(len(result), 1, self.receipts())
         self.assertEqual(result[0]["outcome"], "deleted")
         self.assertEqual(result[0]["retention"], "disposable")
-        self.assertTrue(result[0]["idle"]["idle"], result[0]["idle"])
-        self.assertEqual(result[0]["idle"]["reason"], "idle")
+        self.assertTrue(result[0]["idleProof"]["idle"], result[0]["idleProof"])
+        self.assertEqual(result[0]["idleProof"]["reason"], "idle")
+        plan = [r for r in self.receipts() if r.get("phase") == "plan" and r.get("path") == str(task)]
+        self.assertEqual(len(plan), 1, self.receipts())
+        self.assertIn("idleProof", plan[0])
+
+    def test_the_receipt_of_a_marked_folder_carries_no_proof(self):
+        task = self.scratch("marked-task")
+        self.put(task, "inner.txt")
+        self.cli("mark", str(task), "disposable")
+
+        self.cli("reap", "--scratch")
+
+        result = [r for r in self.receipts() if r.get("phase") == "result" and r.get("path") == str(task)]
+        self.assertEqual(len(result), 1, self.receipts())
+        self.assertNotIn("idleProof", result[0])
 
     def test_the_audit_shows_the_proof_of_a_kept_folder(self):
         task = self.scratch("busy-task")
@@ -277,8 +304,8 @@ class ScratchIdle(Home):
 
         entry = next(i for i in out["items"] if i["path"] == str(task))
         self.assertEqual(entry["reason"], "idle-recent-change")
-        self.assertEqual(entry["idle"]["reason"], "recent-change")
-        self.assertIn("budget", entry["idle"])
+        self.assertEqual(entry["idleProof"]["reason"], "recent-change")
+        self.assertIn("budget", entry["idleProof"])
 
     def test_a_folder_that_changes_after_the_listing_is_kept(self):
         task = self.scratch("growing-task")

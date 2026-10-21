@@ -1532,7 +1532,7 @@ def reap_item_retention(item: dict) -> str:
         # and the budget it spent) rides on the item, so the receipt says why the folder stayed instead of naming an
         # unmarked folder and nothing else.
         if found == "unmarked":
-            proof = reap_scratch_idle_proof(item["path"])
+            proof = reap_scratch_idle_proof(item["path"], seconds=item.get("idleSeconds"))
             item["idleProof"] = proof
             if proof["idle"]:
                 return REAP_DISPOSABLE
@@ -2695,17 +2695,20 @@ def reap_scratch_idle_budget(policy: dict | None = None) -> dict:
             "seconds": whole("agentScratchIdleMaxSeconds", AGENT_SCRATCH_IDLE_SECONDS, 1, 0)}
 
 
-def reap_scratch_idle_proof(path: str, policy: dict | None = None) -> dict:
+def reap_scratch_idle_proof(path: str, policy: dict | None = None, seconds: float | None = None) -> dict:
     """Whether nothing in the folder changed within evidenceExpiryDays, and what the walk that says so spent.
 
     The proof covers the whole tree: the walk is descriptor-relative (a symlink is never followed, a directory swapped
     for one is never entered) and it reads every entry's mtime, so a change anywhere in the tree is seen, however deep.
     The budget is per folder and honest: a walk that runs out of it is not idle, and the budget it spent is part of the
     answer, so the receipt says why the folder stayed. The walk's own failures keep a folder that would otherwise be
-    idle: an entry it cannot read, a protected name it must not enter, and expiry turned off."""
+    idle: an entry it cannot read, a protected name it must not enter, and expiry turned off. `seconds` is the caller's
+    own time budget: the walk never takes longer than it."""
     policy = policy if policy is not None else load_policy()
     budget = reap_scratch_idle_budget(policy)
-    proof = {"idle": False, "reason": "", "entries": 0, "bytes": 0, "newest": None, "budget": budget, "elapsed": 0.0}
+    if seconds is not None:
+        budget = {**budget, "seconds": min(budget["seconds"], max(0.0, float(seconds)))}
+    proof = {"idle": False, "reason": "", "detail": "", "entries": 0, "bytes": 0, "newest": None, "budget": budget, "elapsed": 0.0}
     days = evidence_expiry_days(policy)
     if not days:
         proof["reason"] = "expiry-off"
@@ -2754,6 +2757,7 @@ def reap_scratch_idle_proof(path: str, policy: dict | None = None) -> dict:
     proof["elapsed"] = round(time.monotonic() - started, 3)
     if proof["reason"] and proof["reason"] not in ("recent-change", "protected-leaf", "budget-exceeded", "budget-time-exceeded",
                                                    "budget-bytes-exceeded", "too-deep"):
+        proof["detail"] = proof["reason"]
         proof["reason"] = "unreadable"  # a root that is not a folder, a folder that changed under the walk, a read error
     proof["newest"] = newest[0] or None
     if not proof["reason"] and not completed[0]:
@@ -4478,7 +4482,7 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
     apply = mode == "delete"
     result = {"path": item.get("path"), "owner": item.get("owner"), "class": item.get("class"), "kind": item.get("kind"),
               "ownership": item.get("ownership"), "retention": item.get("retention"), "bytes": None, "bytesIncomplete": False, "sizeReason": None, "archive": None, "checks": [], "preserved": [],
-              "idle": None, "outcome": "refused", "reason": None}
+              "idleProof": None, "outcome": "refused", "reason": None}
     checks = result["checks"]
     cleanup_owner = getattr(REAP_CLEANUP_OWNER, "held", None)
     with ExitStack() as stack:
@@ -4492,11 +4496,13 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
             declared = item.get("retention")
             if not isinstance(declared, str) or not declared.strip():
                 raise ReapRefused("retention-gate:retention-missing")
+            if item.get("class") == "agent-scratch":
+                item["idleSeconds"] = ctx.get("sizeBudget", 120)  # the walk never takes longer than this pass's own budget
             if item.get("class") == "agent-scratch" and declared == "unmarked":
                 # An unmarked folder is judged by its own idle proof, taken now. A folder that aged out since the listing is
                 # not taken now: the next pass lists it as disposable and removes it, so a removal receipt always says so.
-                proof = reap_scratch_idle_proof(item["path"])
-                item["idleProof"], result["idle"] = proof, proof
+                proof = reap_scratch_idle_proof(item["path"], seconds=item.get("idleSeconds"))
+                item["idleProof"], result["idleProof"] = proof, proof
                 if proof["idle"]:
                     raise ReapRefused("retention-changed")
                 raise ReapRefused(reap_item_idle_reason(item))
@@ -4529,7 +4535,7 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
                 checks.extend(["exclusive-output-producer-guard", "producer-locks"])
             retention = reap_retention(item)  # established now, from the directory itself: the declared value is only a claim
             if item.get("class") == "agent-scratch":
-                result["idle"] = item.get("idleProof")  # the proof this call just took, with the budget it spent
+                result["idleProof"] = item.get("idleProof")  # the proof this call just took, with the budget it spent
             if retention != REAP_DISPOSABLE:
                 if item.get("class") == "agent-scratch" and retention == "unmarked":
                     raise ReapRefused(reap_item_idle_reason(item))
@@ -4631,7 +4637,7 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
                 result["sizeReason"] = sizing["reason"]
                 raise ReapRefused(sizing["reason"])
             if apply:
-                reap_receipt({"phase": "plan", "run": ctx.get("run"), **{k: result[k] for k in ("path", "owner", "class", "kind", "ownership", "retention", "bytes", "archive", "checks", "preserved", "idle")}})
+                reap_receipt({"phase": "plan", "run": ctx.get("run"), **{k: result[k] for k in ("path", "owner", "class", "kind", "ownership", "retention", "bytes", "archive", "checks", "preserved")}, **({"idleProof": result["idleProof"]} if result.get("idleProof") else {})})
                 checks.append("plan-receipt-durable")
             if reap_authority(item) != evidence:
                 raise ReapRefused("authority-changed")
@@ -4677,7 +4683,7 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
             checks.append("no-protected-leaf")
             retention = reap_retention(item)
             if item.get("class") == "agent-scratch":
-                result["idle"] = item.get("idleProof")  # the last proof, before anything is removed
+                result["idleProof"] = item.get("idleProof")  # the last proof, before anything is removed
             if retention != REAP_DISPOSABLE:
                 raise ReapRefused("retention-changed")
             if reap_authority(item) != evidence:
@@ -4727,7 +4733,7 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
             if apply:  # still inside the lock block: the result is receipted before any lock is released
                 try:
                     reap_receipt({"phase": "result", "run": ctx.get("run"), "outcome": result["outcome"], "reason": result["reason"],
-                                  "removed": result.get("removed"), "bytesIncomplete": result["bytesIncomplete"], "sizeReason": result["sizeReason"], **{k: result[k] for k in ("path", "owner", "class", "kind", "ownership", "retention", "bytes", "archive", "checks", "preserved", "idle")}})
+                                  "removed": result.get("removed"), "bytesIncomplete": result["bytesIncomplete"], "sizeReason": result["sizeReason"], **{k: result[k] for k in ("path", "owner", "class", "kind", "ownership", "retention", "bytes", "archive", "checks", "preserved")}, **({"idleProof": result["idleProof"]} if result.get("idleProof") else {})})
                 except ReapRefused:
                     result["receiptWritten"] = False
                     result["stopped"] = result.get("stopped") or "result-receipt-unavailable"
@@ -6007,7 +6013,7 @@ def reap_audit_item(item: dict, blocker: str | None, ctx: dict, deadline: float)
             REAP_PRESSURE.on = previous_pressure
         entry = {"state": "reapable" if done["outcome"] == "would-delete" else "blocked", "blocking": done["reason"]}
         if done.get("idle"):
-            entry["idle"] = done["idle"]  # the folder's own idle proof: its reason and the budget the walk spent
+            entry["idleProof"] = done["idleProof"]  # the folder's own idle proof: its reason and the budget the walk spent
         if done.get("archive"):
             entry["archive"] = str(done["archive"].get("reason", "")).split(":")[0]  # reapable once archived first
     if done is not None and done["bytes"] is not None:
@@ -6038,12 +6044,12 @@ REAP_REASON_ACTIONS = {
     "kept-by-release": "the installed release or its rollback was built from this folder: kept",
     "retention-preserved": "carries a retention class (evidence/customer/release-runtime-rollback) or an unknown marker: kept",
     "idle-recent-change": "something in the folder changed inside the evidence window: kept until it is quiet for that long",
-    "idle-budget-exceeded": "the folder holds more entries than the idle walk may list: kept; raise agentScratchIdleMaxEntries or the receipt names what the walk spent",
-    "idle-budget-time-exceeded": "the idle walk ran out of its time budget on this folder: kept; the receipt names the seconds it spent",
-    "idle-budget-bytes-exceeded": "the folder is bigger than the byte budget the idle walk may see: kept; raise agentScratchIdleMaxBytes or the receipt names what the walk spent",
+    "idle-budget-exceeded": "the folder holds more entries than the idle walk may list: kept; the receipt names what the walk spent, and the policy key agentScratchIdleMaxEntries raises the limit",
+    "idle-budget-time-exceeded": "the idle walk ran out of its time budget on this folder: kept; the receipt names the seconds it spent, and the policy key agentScratchIdleMaxSeconds raises the limit",
+    "idle-budget-bytes-exceeded": "the folder is bigger than the byte budget the idle walk may see: kept; the receipt names what the walk spent, and the policy key agentScratchIdleMaxBytes raises the limit",
     "idle-unreadable": "an entry of the folder could not be read: kept; nothing is removed on a guess",
     "idle-protected-leaf": "the folder holds a protected name (.env*, .dev.vars*, .wrangler, .vercel): kept",
-    "idle-too-deep": "the folder is deeper than the walk may go: kept; nothing is removed on a guess",
+    "idle-too-deep": "the folder is deeper than the walk may go (128 levels): kept; nothing is removed on a guess",
     "idle-expiry-off": "evidence expiry is off: every unmarked agent-scratch folder is kept (one marked disposable still goes)",
     "retention-ambiguous": "conflicting retention markers: kept; leave exactly one marker",
     "dirty": "uncommitted changes: archived under <archive root>/<job>/ then removed once the job is past cloneExpiryDays",
