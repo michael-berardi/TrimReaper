@@ -62,11 +62,12 @@ DEFAULT_POLICY = {
     # A linked git worktree no job owns goes after this many days without a change (and every other check); 0 keeps them all.
     "worktreeIdleDays": 7,
     "projectIdleHours": 48,
-    # The budget one agent-scratch folder's idle walk may spend: how many entries it may list and how many bytes it may see.
-    # A folder that outgrows its budget is kept, and the receipt names the budget the walk spent. A byte budget of 0 is no
-    # byte bound at all: bytes bound no work, so the entry budget is what limits the walk.
+    # The budget one agent-scratch folder's idle walk may spend: how many entries it may list, how many bytes it may see
+    # and how long it may take. A folder that outgrows its budget is kept, and the receipt names the budget the walk spent.
+    # A byte budget of 0 is no byte bound at all: bytes bound no work, so the entry budget is what limits the walk.
     "agentScratchIdleMaxEntries": 200000,
     "agentScratchIdleMaxBytes": 0,
+    "agentScratchIdleMaxSeconds": 10,
 }
 
 DEFAULT_CONFIG = {
@@ -190,6 +191,9 @@ def check_policy(policy: dict) -> None:
             raise HostError(f"policy {key} must be a whole number of at least 0, not {json.dumps(value)}")
     if merged["agentScratchIdleMaxEntries"] < 1:
         raise HostError("policy agentScratchIdleMaxEntries must be at least 1, not 0")
+    value = merged["agentScratchIdleMaxSeconds"]
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise HostError(f"policy agentScratchIdleMaxSeconds must be a whole number of at least 1, not {json.dumps(value)}")
     value = merged["reapOpenTerminalGraceHours"]
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
         raise HostError(f"policy reapOpenTerminalGraceHours must be 0 (never) or more hours, not {json.dumps(value)}")
