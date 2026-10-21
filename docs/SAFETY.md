@@ -72,14 +72,18 @@ swapped for a link is never entered, and a link is never followed. It reads ever
 the tree is seen, however deep. A protected name (`.env*`, `.dev.vars*`, `.wrangler`, `.vercel`) is named but never
 stat'ed, opened or entered, and it keeps the folder.
 
-The walk is bounded per folder, and the bound is on the record. `agentScratchIdleMaxEntries` limits how many entries one
-folder's walk may list, `agentScratchIdleMaxBytes` (0: no byte bound) how many bytes it may see, and
-`agentScratchIdleMaxSeconds` how long one walk may take. A walk that runs out of its budget is not idle: the folder is
-kept, and the receipt records the reason, the entries and bytes the walk spent, the seconds it took and the budget it
-had. A budget that cannot be read fails closed: the walk stops at once and the folder is kept. The walk's own failures
-keep a folder that would otherwise be idle: an entry it cannot read, a root that is not a folder, a root that was
-swapped under the walk, a tree deeper than the walk may go, and expiry turned off. The proof is taken again before the
-removal, and a folder that changed in between is kept.
+The walk is bounded per folder, and the bound is on the record. `agentScratchIdleMaxEntries` (200000) limits how many entries
+one folder's walk may list, `agentScratchIdleMaxBytes` (0: no byte bound) how many bytes it may see, and
+`agentScratchIdleMaxSeconds` (10) how long one walk may take; the walk also stops at the reaper's own depth cap (128
+levels). A walk that runs out of its budget is not idle: the folder is kept, and the receipt records the reason, the
+entries and bytes the walk spent, the seconds it took and the budget it had. A budget that cannot be read fails closed:
+it becomes the strictest value there is, never a more permissive one. The walk's own failures keep a folder that would
+otherwise be idle: an entry it cannot read, a root that is not a folder, a root that was swapped under the walk, a tree
+deeper than the walk may go, and expiry turned off. The proof is taken again before the removal, and a folder that
+changed in between is kept.
+
+A folder marked `disposable` should be marked when the work is done, not when the folder is created: the marker makes
+the folder disposable whatever the proof says.
 
 Every folder the reaper keeps says why: `idle-recent-change`, `idle-budget-exceeded`, `idle-budget-time-exceeded`,
 `idle-budget-bytes-exceeded`, `idle-unreadable`, `idle-protected-leaf`, `idle-too-deep` or `idle-expiry-off`.

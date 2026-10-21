@@ -185,12 +185,12 @@ def check_policy(policy: dict) -> None:
         value = merged[key]
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             raise HostError(f"policy {key} must be a whole number of days (0 = never), not {json.dumps(value)}")
-    for key in ("agentScratchIdleMaxEntries", "agentScratchIdleMaxBytes"):
-        value = merged[key]
-        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-            raise HostError(f"policy {key} must be a whole number of at least 0, not {json.dumps(value)}")
-    if merged["agentScratchIdleMaxEntries"] < 1:
-        raise HostError("policy agentScratchIdleMaxEntries must be at least 1, not 0")
+    value = merged["agentScratchIdleMaxEntries"]
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise HostError(f"policy agentScratchIdleMaxEntries must be a whole number of at least 1, not {json.dumps(value)}")
+    value = merged["agentScratchIdleMaxBytes"]
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise HostError(f"policy agentScratchIdleMaxBytes must be a whole number of at least 0, not {json.dumps(value)}")
     value = merged["agentScratchIdleMaxSeconds"]
     if not isinstance(value, int) or isinstance(value, bool) or value < 1:
         raise HostError(f"policy agentScratchIdleMaxSeconds must be a whole number of at least 1, not {json.dumps(value)}")
