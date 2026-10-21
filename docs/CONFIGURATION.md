@@ -43,6 +43,7 @@ Paths are absolute or start with `~/`. Here `~` is the reap home (`home`), not t
 | `worktreeIdleDays` | `7` | A linked git worktree no job owns is removed by `clean` after this many days without a change, and every other check. `0` keeps them all. |
 | `agentScratchIdleMaxEntries` | `200000` | How many entries one agent-scratch folder's idle walk may list. A folder that outgrows its budget is kept, and the receipt names the budget the walk spent. A whole number of at least 1. |
 | `agentScratchIdleMaxBytes` | `0` | How many bytes one agent-scratch folder's idle walk may see. `0` is no byte bound at all: bytes bound no work, so the entry budget is what limits the walk. A folder that outgrows a bound you set is kept, and the receipt names the bound and what the walk spent. A whole number of at least 0. |
+| `agentScratchIdleMaxSeconds` | `10` | How long one agent-scratch folder's idle walk may take. A walk that runs out of time is not idle: the folder is kept, and the receipt names the seconds it spent. A whole number of at least 1. |
 
 ## Jobs
 

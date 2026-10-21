@@ -63,7 +63,8 @@ authorizes a removal, and every removal is proved again, freshly, by the reaper 
 
 An agent-scratch folder (`scratchRoot/<task>`) is disposable only when its own idle proof says so: nothing in it changed
 within `evidenceExpiryDays`. A marker decides as it does everywhere else: a folder marked `disposable` is disposable
-whatever the proof says, and a folder marked anything else is kept.
+whatever the proof says (every other gate - claims, protected leaves, git, locks - still runs), and a folder marked
+anything else is kept.
 
 The proof covers the whole tree. The walk is descriptor-relative end to end: the folder is opened with no symlink in any
 component, every child directory is opened with `O_NOFOLLOW` and compared with the `lstat` that chose it, so a directory
@@ -72,11 +73,13 @@ the tree is seen, however deep. A protected name (`.env*`, `.dev.vars*`, `.wrang
 stat'ed, opened or entered, and it keeps the folder.
 
 The walk is bounded per folder, and the bound is on the record. `agentScratchIdleMaxEntries` limits how many entries one
-folder's walk may list, `agentScratchIdleMaxBytes` (0: no byte bound) how many bytes it may see, and a time budget
-limits one walk. A walk that runs out of its budget is not idle: the folder is kept, and the receipt records the reason,
-the entries and bytes the walk spent and the budget it had. The walk's own failures keep a folder that would otherwise
-be idle: an entry it cannot read, a root that is not a folder, a tree deeper than the walk may go, and expiry turned off.
-The proof is taken again before the removal, and a folder that changed in between is kept.
+folder's walk may list, `agentScratchIdleMaxBytes` (0: no byte bound) how many bytes it may see, and
+`agentScratchIdleMaxSeconds` how long one walk may take. A walk that runs out of its budget is not idle: the folder is
+kept, and the receipt records the reason, the entries and bytes the walk spent, the seconds it took and the budget it
+had. A budget that cannot be read fails closed: the walk stops at once and the folder is kept. The walk's own failures
+keep a folder that would otherwise be idle: an entry it cannot read, a root that is not a folder, a root that was
+swapped under the walk, a tree deeper than the walk may go, and expiry turned off. The proof is taken again before the
+removal, and a folder that changed in between is kept.
 
 Every folder the reaper keeps says why: `idle-recent-change`, `idle-budget-exceeded`, `idle-budget-time-exceeded`,
 `idle-budget-bytes-exceeded`, `idle-unreadable`, `idle-protected-leaf`, `idle-too-deep` or `idle-expiry-off`.

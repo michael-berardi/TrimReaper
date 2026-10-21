@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import time
 from pathlib import Path
 from unittest import mock
 
@@ -136,13 +137,12 @@ class ScratchIdle(Home):
         self.put(task, "inner.txt")
         self.age(task, 20)
 
-        with mock.patch.object(core, "AGENT_SCRATCH_IDLE_SECONDS", 0):
-            out = self.cli("reap", "--scratch")
+        # A host that does not validate the policy: a time budget of zero stops the walk at its first entry.
+        proof = core.reap_scratch_idle_proof(str(task), {"evidenceExpiryDays": 1, "agentScratchIdleMaxSeconds": 0})
 
-        self.assertEqual(out["deleted"], 0, out)
-        self.assertTrue(task.exists())
-        held = next(i for i in out["items"] if i["path"] == str(task))
-        self.assertEqual(held["reason"], "idle-budget-time-exceeded")
+        self.assertFalse(proof["idle"], proof)
+        self.assertEqual(proof["reason"], "budget-time-exceeded", proof)
+        self.assertEqual(proof["budget"]["seconds"], 0)
 
     def test_a_folder_that_fits_its_budget_is_idle_and_goes(self):
         self.write_config({"policy": {"agentScratchIdleMaxEntries": 100}})
@@ -158,9 +158,10 @@ class ScratchIdle(Home):
         self.assertEqual(proof["budget"]["entries"], 100)
 
     def test_the_budget_is_read_from_the_policy(self):
-        self.write_config({"policy": {"agentScratchIdleMaxEntries": 25, "agentScratchIdleMaxBytes": 4096}})
+        self.write_config({"policy": {"agentScratchIdleMaxEntries": 25, "agentScratchIdleMaxBytes": 4096,
+                                      "agentScratchIdleMaxSeconds": 3}})
         budget = core.reap_scratch_idle_budget()
-        self.assertEqual(budget, {"entries": 25, "bytes": 4096})
+        self.assertEqual(budget, {"entries": 25, "bytes": 4096, "seconds": 3})
 
     def test_an_unreadable_entry_budget_keeps_every_folder(self):
         self.write_config({"policy": {"agentScratchIdleMaxEntries": 0}})
@@ -172,6 +173,29 @@ class ScratchIdle(Home):
 
         self.assertTrue(task.exists())
         self.assertIn("agentScratchIdleMaxEntries", out["error"])
+
+    def test_the_engine_keeps_a_folder_whose_entry_budget_cannot_be_read(self):
+        # A host that does not validate the policy: the engine's own fallback is zero, so the walk stops at once.
+        task = self.scratch("unreadable-budget")
+        self.put(task, "inner.txt")
+        self.age(task, 20)
+
+        for value in (0, "10", 1.5, True):
+            with self.subTest(value=value):
+                proof = core.reap_scratch_idle_proof(str(task), {"evidenceExpiryDays": 1,
+                                                                 "agentScratchIdleMaxEntries": value})
+                self.assertFalse(proof["idle"], proof)
+                self.assertEqual(proof["reason"], "budget-exceeded", proof)
+
+    def test_the_engine_keeps_a_folder_whose_byte_budget_cannot_be_read(self):
+        task = self.scratch("unreadable-bytes")
+        self.put(task, "inner.txt")
+        self.age(task, 20)
+
+        proof = core.reap_scratch_idle_proof(str(task), {"evidenceExpiryDays": 1, "agentScratchIdleMaxBytes": "4096"})
+
+        self.assertFalse(proof["idle"], proof)
+        self.assertEqual(proof["reason"], "budget-bytes-exceeded", proof)
 
     def test_the_policy_refuses_an_unusable_budget(self):
         for value in (0, -1, True, 1.5, "10"):
@@ -201,19 +225,23 @@ class ScratchIdle(Home):
         task = self.scratch("protected-task")
         self.put(task, ".wrangler/state/db")
         self.age(task, 20)
-        original = core.os.stat
+        original_stat, original_lstat = core.os.stat, core.os.lstat
         seen = []
 
         def checked(name, *args, **kwargs):
-            seen.append(str(name))
-            return original(name, *args, **kwargs)
+            seen.append(os.path.basename(str(name)))
+            return original_stat(name, *args, **kwargs)
 
-        with mock.patch.object(core.os, "stat", side_effect=checked):
+        def checked_lstat(name, *args, **kwargs):
+            seen.append(os.path.basename(str(name)))
+            return original_lstat(name, *args, **kwargs)
+
+        with mock.patch.object(core.os, "stat", side_effect=checked), mock.patch.object(core.os, "lstat", side_effect=checked_lstat):
             proof = core.reap_scratch_idle_proof(str(task))
 
         self.assertFalse(proof["idle"], proof)
         self.assertEqual(proof["reason"], "protected-leaf")
-        self.assertNotIn(".wrangler", seen)
+        self.assertEqual([name for name in seen if name.startswith(".wrangler")], [])
 
     def test_a_root_that_is_not_a_folder_is_not_idle(self):
         other = self.scratch("not-a-folder")
@@ -257,7 +285,7 @@ class ScratchIdle(Home):
         self.put(task, "inner.txt")
         self.age(task, 20)
         idle = {"idle": True, "reason": "idle", "entries": 1, "bytes": 0, "newest": None,
-                "budget": {"entries": 200000, "bytes": 0}, "seconds": 0.0}
+                "budget": {"entries": 200000, "bytes": 0, "seconds": 10}, "elapsed": 0.0}
         busy = {**idle, "idle": False, "reason": "recent-change"}
         proofs = [idle, busy]  # the listing sees it idle, the re-proof does not
 
@@ -268,3 +296,74 @@ class ScratchIdle(Home):
         self.assertTrue(task.exists())
         held = next(i for i in out["items"] if i["path"] == str(task))
         self.assertEqual(held["reason"], "idle-recent-change")
+
+    def test_a_folder_that_ages_out_between_the_listing_and_the_gate_is_kept(self):
+        # The gate never upgrades a declared "unmarked" folder: the next pass lists it as disposable and removes it.
+        task = self.scratch("aging-task")
+        self.put(task, "inner.txt")
+        self.age(task, 20)
+        idle = {"idle": True, "reason": "idle", "entries": 1, "bytes": 0, "newest": None,
+                "budget": {"entries": 200000, "bytes": 0, "seconds": 10}, "elapsed": 0.0}
+        busy = {**idle, "idle": False, "reason": "recent-change"}
+        proofs = [busy, idle]  # the listing sees it busy, the gate sees it idle
+
+        with mock.patch.object(core, "reap_scratch_idle_proof", side_effect=proofs):
+            out = self.cli("reap", "--scratch")
+
+        self.assertEqual(out["deleted"], 0, out)
+        self.assertTrue(task.exists())
+        held = next(i for i in out["items"] if i["path"] == str(task))
+        self.assertEqual(held["reason"], "retention-changed")
+
+    def test_a_folder_that_changes_before_the_removal_is_kept(self):
+        task = self.scratch("last-look-task")
+        self.put(task, "inner.txt")
+        self.age(task, 20)
+        idle = {"idle": True, "reason": "idle", "entries": 1, "bytes": 0, "newest": None,
+                "budget": {"entries": 200000, "bytes": 0, "seconds": 10}, "elapsed": 0.0}
+        busy = {**idle, "idle": False, "reason": "recent-change"}
+        proofs = [idle, idle, busy]  # the listing, the re-proof and the last look
+
+        with mock.patch.object(core, "reap_scratch_idle_proof", side_effect=proofs):
+            out = self.cli("reap", "--scratch")
+
+        self.assertEqual(out["deleted"], 0, out)
+        self.assertTrue(task.exists())
+        held = next(i for i in out["items"] if i["path"] == str(task))
+        self.assertEqual(held["reason"], "retention-changed")
+
+    def test_a_disposable_marker_decides_over_the_idle_proof(self):
+        # A marker decides as it does everywhere else: a folder marked disposable goes whatever the proof says.
+        task = self.scratch("marked-task")
+        self.put(task, "inner.txt")
+        self.cli("mark", str(task), "disposable")
+
+        out = self.cli("reap", "--scratch")
+
+        self.assertEqual(out["deleted"], 1, out)
+        self.assertFalse(task.exists())
+
+    def test_expiry_turned_off_keeps_every_unmarked_folder(self):
+        self.write_config({"policy": {"evidenceExpiryDays": 0}})
+        task = self.scratch("no-expiry-task")
+        self.put(task, "inner.txt")
+        self.age(task, 20)
+
+        out = self.cli("reap", "--scratch")
+
+        self.assertEqual(out["deleted"], 0, out)
+        self.assertTrue(task.exists())
+        held = next(i for i in out["items"] if i["path"] == str(task))
+        self.assertEqual(held["reason"], "idle-expiry-off")
+
+    def test_the_proof_names_the_newest_mtime_it_saw(self):
+        task = self.scratch("newest-task")
+        self.put(task, "sub/inner.txt")
+        self.age(task, 20)
+        self.put(task, "sub/new.txt")  # changed now
+
+        proof = core.reap_scratch_idle_proof(str(task))
+
+        self.assertFalse(proof["idle"], proof)
+        self.assertEqual(proof["reason"], "recent-change")
+        self.assertTrue(proof["newest"] > time.time() - 3600, proof)
