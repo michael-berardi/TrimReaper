@@ -291,21 +291,30 @@ def reap_worktree_homes() -> list[Path] | None:
 def app_version(app: Path | None) -> str | None:
     if app is None:
         return None
-    import plistlib
-    try:
-        with open(app / "Contents" / "Info.plist", "rb") as stream:
-            version = plistlib.load(stream).get("CFBundleShortVersionString")
-    except (OSError, ValueError, plistlib.InvalidFileException):
-        return None
-    return version if isinstance(version, str) and re.match(r"^\d+\.\d+\.\d+", version) else None
+    from . import core
+    return core.reap_app_version(app)
+
+
+def app_identity(app: Path | None) -> dict:
+    """The version, the bundle identifier and the bundle name of a macOS app, as the installer reads them."""
+    if app is None:
+        return {"version": None, "identifier": None, "name": None}
+    from . import core
+    version, identifier = core.reap_app_plist(app)
+    name = app.name[:-4] if app.name.endswith(".app") else app.name
+    return {"version": version if isinstance(version, str) and re.match(r"^\d+\.\d+\.\d+", version) else None,
+            "identifier": identifier or None, "name": name.strip() or None}
 
 
 def reap_release_marks() -> dict:
-    """The installed version and the single rollback. Unknown (unset or unreadable) keeps every release candidate."""
+    """The installed version, the single rollback, and the identity of the installed product: its bundle identifier
+    and its name. Unknown (unset or unreadable) keeps every release candidate."""
     release = config().get("release") or {}
     installed, rollback = release.get("installedApp"), release.get("rollbackApp")
-    return {"installed": app_version(expand(installed) if installed else None),
-            "rollback": app_version(expand(rollback) if rollback else None)}
+    identity = app_identity(expand(installed) if installed else None)
+    return {"installed": identity["version"],
+            "rollback": app_version(expand(rollback) if rollback else None),
+            "identifier": identity["identifier"], "name": identity["name"]}
 
 
 # ---- time, policy, disk ---------------------------------------------------------------------------------------------
