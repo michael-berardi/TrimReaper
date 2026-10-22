@@ -14,7 +14,7 @@ from unittest import mock
 
 from trimreaper import core
 
-from helpers import DAY, Home
+from helpers import DAY, Home, ScratchHome
 
 
 class FinishedJobOutput(Home):
@@ -305,7 +305,7 @@ class Boundaries(Home):
         self.assertIn("unknown keys: cloneBase", error["error"])
 
 
-class ScratchAndEvidence(Home):
+class ScratchAndEvidence(ScratchHome):
     config_extra = {"scratchRoot": "~/.cache/agent-scratch"}
 
     def test_idle_scratch_goes_recent_and_marked_scratch_stays(self):

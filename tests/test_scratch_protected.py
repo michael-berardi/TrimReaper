@@ -8,10 +8,10 @@ from pathlib import Path
 from unittest import mock
 
 from trimreaper import core
-from helpers import Home
+from helpers import ScratchHome
 
 
-class ScratchProtected(Home):
+class ScratchProtected(ScratchHome):
     config_extra = {"scratchRoot": "~/.cache/agent-scratch"}
 
     def task(self, archive=True):
@@ -107,6 +107,8 @@ class ScratchProtected(Home):
         except OSError:
             self.skipTest("filesystem does not support immutable flags")
         self.addCleanup(os.chflags, leaf, 0)
+        info = leaf.lstat()  # immutable files cannot be backdated; synthesize only this identity's old ctime
+        self.aged_changes[(info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns)] = info.st_mtime
         out = self.reap()
         self.assertEqual(out["deleted"], 0, out)
         self.assertTrue(any("filesystem-protected-flags" in r for r in out["reasons"]), out)
@@ -259,7 +261,9 @@ class ScratchProtected(Home):
             if str(name) == ".env":
                 # A stat-shaped object retains nanosecond and flags fields while changing only ownership.
                 return mock.Mock(wraps=info, st_uid=os.getuid() + 1, st_mode=info.st_mode,
-                                 st_mtime=info.st_mtime, st_dev=info.st_dev, st_ino=info.st_ino, st_blocks=info.st_blocks)
+                                 st_mtime=info.st_mtime, st_mtime_ns=info.st_mtime_ns,
+                                 st_ctime=info.st_ctime, st_ctime_ns=info.st_ctime_ns,
+                                 st_dev=info.st_dev, st_ino=info.st_ino, st_blocks=info.st_blocks)
             return info
         with mock.patch.object(core.os, "stat", side_effect=foreign), mock.patch.object(core, "reap_archive_tar") as tar:
             out = self.reap()
