@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.0 (2026-10-22)
+
+- Add the opt-in `agentScratchProtectedCopies: "archive"` rule. An expired scratch task holding protected names can
+  be reclaimed only after its protected material has a verified, owner-only archive. Scratch protected-copy archives
+  never expire automatically; an archive failure or a change after the archive keeps the task.
+- The exception applies only to top-level agent-scratch tasks, never job caches. Protected descendants share the
+  existing idle-walk budget, and recent changes, live claims, preserving markers and filesystem protections still
+  keep the task. The default remains `"keep"`; other folder classes keep their existing rules.
+
 ## 0.6.12 (2026-10-22)
 
 - Keep the scratch listing's proof on the item it proved, so the pass that follows does not walk every retained folder a

@@ -390,7 +390,8 @@ def reap_probe(argv: list[str], timeout: float = 60, env: dict | None = None, da
 
 
 def reap_fd_walk(top: str, visit, limit: int, deadline: float | None = None, incomplete: str = "walk-incomplete",
-                 too_deep: str = "walk-too-deep", soft: list | None = None, blind=None, listing=None) -> int:
+                 too_deep: str = "walk-too-deep", soft: list | None = None, blind=None, listing=None,
+                 scratch: bool = False) -> int:
     """Names-only walk below `top`, descriptor-relative end to end: the top is opened with no symlink in any component and
     every child directory with O_NOFOLLOW, then compared by device and inode with the lstat that chose it, so a directory
     swapped for a symlink between the listing and the entry is never listed. `visit(rel, name, info, level, device)` gets
@@ -399,6 +400,8 @@ def reap_fd_walk(top: str, visit, limit: int, deadline: float | None = None, inc
     passed `deadline`, a tree deeper than REAP_MAX_DEPTH, a changed identity or an unreadable directory refuse; with `soft`
     an unreadable entry is noted there and skipped instead; `blind(name)` names more entries the visit sees by name only; `listing(rel, names)` sees every
     directory's entry names (still no stat) before any of them is visited or entered, and raises to refuse. Returns the number of entries listed."""
+    if scratch:
+        reap_scratch_scope(top)  # exact configured task only, never a caller's protected_ok assertion
     top_info = os.lstat(top)
     if not stat.S_ISDIR(top_info.st_mode):
         raise ReapRefused("walk-root-not-a-directory")
@@ -420,7 +423,7 @@ def reap_fd_walk(top: str, visit, limit: int, deadline: float | None = None, inc
             if listed > limit or (deadline is not None and time.monotonic() > deadline):
                 raise ReapRefused(incomplete)
             sub = rel + "/" + name if rel else name
-            if reap_protected(name) or (blind is not None and blind(name)):
+            if (reap_protected(name) and not scratch) or (blind is not None and blind(name)):
                 visit(sub, name, None, level, device)  # named only: a protected (or blind) entry is never stat'ed, opened or entered
                 continue
             try:
@@ -448,7 +451,7 @@ def reap_fd_walk(top: str, visit, limit: int, deadline: float | None = None, inc
                 walk(child, sub, level + 1)
             finally:
                 os.close(child)
-    fd = os.open(top, REAP_ROOT_FLAGS)
+    fd = reap_open_nofollow(top) if scratch else os.open(top, REAP_ROOT_FLAGS)
     try:
         opened = os.fstat(fd)
         if (opened.st_dev, opened.st_ino) != (top_info.st_dev, top_info.st_ino):
@@ -1040,11 +1043,13 @@ def reap_holders(path: str, root: str, table: dict | None = None) -> None:
 
 
 def reap_metadata_size(path: str, seconds: float = 120, entry_limit: int = REAP_WALK_ENTRIES,
-                  max_depth: int = REAP_MAX_DEPTH, templates: frozenset = frozenset(), protected_ok: bool = False) -> dict:
+                  max_depth: int = REAP_MAX_DEPTH, templates: frozenset = frozenset(), protected_ok: bool = False,
+                  scratch: bool = False) -> dict:
     """Bounded allocated-metadata lower bound. Protected roots are skipped BEFORE any stat/open; no file contents,
     symlink targets or other devices are read. Incomplete bytes are partial, never an estimate of skipped contents.
     Descriptor-relative directory opens fence replacement/symlink races. Named failures forbid removal."""
     result = {"bytes": None, "complete": False, "reason": None}
+    scratch = scratch and reap_scratch_protected(path)
     if any(reap_protected(p) for p in Path(path).parts):
         result["reason"] = "size-protected-ancestor"
         return result
@@ -1058,7 +1063,7 @@ def reap_metadata_size(path: str, seconds: float = 120, entry_limit: int = REAP_
                 listed += 1
                 if listed > entry_limit:
                     raise ReapRefused("size-entry-limit")
-                if reap_protected(entry.name):
+                if reap_protected(entry.name) and not scratch:
                     if not protected_ok and os.path.join(path, rel, entry.name) not in templates:  # not counted: never entered
                         result["reason"] = result["reason"] or "size-protected-skipped"
                     continue
@@ -1203,7 +1208,7 @@ def reap_vendored_templates(path: str) -> dict:
 def reap_protected_scan(path: str, allow_git: bool = False, markers: bool = False, budget: int = REAP_WALK_ENTRIES,
                         repos: list | None = None, nested_disposable: bool = False, templates: frozenset = frozenset(),
                         protected_ok: bool = False, git_dirs: list | None = None, secrets: list | None = None,
-                        expiring_evidence: bool = False) -> int:
+                        expiring_evidence: bool = False, scratch: bool = False) -> int:
     """Names only, descriptor-relative (reap_fd_walk). Preserve the item if a protected name (.wrangler, .vercel, .env*,
     .dev.vars*) or, unless `allow_git`, a nested git repository sits anywhere inside it. The walk raises on seeing a
     protected name and never scans it, so it cannot enter the state it protects. Symlinks are named, not followed, and a
@@ -1215,6 +1220,7 @@ def reap_protected_scan(path: str, allow_git: bool = False, markers: bool = Fals
     `unproved-git-dir:<rel>`; it is never proved, so it is never removed. With `git_dirs` (the archive pass, cloneArchive=archive)
     such a directory is named there instead of refused: the archive saves it whole before anything is removed. With `secrets`
     (a whole clone, protected_ok) every protected name that is not a tracked template is appended: the archive saves those too."""
+    scratch = scratch and reap_scratch_protected(path)
     if any(reap_protected(part) for part in Path(path).parts):
         raise ReapRefused("protected-scan-ancestor")
     protected_flags = sum(getattr(stat, flag, 0) for flag in ("SF_NOUNLINK", "SF_IMMUTABLE", "SF_APPEND", "SF_RESTRICTED", "UF_NOUNLINK", "UF_IMMUTABLE", "UF_APPEND"))
@@ -1240,7 +1246,7 @@ def reap_protected_scan(path: str, allow_git: bool = False, markers: bool = Fals
                 raise
             git_dirs.append(rel or ".")
     def visit(rel, name, info, level, device):
-        if reap_protected(name):
+        if reap_protected(name) and not scratch:
             if expiring_evidence:
                 raise ReapRefused(f"protected-leaf:{rel}")
             if protected_ok:
@@ -1255,6 +1261,13 @@ def reap_protected_scan(path: str, allow_git: bool = False, markers: bool = Fals
                 if stat.S_ISREG(found.st_mode) and found.st_nlink == 1 and found.st_uid == os.getuid():
                     return False
             raise ReapRefused(f"protected-leaf:{rel}")
+        if scratch and any(reap_protected(p) for p in Path(rel).parts):
+            if info.st_uid != os.getuid():
+                raise ReapRefused("foreign-owner:" + rel)
+            if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)):
+                raise ReapRefused("protected-special-file:" + rel)
+            if secrets is not None:
+                secrets.append(rel)
         if reap_is_git(name):
             if not allow_git:
                 raise ReapRefused(f"nested-git:{rel}")
@@ -1273,7 +1286,7 @@ def reap_protected_scan(path: str, allow_git: bool = False, markers: bool = Fals
         return True
     try:
         return reap_fd_walk(path, visit, budget, incomplete="protected-scan-incomplete", too_deep="protected-scan-too-deep",
-                            blind=None if allow_git else reap_is_git, listing=listing)
+                            blind=None if allow_git else reap_is_git, listing=listing, scratch=scratch)
     except OSError:
         raise ReapRefused("protected-scan-incomplete")
 
@@ -1923,6 +1936,7 @@ def reap_item_retention(item: dict, prove: bool = True) -> str:
 
 
 REAP_ARCHIVE_SOLE = "sole-copy-since.json"   # written into an archive the moment its clone starts to be removed (never before)
+REAP_ARCHIVE_SCRATCH = "scratch-protected-copy.json"  # permanent retention even if the large manifest becomes unreadable
 
 
 def reap_archive_read_small(path: str, limit: int) -> bytes | None:
@@ -2003,11 +2017,24 @@ def reap_archive_mark_sole(path: str, clone: str, run: str | None, observed: boo
     return stamp
 
 
+def reap_archive_scratch(path: str) -> bool:
+    if os.path.lexists(os.path.join(path, REAP_ARCHIVE_SCRATCH)):
+        return True  # presence alone preserves; never follow it or weaken retention on a damaged record
+    data = reap_archive_read_small(os.path.join(path, "manifest.json"), 64 * 2 ** 20)
+    try:
+        manifest = json.loads(data) if data else None
+        return isinstance(manifest, dict) and manifest.get("class") == "agent-scratch"
+    except (ValueError, TypeError):
+        return False
+
+
 def reap_archive_expired(path: str) -> bool:
     """The archive has been the only copy of its clone for at least archiveExpiryDays: counted from the clone's removal (its
     `sole-copy-since.json`), never from when the archive was written, so a removal that was refused and retried cannot shorten
     the time. While the clone still exists, or a legacy archive's removal time is not recorded yet (the tick records it), it does
     not expire. Only an archive with no readable manifest to ask falls back to its own folder's mtime."""
+    if reap_archive_scratch(path):
+        return False  # protected scratch copies have no automatic expiry, including when they are the sole copy
     days = load_policy().get("archiveExpiryDays", 30)
     if not isinstance(days, int) or isinstance(days, bool) or days <= 0:
         return False
@@ -2106,7 +2133,7 @@ def reap_archive_supersede(job_dir: str, final: str, clone: str, job: str) -> in
             older = json.loads(data) if data else None
             if info.st_uid != os.getuid() or info.st_mtime >= newest or not isinstance(older, dict) \
                     or older.get("kind") != "ut-overseer-reap-archive" or older.get("path") != clone or older.get("job") != job \
-                    or reap_archive_sole_since(entry.path) is not None:
+                    or older.get("class") == "agent-scratch" or reap_archive_scratch(entry.path) or reap_archive_sole_since(entry.path) is not None:
                 continue
             shutil.rmtree(entry.path, ignore_errors=True)
             removed += 0 if os.path.lexists(entry.path) else 1
@@ -2358,7 +2385,8 @@ def reap_archive_needs_save(unit: dict) -> bool:
 def reap_archive_protected(item: dict) -> bool:
     """Secret copies and local state (.env*, .dev.vars*, .wrangler, .vercel) of a whole clone are archived (owner-only) before
     cloneProtectedCopies=remove deletes them with the clone: nothing is irrecoverable."""
-    return item["class"] == "job-clone-root" and load_policy().get("cloneProtectedCopies", "remove") == "remove"
+    return (item["class"] == "job-clone-root" and load_policy().get("cloneProtectedCopies", "remove") == "remove") \
+        or (item["class"] == "agent-scratch" and reap_scratch_protected(item["path"]))
 
 
 def reap_archive_units(item: dict, repos: list, git_dirs: list) -> list[dict]:
@@ -2409,6 +2437,48 @@ def reap_archive_evidence_why(unit: dict | None, in_unit: str | None, sub: str) 
         if any("/".join(parts[:i]) in unit["ignoredAll"] for i in range(1, len(parts) + 1)):
             return "ignored"
     return "evidence-dir" if any(reap_fold(part) in REAP_EVIDENCE_DIRS for part in Path(sub).parts[:-1]) else None
+
+
+def reap_scratch_entry(info) -> tuple:
+    return (info.st_mode, info.st_dev, info.st_ino, info.st_nlink, info.st_uid, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns, getattr(info, "st_flags", 0))
+
+
+def reap_scratch_archive_collect(item: dict) -> dict:
+    """Protected-only scratch archive, including templates and material below regenerable names.
+    The same per-folder metadata bounds cover every descendant; the stamp covers even discarded source/output."""
+    path = item["path"]
+    if not reap_scratch_protected(path):
+        raise ReapRefused("scratch-protected-archive-not-approved")
+    budget = reap_scratch_idle_budget()
+    deadline = time.monotonic() + budget["seconds"]
+    secrets, seen, used, identities = [], set(), [0], {}
+    stamp = hashlib.sha256()
+    def visit(rel, name, info, level, device):
+        reap_archive_remaining()
+        if info.st_dev != device:
+            raise ReapRefused("archive-crosses-device")
+        if info.st_uid != os.getuid():
+            raise ReapRefused("foreign-owner:" + rel)
+        key = (info.st_dev, info.st_ino)
+        if key not in seen:
+            seen.add(key)
+            used[0] += info.st_blocks * 512
+            if budget["bytes"] and used[0] > budget["bytes"]:
+                raise ReapRefused("archive-too-large:idle-bytes")
+        identities[rel] = reap_scratch_entry(info)
+        stamp.update(repr((rel, info.st_mode, info.st_dev, info.st_ino, info.st_nlink, info.st_uid,
+                           info.st_size, info.st_mtime_ns, info.st_ctime_ns, getattr(info, "st_flags", 0))).encode("utf-8", "surrogateescape"))
+        if any(reap_protected(p) for p in Path(rel).parts) and not stat.S_ISDIR(info.st_mode):
+            if not (stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)):
+                raise ReapRefused("protected-special-file:" + rel)
+            secrets.append({"path": rel, "kind": "link" if stat.S_ISLNK(info.st_mode) else "file",
+                            "dev": info.st_dev, "ino": info.st_ino, "uid": info.st_uid, "bytes": info.st_size if stat.S_ISREG(info.st_mode) else 0,
+                            "mtimeNs": info.st_mtime_ns, "mode": stat.S_IMODE(info.st_mode)})
+        return True
+    reap_fd_walk(path, visit, budget["entries"], deadline=deadline, incomplete="archive-idle-budget-exceeded", scratch=True)
+    return {"files": [], "protected": secrets, "skipped": [], "skippedCount": None, "expired": [], "stamp": stamp.hexdigest(),
+            "scratchEntries": identities}
 
 
 def reap_archive_collect(item: dict, units: list, evidence_cutoff: float | None, protected: bool = False) -> dict:
@@ -2579,6 +2649,23 @@ class _ReapHashingReader:
         return data
 
 
+def reap_archive_readlink(path: str, entry: dict) -> str:
+    parent = reap_open_nofollow(os.path.dirname(path))
+    try:
+        name = os.path.basename(path)
+        before = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if "uid" in entry and before.st_uid != entry["uid"]:
+            raise ReapRefused("foreign-owner:" + entry["path"][:80])
+        target = os.readlink(name, dir_fd=parent)
+        after = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if not stat.S_ISLNK(before.st_mode) or before != after or (before.st_dev, before.st_ino, before.st_mtime_ns) != \
+                (entry["dev"], entry["ino"], entry["mtimeNs"]):
+            raise ReapRefused("archive-source-changed:" + entry["path"][:80])
+        return target
+    finally:
+        os.close(parent)
+
+
 def reap_archive_tar(path: str, files: list, target: str, level: int = 6) -> dict:
     """files.tar.gz of the collected files, each opened without following a symlink and checked against the walk's lstat."""
     fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
@@ -2590,13 +2677,15 @@ def reap_archive_tar(path: str, files: list, target: str, level: int = 6) -> dic
                 member = tarfile.TarInfo(entry["path"])
                 member.mtime, member.mode = entry["mtimeNs"] // 10 ** 9, entry["mode"]
                 if entry["kind"] == "link":
-                    member.type, member.linkname = tarfile.SYMTYPE, os.readlink(absolute)
+                    member.type, member.linkname = tarfile.SYMTYPE, reap_archive_readlink(absolute, entry)
                     entry["sha256"] = hashlib.sha256(os.fsencode(member.linkname)).hexdigest()
                     tar.addfile(member)
                     continue
-                source = os.open(absolute, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+                source = reap_open_nofollow(absolute, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
                 with os.fdopen(source, "rb") as handle:
                     info = os.fstat(handle.fileno())
+                    if "uid" in entry and info.st_uid != entry["uid"]:
+                        raise ReapRefused("foreign-owner:" + entry["path"][:80])
                     if not stat.S_ISREG(info.st_mode) or (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns) != \
                             (entry["dev"], entry["ino"], entry["bytes"], entry["mtimeNs"]):
                         raise ReapRefused("archive-source-changed:" + entry["path"][:80])
@@ -2888,6 +2977,9 @@ def reap_archive_reuse(job_dir: str, path: str, fingerprint: str) -> dict | None
 
 def reap_archive_state(item: dict, repos: list, git_dirs: list) -> tuple[list, dict]:
     """The units and the collected files an archive of this item would hold right now (names, sizes and tips; nothing written)."""
+    if item["class"] == "agent-scratch":
+        reap_scratch_scope(item["path"])
+        return [], reap_scratch_archive_collect(item)
     units = reap_archive_units(item, repos, git_dirs)
     days = evidence_expiry_days(load_policy())
     cutoff = now() - days * 86400 if days and reap_jobs_finished_before(item.get("jobs") or [item.get("owner")], days * 86400) else None
@@ -2932,6 +3024,9 @@ def reap_archive_create_owned(item: dict, plan: dict, repos: list, git_dirs: lis
         raise ReapRefused(f"archive-no-space:{free}B-free:{total}B-needed")
     root = reap_archive_root()
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if item["class"] == "agent-scratch":
+        private_fd = reap_open_nofollow(str(root))
+        os.close(private_fd)
     info = os.lstat(root)
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
         raise ReapRefused("archive-failed:archive-root-not-private")
@@ -2944,9 +3039,10 @@ def reap_archive_create_owned(item: dict, plan: dict, repos: list, git_dirs: lis
             os.chmod(private, 0o700)
     fingerprint = reap_archive_fingerprint(units, collected)
     linked = next((u for u in units if u["root"] == item["path"] and u["kind"] == "git" and u.get("linked")), None)
-    common = {"fingerprint": fingerprint, "stamp": collected["stamp"], "gitCommonDir": linked["commonDir"] if linked else None,
+    common = {"fingerprint": fingerprint, "stamp": collected["stamp"], "scratchEntries": collected.get("scratchEntries"),
+              "gitCommonDir": linked["commonDir"] if linked else None,
               "gitDir": linked["gitDir"] if linked else None, "files": len(files) + len(secrets) + len(lfs_files), "inputBytes": total}
-    reused = reap_archive_reuse(str(job_dir), item["path"], fingerprint)
+    reused = reap_archive_reuse(str(job_dir), item["path"], fingerprint) if item["class"] != "agent-scratch" else None
     if reused:
         return {**reused, **common}
     reap_archive_clean_partials()  # crashed archives of earlier passes (every job folder; the tick does this too)
@@ -2979,7 +3075,7 @@ def reap_archive_create_owned(item: dict, plan: dict, repos: list, git_dirs: lis
         tar = reap_archive_tar(item["path"], files, os.path.join(stage, "files.tar.gz")) if files else None
         if tar:
             reap_archive_verify_tar(os.path.join(stage, "files.tar.gz"), files)
-        sealed = reap_archive_tar(item["path"], secrets, os.path.join(stage, "protected.tar.gz")) if secrets else None
+        sealed = reap_archive_tar(item["path"], secrets, os.path.join(stage, "protected.tar.gz")) if secrets or item["class"] == "agent-scratch" else None
         if sealed:
             reap_archive_verify_tar(os.path.join(stage, "protected.tar.gz"), secrets)
         manifest = {"schema": 2, "kind": "ut-overseer-reap-archive", "reaperVersion": VERSION, "createdAt": iso(), "run": run,
@@ -3001,6 +3097,15 @@ def reap_archive_create_owned(item: dict, plan: dict, repos: list, git_dirs: lis
             reap_durable(fd)
         finally:
             os.close(fd)
+        if item["class"] == "agent-scratch":
+            permanent = os.open(os.path.join(stage, REAP_ARCHIVE_SCRATCH), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+            try:
+                record = b'{"class":"agent-scratch","automaticExpiry":false}\n'
+                if os.write(permanent, record) != len(record):
+                    raise ReapRefused("archive-failed:permanent-record-short-write")
+                reap_durable(permanent)
+            finally:
+                os.close(permanent)
         final = str(job_dir / f"{name}-{time.strftime('%Y%m%dT%H%M%S', time.localtime(now()))}-{tag}")
         os.rename(stage, final)
         dfd = os.open(job_dir, REAP_DIR_FLAGS)
@@ -3014,7 +3119,8 @@ def reap_archive_create_owned(item: dict, plan: dict, repos: list, git_dirs: lis
     superseded = reap_archive_supersede(str(job_dir), final, item["path"], item["owner"])  # the new one verified: its older siblings are redundant
     return {"path": final, "superseded": superseded, "manifestSha256": hashlib.sha256(data).hexdigest(), "bytes": sum(os.lstat(os.path.join(final, n)).st_size for n in os.listdir(final)),
             "bundles": sum(1 for r in repositories if r.get("bundle")), "expiredEvidence": len(collected["expired"]),
-            "protectedFiles": len(secrets), "lfsObjects": len(lfs_files), "reused": False, **common}
+            "protectedFiles": len(secrets), "lfsObjects": len(lfs_files), "reused": False,
+            "scratchHashes": {f["path"]: f["sha256"] for f in secrets} if item["class"] == "agent-scratch" else None, **common}
 
 
 def reap_recent_users(scope: str, ids: list, seconds: float) -> list[str]:
@@ -3050,6 +3156,55 @@ def reap_clone_expired(ids: list, scope: str | None = None) -> bool:
     return not (scope and reap_recent_users(scope, ids, days * 86400))
 
 
+def reap_open_nofollow(path: str, flags: int = REAP_DIR_FLAGS) -> int:
+    """Open an absolute path component by component, including on hosts without O_NOFOLLOW_ANY."""
+    if not os.path.isabs(path) or any(p == ".." for p in Path(path).parts):
+        raise ReapRefused("path-not-canonical")
+    fd = os.open("/", REAP_DIR_FLAGS)
+    try:
+        parts = Path(path).parts[1:]
+        for index, part in enumerate(parts):
+            child = os.open(part, flags if index == len(parts) - 1 else REAP_DIR_FLAGS, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def reap_scratch_scope(path: str, private: bool = True) -> None:
+    """The scratch exception is never usable as a job-cache or archive escape hatch."""
+    root = str(reap_agent_scratch_root())
+    if reap_canon(root) != root or reap_canon(path) != path or os.path.dirname(path) != root:
+        raise ReapRefused("scratch-outside-exact-root")
+    reap_vet_root(root)
+    for forbidden in (reap_canon(reap_cache_root()), reap_canon(reap_archive_root())):
+        if reap_inside_folded(root, forbidden) or reap_inside_folded(forbidden, root):
+            raise ReapRefused("scratch-root-overlap")
+    if any(reap_protected(p) for p in Path(path).parts):
+        raise ReapRefused("scratch-protected-ancestor")
+    fd = reap_open_nofollow(root)
+    try:
+        info = os.fstat(fd)
+        if info.st_uid != os.getuid() or (private and stat.S_IMODE(info.st_mode) & 0o077):
+            raise ReapRefused("scratch-root-not-private")
+    finally:
+        os.close(fd)
+    if reap_cache_retention(root) not in ("unmarked", REAP_DISPOSABLE):
+        raise ReapRefused("scratch-root-preserving-marker")
+
+
+def reap_scratch_protected(path: str) -> bool:
+    if load_policy().get("agentScratchProtectedCopies", "keep") != "archive" or not reap_archive_on():
+        return False
+    try:
+        reap_scratch_scope(path)
+        return True
+    except (ReapRefused, OSError, HostError):
+        return False
+
+
 def reap_scratch_idle_budget(policy: dict | None = None) -> dict:
     """The budget one scratch folder's idle walk may spend: how many entries it may list, how many bytes it may see and
     how long it may take. A host may set the three keys in its policy. A budget that cannot be read fails closed: an entry
@@ -3077,6 +3232,7 @@ def reap_scratch_idle_proof(path: str, policy: dict | None = None, seconds: floa
     own time budget: the walk stops at the first entry past that deadline."""
     policy = policy if policy is not None else load_policy()
     budget = reap_scratch_idle_budget(policy)
+    scratch = policy.get("agentScratchProtectedCopies", "keep") == "archive" and reap_scratch_protected(path)
     if seconds is not None:
         budget = {**budget, "seconds": min(budget["seconds"], max(0.0, float(seconds)))}
     proof = {"idle": False, "reason": "", "detail": "", "entries": 0, "bytes": 0, "newest": None, "budget": budget, "elapsed": 0.0}
@@ -3092,6 +3248,8 @@ def reap_scratch_idle_proof(path: str, policy: dict | None = None, seconds: floa
     def visit(rel, name, info, level, device):
         if info is None:
             raise ReapRefused("protected-leaf")  # a protected name is named, never stat'ed, opened or entered
+        if scratch and info.st_dev != device:
+            raise ReapRefused("walk-crosses-device")
         if info.st_mtime > newest[0]:
             newest[0] = info.st_mtime
         if info.st_mtime > cutoff:
@@ -3119,7 +3277,7 @@ def reap_scratch_idle_proof(path: str, policy: dict | None = None, seconds: floa
         if time.monotonic() >= deadline:
             raise ReapRefused("budget-time-exceeded")
         reap_fd_walk(path, visit, max(1, budget["entries"] + 1), deadline=deadline,
-                     incomplete="budget-time-exceeded", too_deep="too-deep")
+                     incomplete="budget-time-exceeded", too_deep="too-deep", scratch=scratch)
         completed[0] = True
         again = os.lstat(path)  # the same folder, still: a root that was swapped under the walk keeps the folder
         if (again.st_dev, again.st_ino) != (root.st_dev, root.st_ino):
@@ -4332,6 +4490,7 @@ def reap_boundary(item: dict) -> str:
         if root != reap_canon(reap_agent_scratch_root()) or owner != AGENT_SCRATCH_OWNER or len(rel) != 1 or reap_protected(rel[0]):
             raise ReapRefused("outside-allowed-roots")
         reap_vet_root(root)
+        reap_scratch_scope(path, private=False)
         kind = "agent-scratch"
     else:  # release-target
         releases = reap_canon(reap_release_root())
@@ -4483,14 +4642,50 @@ def reap_open_fence(fence: list[tuple[str, int, int]]) -> int:
     return fd
 
 
+def reap_scratch_copy_current(fd: int, name: str, rel: str, expected: tuple, saved: dict) -> None:
+    """Only the bytes verified in this archive may be unlinked, never a newly appeared protected descendant."""
+    digest = hashlib.sha256()
+    if stat.S_ISLNK(expected[0]):
+        digest.update(os.fsencode(os.readlink(name, dir_fd=fd)))
+    else:
+        source = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=fd)
+        try:
+            if reap_scratch_entry(os.fstat(source)) != expected:
+                raise ReapRefused("scratch-protected-copy-changed:" + rel)
+            total = 0
+            while True:
+                if time.monotonic() > saved["deadline"]:
+                    raise ReapRefused("scratch-protected-copy-time-limit")
+                chunk = os.read(source, 1 << 20)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > expected[5]:
+                    raise ReapRefused("scratch-protected-copy-changed:" + rel)
+                digest.update(chunk)
+            if reap_scratch_entry(os.fstat(source)) != expected:
+                raise ReapRefused("scratch-protected-copy-changed:" + rel)
+        finally:
+            os.close(source)
+    if digest.hexdigest() != saved["hashes"].get(rel) or reap_scratch_entry(os.stat(name, dir_fd=fd, follow_symlinks=False)) != expected:
+        raise ReapRefused("scratch-protected-copy-changed:" + rel)
+
+
 def reap_empty_directory(fd: int, dev: int, depth: int, rel: str, tally: dict, allow_git: bool, templates: frozenset = frozenset(), base: str = "",
-                         protected_ok: bool = False, expiring_evidence: bool = False) -> None:
+                         protected_ok: bool = False, expiring_evidence: bool = False, scratch_saved: dict | None = None) -> None:
     """Unlink everything below an open directory. A protected name (or `.git`, unless allowed) that appeared after the final
     scan stops the walk before it is entered or unlinked; so do another device, another owner, a swapped entry and
     REAP_MAX_DEPTH."""
     if depth > REAP_MAX_DEPTH:
         raise ReapRefused("removal-too-deep")
     info = os.fstat(fd)
+    if scratch_saved is not None:
+        flags = sum(getattr(stat, flag, 0) for flag in ("SF_NOUNLINK", "SF_IMMUTABLE", "SF_APPEND", "SF_RESTRICTED", "UF_NOUNLINK", "UF_IMMUTABLE", "UF_APPEND"))
+        if getattr(info, "st_flags", 0) & flags:
+            raise ReapRefused("filesystem-protected-flags:" + (rel or "."))
+        markers = [n for n in os.listdir(fd) if reap_fold(n).startswith(REAP_MARKER_PREFIX)]
+        if markers and (rel or markers != [REAP_MARKER_PREFIX + REAP_DISPOSABLE]):
+            raise ReapRefused("scratch-preserving-marker-appeared:" + (rel or "."))
     if info.st_uid != os.getuid():
         raise ReapRefused(f"foreign-owner:{rel or '.'}")
     if stat.S_IMODE(info.st_mode) & 0o700 != 0o700:
@@ -4508,7 +4703,17 @@ def reap_empty_directory(fd: int, dev: int, depth: int, rel: str, tally: dict, a
                 raise ReapRefused("marked-evidence-marker-changed")
     for name in names:
         sub = f"{rel}/{name}" if rel else name
-        if reap_protected(name) and protected_ok:
+        if scratch_saved is not None and any(reap_protected(p) for p in Path(sub).parts):
+            entry = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            expected = scratch_saved["entries"].get(sub)
+            current = reap_scratch_entry(entry)
+            if expected is None or (current[:3] != expected[:3] if stat.S_ISDIR(entry.st_mode) else current != expected):
+                raise ReapRefused("scratch-protected-copy-changed:" + sub)
+            if getattr(entry, "st_flags", 0) & flags:
+                raise ReapRefused("filesystem-protected-flags:" + sub)
+            if not stat.S_ISDIR(entry.st_mode):
+                reap_scratch_copy_current(fd, name, sub, expected, scratch_saved)
+        elif reap_protected(name) and protected_ok:
             pass  # removed below like any other entry (whole clone, cloneProtectedCopies=remove)
         elif reap_protected(name):
             if base and os.path.join(base, sub) in templates:
@@ -4533,7 +4738,7 @@ def reap_empty_directory(fd: int, dev: int, depth: int, rel: str, tally: dict, a
                 raise ReapRefused(f"swapped:{sub}")
             try:
                 reap_expect(child, entry.st_dev, entry.st_ino, f"swapped:{sub}")
-                reap_empty_directory(child, dev, depth + 1, sub, tally, allow_git, templates, base, protected_ok, expiring_evidence)
+                reap_empty_directory(child, dev, depth + 1, sub, tally, allow_git, templates, base, protected_ok, expiring_evidence, scratch_saved)
             finally:
                 os.close(child)
             again = os.stat(name, dir_fd=fd, follow_symlinks=False)
@@ -4546,7 +4751,7 @@ def reap_empty_directory(fd: int, dev: int, depth: int, rel: str, tally: dict, a
 
 
 def reap_remove_tree(fence: list[tuple[str, int, int]], tally: dict, allow_git: bool = False, templates: frozenset = frozenset(), base: str = "",
-                     protected_ok: bool = False, expiring_evidence: bool = False) -> None:
+                     protected_ok: bool = False, expiring_evidence: bool = False, scratch_saved: dict | None = None) -> None:
     parent = reap_open_fence(fence)
     try:
         name, dev, ino = fence[-1]
@@ -4556,7 +4761,7 @@ def reap_remove_tree(fence: list[tuple[str, int, int]], tally: dict, allow_git: 
             raise ReapRefused("identity-changed")
         try:
             reap_expect(fd, dev, ino, "identity-changed")
-            reap_empty_directory(fd, dev, 1, "", tally, allow_git, templates, base, protected_ok, expiring_evidence)
+            reap_empty_directory(fd, dev, 1, "", tally, allow_git, templates, base, protected_ok, expiring_evidence, scratch_saved)
         finally:
             os.close(fd)
         info = os.stat(name, dir_fd=parent, follow_symlinks=False)
@@ -4569,13 +4774,13 @@ def reap_remove_tree(fence: list[tuple[str, int, int]], tally: dict, allow_git: 
 
 
 def reap_remove_and_verify(fence: list, path: str, before: list[dict], result: dict, allow_git: bool, templates: frozenset = frozenset(),
-                           protected_ok: bool = False, expiring_evidence: bool = False) -> None:
+                           protected_ok: bool = False, expiring_evidence: bool = False, scratch_saved: dict | None = None) -> None:
     """Remove the item and, however the removal ends (done, stopped, OSError or anything else), re-take the preserved
     identities. A difference is `preserved-state-changed`, the removal's own cause stays with it, and the sweep stops."""
     checks, tally, cause = result["checks"], {"removed": 0}, "removal-interrupted"
     try:
-        if templates or protected_ok or expiring_evidence:
-            reap_remove_tree(fence, tally, allow_git, templates, path, protected_ok, expiring_evidence)
+        if templates or protected_ok or expiring_evidence or scratch_saved is not None:
+            reap_remove_tree(fence, tally, allow_git, templates, path, protected_ok, expiring_evidence, scratch_saved)
         else:
             reap_remove_tree(fence, tally, allow_git)
         cause = None
@@ -4929,6 +5134,8 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
             result["kind"] = reap_boundary(item)
             fence = reap_fence(item["path"], item["root"])
             checks.append("canonical-boundary")
+            if item["class"] == "job-archive" and reap_archive_scratch(item["path"]):
+                raise ReapRefused("scratch-protected-archive-permanent")  # a disposable marker cannot expire a sole protected copy
             targeted = item["class"] == "job-derived-output"
             if targeted:
                 source = item["source"]
@@ -4992,12 +5199,13 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
                 stack.enter_context(reap_locks(reap_cargo_locks(item["path"]), create=False))
                 checks.append("cache-tag-locks")
             repos, proved, git_dirs, archive, templates, secrets = [], set(), [], None, frozenset(), []
+            scratch = item["class"] == "agent-scratch" and reap_scratch_protected(item["path"])
             protected_ok = whole_clone and load_policy().get("cloneProtectedCopies", "remove") == "remove"
             try:
                 templates = reap_tracked_templates(item["path"]) if whole_clone else frozenset()
                 reap_protected_scan(item["path"], allow_git=allow_git, markers=True, repos=repos if allow_git else None, nested_disposable=whole_clone,
-                                    templates=templates, protected_ok=protected_ok, secrets=secrets if protected_ok else None,
-                                    expiring_evidence=expiring_evidence)
+                                    templates=templates, protected_ok=protected_ok, secrets=secrets if protected_ok or scratch else None,
+                                    expiring_evidence=expiring_evidence, scratch=scratch)
                 if whole_clone:  # exactly one repository, the clone itself: a nested repository keeps the whole clone
                     if set(repos) != {item["path"]}:
                         raise ReapRefused("nested-git-in-clone")
@@ -5024,7 +5232,8 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
                     checks.extend(reap_git_proof(item.get("repo") or item["root"], item["path"], reap_class_git_needs(item), ctx.setdefault("git", {}) if mode == "audit" else None))
                 if allow_git and not whole_clone:  # EVERY .git the scan permits is proved, at any depth and under any name, or the item stays whole
                     for repo in sorted(set(repos)):
-                        checks.extend(["nested-" + c for c in reap_git_proof(repo, repo, ("clean", "pushed", "all-refs"), ctx.setdefault("git", {}) if mode == "audit" else None)])
+                        needs = ("clean", "pushed", "all-refs") + (("protected-ok",) if scratch else ())
+                        checks.extend(["nested-" + c for c in reap_git_proof(repo, repo, needs, ctx.setdefault("git", {}) if mode == "audit" else None)])
                         proved.add(repo)
                     checks.append("every-nested-git-proved")
             except ReapRefused as refusal:
@@ -5036,6 +5245,12 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
                 proved = set(repos)
                 result["archive"] = {"reason": archive["reason"], "repositories": len(proved), "gitDirs": len(set(git_dirs))}
                 checks.append("archive-settles-refusal")
+            if scratch and secrets:
+                # Nested Git must already have passed its unchanged clean/pushed/all-refs proofs above.
+                # This exception saves protected material only; it never settles unsaved source refusals.
+                archive = {"reason": "scratch-protected-copies"}
+                result["archive"] = {"reason": archive["reason"], "repositories": 0, "gitDirs": 0}
+                checks.append("scratch-protected-archive-required")
             before = []
             if mode != "audit":
                 before = [reap_identity(leaf) for leaf in reap_preserved_leaves(item["path"], item["root"])]
@@ -5043,7 +5258,8 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
                 checks.append("preserved-root-metadata")
             seconds, entry_limit = reap_size_plan(item["path"], ctx.get("sizeBudget", 120)) if apply else (ctx.get("sizeBudget", 120), REAP_WALK_ENTRIES)
             sizing = reap_metadata_size(item["path"], seconds, entry_limit,
-                                        templates=templates | reap_vendored_templates(item["path"]).keys(), protected_ok=protected_ok)
+                                        templates=templates | reap_vendored_templates(item["path"]).keys(), protected_ok=protected_ok,
+                                        scratch=scratch)
             if apply:
                 reap_size_note(item["path"], sizing)
             result["bytes"] = sizing["bytes"]
@@ -5066,6 +5282,10 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
                     if made.get("gitCommonDir"):
                         result["gitCommonDir"], result["gitWorktreeDir"] = made["gitCommonDir"], made.get("gitDir")
                     checks.append("archive-verified")
+                    if scratch:
+                        reap_receipt({"phase": "archive", "run": ctx.get("run"), "path": item["path"],
+                                      "class": "agent-scratch", "archive": result["archive"]})
+                        checks.append("archive-receipt-durable")
                 else:
                     checks.append("archive-planned")
             last = os.lstat(item["path"])
@@ -5083,7 +5303,8 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
                     raise ReapRefused("tracked-templates-changed")
             reap_protected_scan(item["path"], allow_git=allow_git, markers=True, repos=again if allow_git else None, nested_disposable=whole_clone,
                                 templates=templates, protected_ok=protected_ok,
-                                git_dirs=again_dirs if archive is not None else None, expiring_evidence=expiring_evidence)  # last look
+                                git_dirs=again_dirs if archive is not None and not scratch else None, expiring_evidence=expiring_evidence,
+                                scratch=scratch)  # last look
             if set(again) != proved or (archive is not None and sorted(set(again_dirs)) != sorted(set(git_dirs))):
                 raise ReapRefused("nested-git-changed")
             if made is not None:  # the archive took time: a process, a file, an ignored folder or a ref may have moved since
@@ -5133,7 +5354,17 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
                 try:
                     removal_templates = dict.fromkeys(templates)
                     removal_templates.update(reap_vendored_templates(item["path"]))
-                    reap_remove_and_verify(fence, item["path"], before, result, allow_git, removal_templates, protected_ok, expiring_evidence)
+                    scratch_saved = None
+                    if scratch and archive is not None:
+                        if made is None or not since:
+                            raise ReapRefused("scratch-protected-archive-required")
+                        reap_scratch_scope(item["path"])
+                        units, collected = reap_archive_state(item, again, again_dirs)
+                        if reap_archive_fingerprint(units, collected) != made["fingerprint"] or collected["stamp"] != made["stamp"]:
+                            raise ReapRefused("archive-stale:tree-changed-before-removal")
+                        scratch_saved = {"entries": made["scratchEntries"], "hashes": made["scratchHashes"],
+                                         "deadline": time.monotonic() + REAP_ARCHIVE_SECONDS}
+                    reap_remove_and_verify(fence, item["path"], before, result, allow_git, removal_templates, protected_ok, expiring_evidence, scratch_saved)
                 finally:
                     if made is not None and since and not had_stamp and not result.get("removed"):
                         # Nothing was removed (the removal refused before its first byte): the clone is still the primary copy and the archive's
