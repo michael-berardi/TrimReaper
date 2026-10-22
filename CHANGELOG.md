@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.6.12 (2026-10-22)
+
+- Keep the scratch listing's proof on the item it proved, so the pass that follows does not walk every retained folder a
+  second time. A folder the listing could not reach in time stays, unproven, with a named budget reason and a zero-time
+  proof instead of a silent refusal, and the listing records where it stopped so the next pass begins after that folder
+  rather than at the same name every hour.
+- The listing's own budget bounds the discovery only. The sweep it hands its items to visits every listed folder with the
+  per-folder budget, so a slow or refused folder can never starve the folders behind it, and the last whole-tree proof a
+  removal requires gets the whole per-folder budget instead of what the first proof left of it. A fresh whole-tree proof
+  is still required immediately before removal, and a listed item's retention is re-derived from the directory itself, so
+  a stale or forged listing proof never authorizes a deletion.
+- Make the listing deadline regression deterministic instead of relying on a short wall-clock interval.
+
 ## 0.6.11 (2026-10-22)
 
 - Fix retention of superseded release targets: only known older artifacts of the installed product may be reclaimed.
