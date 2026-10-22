@@ -143,6 +143,22 @@ they rebuild it when they resume. The pressure check runs during a `tick` that h
   its rollback needs). An `evidence` marker on a job's own cache cannot outlive the job's promise: once that job is
   cancelled and `evidenceExpiryDays` has passed, the cache keeps only the normal window instead of forever. `disposable`
   is the opposite: it allows removal, still subject to every other check.
+- A cargo `target` that the release class recognizes is kept when it holds a release artifact, because the installed version and the
+  single rollback must survive. The class is the engine's names-only check over the release layouts: a directory named `release`, or an artifact
+  name at the top of the target or one level below it. A target the class does not recognize is not held by this class at all, exactly as before.
+  The rule reads the artifacts such a target holds and what version each of them carries: a bundle's own `CFBundleShortVersionString` and
+  `CFBundleIdentifier`, a disk image or package's version in its file name. A target whose artifacts are all artifacts of the installed product and
+  all carry a version older than the installed one, and none of them is the installed version or the rollback, is ordinary build output again
+  and goes with the rest of its job's output. A bundle of another product, a bundle that does not say which product it is, a file that does not
+  name the installed product, a name with a second version in it, a bundle whose name and plist disagree about the version, a version that
+  cannot be read, an unknown installed version, rollback version, product identifier or product name, a directory the scan may not read, a tree
+  deeper than the cap, a scan that ran out of budget and a target that holds no release artifact at all are kept. The scan that finds the
+  artifacts walks the whole target and enters every directory except a protected name, a git directory and a release artifact itself; no
+  directory is skipped because of its name, because a folder that happens to be called `deps` or `examples` may hold a distributable. It records a file when its suffix is a release artifact or an installer of one (the class's set, the `.sig`/`.asc` signatures and the archive and installer formats `.zip`, `.tar.gz`, `.msi`, `.exe`, `.appimage`, `.deb`, `.rpm`, `.mpkg`, `.xip`, `.appx`, `.appxbundle`, `.msixbundle`), or when its name names the installed product and carries a version, or when its name mentions the installed product in any spelling and carries a version. A file of the product whose version cannot be read keeps the folder: what it holds is not a release the rule may compare. A Cargo package archive (`.crate`) is the library's version, not the app's release, so it is not recorded at all. A release file that neither carries one of those suffixes nor names or mentions the installed product is not recorded, even when it carries a clear version: the class's names-only check never saw it either.
+- Over-retention is the safe answer, and the alternative (a rule that releases what it cannot read) is the unsafe one: a Windows cargo target (a
+  `.exe` in it) is kept, an archive of the product keeps its target, and with Tauri's updater enabled (`UltraTerm.app.tar.gz`) the rule never
+  reclaims that target.
+- Over-retention is the safe answer, and the alternative (a rule that releases what it cannot read) is the unsafe one: a Windows cargo target (a `.exe` in it) is kept, an archive of the product keeps its target, and with Tauri's updater enabled (`UltraTerm.app.tar.gz`) the rule never reclaims that target.
 - Anything a process has open or names on its command line. A source-only working directory is exempt only for the guarded exact-output route described above.
 - Anything reached through a symlink, on another volume, owned by another user, outside the configured folders, or carrying immutable, no-unlink or restricted filesystem flags. System-protected temp directories stay; flags are never cleared.
 - Your home folder or a system folder as a root, even if the configuration says so.
