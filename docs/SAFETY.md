@@ -81,21 +81,33 @@ entries and bytes the walk spent, the seconds it took and the budget it had. A b
 a recent change further on, so raising the budget can turn `idle-budget-exceeded` into `idle-protected-leaf`. A budget
 that cannot be read fails closed: it becomes the strictest value there is, never a more permissive one. The walk's own
 failures keep a folder that would otherwise be idle: an entry it cannot read, a root that is not a folder, a root that
-was swapped under the walk, a tree deeper than the walk may go, and expiry turned off. The proof is taken again before
-the removal, and a folder that changed in between is kept.
+was swapped under the walk, a tree deeper than the walk may go, and expiry turned off. The sizing walk that follows a
+successful proof may spend up to eight times the size budget before it gives up (`reap_size_plan`), so a visit is bounded
+by the rule, not by the byte budget alone. The proof is taken again before the removal, and a folder that changed in
+between is kept.
 
 An unmarked folder kept by its idle proof names why (`idle-recent-change`, `idle-budget-exceeded`,
 `idle-budget-time-exceeded`, `idle-budget-bytes-exceeded`, `idle-unreadable`, `idle-protected-leaf`, `idle-too-deep`,
 `idle-expiry-off`); a folder kept by another gate (a marker, a claim, a git proof) carries that gate's own reason. A
-folder that aged out between the listing and the removal is refused as `retention-changed` and goes on the next pass.
+scratch folder whose last proof stops on a budget is refused by that budget reason (`idle-budget-time-exceeded`); any
+other change at that final look is refused as `retention-changed`, and the folder goes on the next pass. A folder kept
+by any other class's gate is refused as `retention-changed` too.
 
 A folder marked `disposable` should be marked when the work is done, not when the folder is created: the marker makes
 the folder disposable whatever the proof says.
 
-The listing of the whole root keeps the budget of the caller that asked for it: every folder's walk gets what is left of
-it, so one listing never spends more than its caller's budget on the whole root. A folder the listing could not prove in
-time is kept, unproven (a marker still decides), and is proved again on the next pass - nothing is removed on a guess
-and nothing is removed on a guess that ran out of time either.
+The whole-root listing shares the caller's budget: every folder's walk gets what is left. Its proof travels with the
+item so the pass does not walk retained or unchecked folders again. A folder not checked in time stays with a named
+budget reason (a marker still decides); later passes give other folders a turn, because the listing resumes after the
+last folder it reached. The listing proof is only a discovery hint: removal still requires a fresh whole-tree proof, and
+a forged or stale hint cannot authorize deletion.
+
+The listing's budget bounds the discovery, not the sweep. Every folder the listing did reach is visited in that pass,
+and each visit carries its own per-folder budget (`agentScratchIdleMaxSeconds`), so a folder behind an expensive or
+refused sibling is not starved by the pass that asked for it. A visit spends at most two whole-tree proofs (the retention
+re-derived at the gate, and again immediately before the removal) and one sizing walk; the last proof gets the whole
+per-folder budget rather than what the first one left of it. A caller that hands in its own `idleDeadline` can shorten a
+proof, and a shortened proof only keeps a folder.
 
 The proof reads mtimes only. A tree that arrives in the scratch root with its old times preserved (moved in with `mv`,
 copied with `cp -a` or `rsync -a`, unpacked from an archive that keeps them) looks idle, and a folder that is not held by

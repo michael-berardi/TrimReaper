@@ -20,7 +20,7 @@ Requires macOS, Python 3.10 or newer, and `git`, `lsof` and `ps`. The `python3` 
 newer one comes from [python.org](https://www.python.org/downloads/) or Homebrew (`brew install python`).
 
 ```sh
-pipx install "git+https://github.com/michael-berardi/TrimReaper@v0.6.7"
+pipx install "git+https://github.com/michael-berardi/TrimReaper@v0.6.12"
 trimreaper --version
 ```
 
@@ -113,6 +113,9 @@ Every command prints one JSON document on stdout. Exit status:
 | Agent scratch folders (`scratchRoot/*`) | Once nothing in them changed for `evidenceExpiryDays`. The idle proof covers the whole tree (every entry's mtime, never following a link), so a folder ages out like a small one instead of being kept for good by the walk's own entry limit - up to its per-folder budget (200000 entries, 10 seconds by default). A folder past that budget is kept as `idle-budget-exceeded` (too many entries) or `idle-budget-time-exceeded` (too slow), and the receipt names the budget and what the walk spent. The proof reads mtimes only: a tree moved or copied in with its old times (`mv`, `cp -a`, `rsync -a`, an archive) looks idle, and `trimreaper mark <folder> evidence` keeps it. Every unmarked folder the reaper keeps names the reason it was kept (`idle-recent-change`, `idle-budget-exceeded`, `idle-unreadable`, `idle-protected-leaf`, ...). Active or parked job claims preserve that task, not unrelated siblings. Off until you set `scratchRoot` |
 | Its own archives | `archiveExpiryDays` (30) after the archive became the only copy |
 | Old release builds and release evidence | Off until configured: [docs/CONFIGURATION.md](docs/CONFIGURATION.md) |
+
+Scratch listings share the caller's time budget and carry their proof into the pass. A folder not checked in time stays;
+subsequent passes give other folders a turn. A listing proof never replaces the fresh check before removal.
 
 Release-target retention allows only known older artifacts of the installed product to be reclaimed. The installed
 version, rollback and anything newer stay. Unknown or ambiguous product identity or version, an incomplete inventory,

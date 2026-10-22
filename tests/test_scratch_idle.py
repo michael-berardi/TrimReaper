@@ -349,7 +349,7 @@ class ScratchIdle(Home):
         self.assertEqual(held["reason"], "idle-recent-change")
 
     def test_a_folder_that_ages_out_between_the_listing_and_the_gate_is_kept(self):
-        # The gate never upgrades a declared "unmarked" folder: the next pass lists it as disposable and removes it.
+        # A listed refusal is not walked again or upgraded: the next pass can list it as disposable.
         task = self.scratch("aging-task")
         self.put(task, "inner.txt")
         self.age(task, 20)
@@ -358,13 +358,14 @@ class ScratchIdle(Home):
         busy = {**idle, "idle": False, "reason": "recent-change"}
         proofs = [busy, idle]  # the listing sees it busy, the gate sees it idle
 
-        with mock.patch.object(core, "reap_scratch_idle_proof", side_effect=proofs):
+        with mock.patch.object(core, "reap_scratch_idle_proof", side_effect=proofs) as checked:
             out = self.cli("reap", "--scratch")
 
+        self.assertEqual(checked.call_count, 1)
         self.assertEqual(out["deleted"], 0, out)
         self.assertTrue(task.exists())
         held = next(i for i in out["items"] if i["path"] == str(task))
-        self.assertEqual(held["reason"], "retention-changed")
+        self.assertEqual(held["reason"], "idle-recent-change")
 
     def test_a_folder_that_changes_before_the_removal_is_kept(self):
         task = self.scratch("last-look-task")
@@ -434,7 +435,9 @@ class ScratchIdle(Home):
 
         held = next(i for i in items if i["path"] == str(task))
         self.assertEqual(held["retention"], "unmarked")
-        self.assertNotIn("idleProof", held)
+        self.assertEqual(held["idleProof"]["reason"], "budget-time-exceeded")
+        self.assertEqual(held["idleProof"]["budget"]["seconds"], 0)
+        self.assertFalse(held["idleAttempted"])
 
     def test_the_listing_proves_a_folder_within_its_budget(self):
         task = self.scratch("early-task")
@@ -445,6 +448,8 @@ class ScratchIdle(Home):
 
         gone = next(i for i in items if i["path"] == str(task))
         self.assertEqual(gone["retention"], core.REAP_DISPOSABLE)
+        self.assertTrue(gone["idleProof"]["idle"])
+        self.assertTrue(gone["idleAttempted"])
 
     def test_the_listing_gives_every_folder_only_what_is_left_of_its_budget(self):
         # The whole listing may spend its budget once: the first folder takes what is left, the next one gets nothing.
@@ -452,20 +457,157 @@ class ScratchIdle(Home):
         for task in (first, second):
             self.put(task, "inner.txt")
             self.age(task, 20)
-        spent = []
+        spent, clock = [], [10.0]
 
         def proof(path, policy=None, seconds=None):
             spent.append(seconds)
+            clock[0] = 19.0  # the first folder spends nine of the listing's twenty seconds
             return {"idle": False, "reason": "recent-change", "detail": "", "entries": 1, "bytes": 0,
                     "newest": time.time(), "budget": {"entries": 1, "bytes": 0, "seconds": 10}, "elapsed": 0.0}
 
-        with mock.patch.object(core, "reap_scratch_idle_proof", side_effect=proof):
-            items = core.reap_agent_scratch_items(deadline=time.monotonic() + 0.05)
+        with mock.patch.object(core.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(core, "reap_scratch_idle_proof", side_effect=proof):
+            items = core.reap_agent_scratch_items(deadline=20.0)
 
         self.assertEqual(len(spent), 2, spent)
         self.assertGreater(spent[0], 0.0)
         self.assertLessEqual(spent[1], spent[0])
         self.assertTrue(all(i["retention"] == "unmarked" for i in items), items)
+
+    def test_an_unproved_listing_is_not_walked_again_by_the_sweep(self):
+        task = self.scratch("unproved-task")
+        self.put(task, "inner.txt")
+        self.age(task, 20)
+        items = core.reap_agent_scratch_items(deadline=time.monotonic() - 1)
+        with mock.patch.object(core, "reap_scratch_idle_proof", side_effect=AssertionError("must not rewalk")):
+            out = core.reap_agent_scratch(True, items)
+        self.assertEqual(out["deleted"], 0)
+        self.assertEqual(out["items"][0]["reason"], "idle-budget-time-exceeded")
+        self.assertEqual(out["items"][0]["idleProof"]["detail"], "listing-budget-exhausted")
+        self.assertTrue(task.exists())
+
+    def test_successive_bounded_passes_give_every_folder_a_turn(self):
+        tasks = [self.scratch(name) for name in ("a-task", "b-task", "c-task")]
+        for task in tasks:
+            self.put(task, "inner.txt")
+        clock, checked = [0.0], []
+
+        def slow(path, policy=None, seconds=None):
+            checked.append(Path(path).name)
+            clock[0] += 2
+            return {"idle": False, "reason": "recent-change", "elapsed": 2.0, "budget": {"seconds": seconds}}
+
+        with mock.patch.object(core, "AGENT_SCRATCH_LIST_SECONDS", 1), \
+                mock.patch.object(core.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(core, "reap_scratch_idle_proof", side_effect=slow):
+            for _ in tasks:
+                out = core.reap_agent_scratch(False)
+                self.assertEqual(out["deleted"], 0)
+        self.assertEqual(checked, [p.name for p in tasks])
+        with self.state() as conn:
+            cursor = conn.execute("SELECT value FROM meta WHERE key='reaper:agent-scratch-cursor'").fetchone()
+        self.assertEqual(cursor[0], "c-task")
+
+    def test_forged_listing_proof_cannot_authorize_removal(self):
+        task = self.scratch("forged-task")
+        self.put(task, "inner.txt")  # fresh: never idle
+        item = core.reap_agent_scratch_items()[0]
+        item["retention"] = core.REAP_DISPOSABLE
+        item["idleProof"] = {"idle": True, "reason": "idle", "elapsed": 0}
+        out = core.reap_item(item, "delete", {"run": "forged-test"})
+        self.assertEqual(out["outcome"], "refused")
+        self.assertEqual(out["reason"], "idle-recent-change")
+        self.assertTrue(task.exists())
+
+    def test_a_slow_folder_does_not_stop_the_folders_behind_it(self):
+        # The listing's budget bounds discovery, never the sweep: every folder it listed is visited in this same pass.
+        tasks = [self.scratch(name) for name in ("a-task", "b-task", "c-task", "d-task")]
+        for task in tasks:
+            self.put(task, "inner.txt")
+            self.age(task, 20)
+        clock = [0.0]
+
+        def slow(path, policy=None, seconds=None):
+            proof = {"idle": True, "reason": "idle", "detail": "", "entries": 1, "bytes": 0, "newest": None,
+                    "budget": {"entries": 200000, "bytes": 0, "seconds": seconds}, "elapsed": 3.0}
+            if seconds is not None and seconds <= 0:
+                return {**proof, "idle": False, "reason": "budget-time-exceeded"}  # what a spent budget proves
+            clock[0] += 3.0  # a folder whose whole-tree proof spends real time
+            return proof
+
+        with mock.patch.object(core.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(core, "reap_scratch_idle_proof", side_effect=slow):
+            out = core.reap_agent_scratch(False)
+
+        self.assertEqual(out["deleted"], 4, out)
+        self.assertEqual([task.exists() for task in tasks], [False, False, False, False])
+        self.assertTrue(all(item["outcome"] == "deleted" for item in out["items"]), out["items"])
+
+    def test_the_last_look_gets_the_whole_per_folder_budget(self):
+        # A first proof that spends most of a generous per-folder budget must not shrink the proof before the removal.
+        self.write_config({"policy": {"agentScratchIdleMaxSeconds": 300}})
+        task = self.scratch("long-budget-task")
+        self.put(task, "inner.txt")
+        self.age(task, 20)
+        spent = []
+
+        def proof(path, policy=None, seconds=None):
+            spent.append(seconds)
+            return {"idle": True, "reason": "idle", "detail": "", "entries": 1, "bytes": 0, "newest": None,
+                    "budget": {"entries": 200000, "bytes": 0, "seconds": seconds}, "elapsed": 200.0}
+
+        with mock.patch.object(core, "reap_scratch_idle_proof", side_effect=proof):
+            out = core.reap_agent_scratch(False)
+
+        self.assertEqual(out["deleted"], 1, out)
+        self.assertIn(120, spent)  # a gate proof still gets the item's own budget
+        self.assertIsNone(spent[-1])  # the last look is not capped by what the first proof left of it
+
+    def test_a_caller_deadline_in_the_past_only_keeps_the_folder(self):
+        # The engine sets no deadline of its own; a caller that hands one in can shorten a proof, and a shortened proof
+        # only ever keeps a folder.
+        task = self.scratch("deadline-task")
+        self.put(task, "inner.txt")
+        self.age(task, 20)
+        item = core.reap_agent_scratch_items()[0]
+        item["retention"] = core.REAP_DISPOSABLE
+        item["idleDeadline"] = time.monotonic() - 1
+
+        out = core.reap_item(item, "delete", {"run": "deadline-test"})
+
+        self.assertEqual(out["outcome"], "refused")
+        self.assertEqual(out["reason"], "idle-budget-time-exceeded")
+        self.assertTrue(task.exists())
+
+    def test_a_dry_run_and_an_audit_do_not_advance_the_cursor(self):
+        tasks = [self.scratch(name) for name in ("a-task", "b-task")]
+        for task in tasks:
+            self.put(task, "inner.txt")
+
+        def cursor():
+            if not (self.home / ".local" / "state" / "trimreaper" / "state.sqlite3").exists():
+                return None  # a read-only pass may not create the store at all
+            with self.state() as conn:
+                return conn.execute("SELECT value FROM meta WHERE key='reaper:agent-scratch-cursor'").fetchone()
+
+        self.assertIsNone(cursor())
+        self.cli("reap", "--scratch", "--dry-run")
+        self.assertIsNone(cursor())
+        core.reap_agent_scratch_items(time.monotonic() + 10)  # the audit's own listing
+        self.assertIsNone(cursor())
+        self.cli("reap", "--scratch")  # the deletion pass is the one that records where the listing stopped
+        with self.state() as conn:
+            self.assertEqual(conn.execute("SELECT value FROM meta WHERE key='reaper:agent-scratch-cursor'").fetchone()[0], "b-task")
+
+    def test_a_listed_unmarked_item_without_a_proof_is_kept_without_a_walk(self):
+        task = self.scratch("no-proof-task")
+        self.put(task, "inner.txt")
+        item = core.reap_agent_scratch_items()[0]
+        item.pop("idleProof")
+        with mock.patch.object(core, "reap_scratch_idle_proof", side_effect=AssertionError("must not rewalk")):
+            out = core.reap_item(item, "delete", {"run": "missing-test"})
+        self.assertEqual(out["reason"], "retention-preserved:unmarked")
+        self.assertTrue(task.exists())
 
     def test_the_proof_names_the_newest_mtime_it_saw(self):
         task = self.scratch("newest-task")
