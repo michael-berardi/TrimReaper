@@ -141,9 +141,35 @@ class MarkedEvidence(Home):
         self.write_config({"policy": {"evidenceExpiryDays": 14, "markedEvidenceExpiryDays": 5}})
         out = self.reap("--expire-evidence")
         self.assertEqual(out["markedEvidence"]["deleted"], 1, out)
+        self.assertEqual(out["expired"], 0, out)
+        self.assertFalse(child.exists())
+        self.assertTrue(log.exists())
+
+    def test_unmarked_old_files_wait_for_the_job_window_while_marked_folders_expire(self):
+        # Preserve the shipped host rule: file age cannot shorten the window after the job finished.
+        self.write_config({"policy": {"evidenceExpiryDays": 14, "markedEvidenceExpiryDays": 5}})
+        root, child = self.setup_evidence()
+        loose = self.put(root, "old-shot.png", b"x" * 100)
+        self.age(loose, 20)
+        out = self.reap("--expire-evidence")
+        self.assertEqual(out["markedEvidence"]["deleted"], 1, out)
+        self.assertEqual(out["expired"], 0, out)
+        self.assertFalse(child.exists())
+        self.assertTrue(loose.exists(), out)
+
+    def test_job_root_marker_keeps_original_cutoff_for_loose_files(self):
+        self.write_config({"policy": {"evidenceExpiryDays": 14, "markedEvidenceExpiryDays": 5}})
+        root, child = self.setup_evidence(ago=15 * DAY, parent=True)
+        loose = self.put(root, "recent-shot.png")
+        self.age(loose, 6)
+        old = self.put(root, "old-shot.png")
+        self.age(old, 20)
+        out = self.reap("--expire-evidence")
+        self.assertEqual(out["markedEvidence"]["deleted"], 1, out)
         self.assertEqual(out["expired"], 1, out)
         self.assertFalse(child.exists())
-        self.assertFalse(log.exists())
+        self.assertTrue(loose.exists(), out)
+        self.assertFalse(old.exists(), out)
 
     def test_late_keep_record_stops_descriptor_removal(self):
         _, child = self.setup_evidence()

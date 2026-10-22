@@ -20,7 +20,7 @@ Requires macOS, Python 3.10 or newer, and `git`, `lsof` and `ps`. The `python3` 
 newer one comes from [python.org](https://www.python.org/downloads/) or Homebrew (`brew install python`).
 
 ```sh
-pipx install "git+https://github.com/michael-berardi/TrimReaper@v0.7.1"
+pipx install "git+https://github.com/michael-berardi/TrimReaper@v0.7.2"
 trimreaper --version
 ```
 
@@ -109,7 +109,7 @@ Every command prints one JSON document on stdout. Exit status:
 | The whole clone | `cloneExpiryDays` (3) after every job named in it finished. Unsaved work is archived first |
 | Per-job scratch folders (`cacheRoot/J-NNNN/*`) | Tool caches (with a `CACHEDIR.TAG`) once the job finishes; anything else `evidenceExpiryDays` (14) after it finished. An interrupted job whose work a durable continuation took over counts as finished, from its verified interruption clock |
 | Screenshots, recordings, traces and logs in a job's scratch | `evidenceExpiryDays` after the job finished. Each file's name and SHA-256 are logged first |
-| Marked bulky job-cache evidence | Strictly more than `markedEvidenceExpiryDays` (5) after the job finished, only with an existing, non-empty `report.md`. Reports, summary/outcome, handoffs and receipts stay. Retained material, protected names and active claims still prevent removal |
+| Marked bulky job-cache evidence | Strictly more than `markedEvidenceExpiryDays` (5) after the job finished, only with an existing, non-empty `report.md`. A job-root evidence marker does not shorten the `evidenceExpiryDays` window for loose files. Reports, summary/outcome, handoffs and receipts stay. Retained material, protected names and active claims still prevent removal |
 | Agent scratch folders (`scratchRoot/*`) | Once nothing in them changed for `evidenceExpiryDays`. The idle proof covers the root and whole tree (the later of every entry's mtime and ctime, never following a link), so a folder ages out like a small one instead of being kept for good by the walk's own entry limit - up to its per-folder budget (200000 entries, 10 seconds by default). A folder past that budget is kept as `idle-budget-exceeded` (too many entries) or `idle-budget-time-exceeded` (too slow), and the receipt names the budget and what the walk spent. A fresh copy with preserved modification times still starts a new quiet window, as do metadata changes. A mount keeps the folder without being entered. Caller-supplied absolute idle deadlines also bound later rechecks; `trimreaper mark <folder> evidence` keeps needed evidence. Every unmarked folder the reaper keeps names the reason it was kept (`idle-recent-change`, `idle-budget-exceeded`, `idle-unreadable`, `idle-protected-leaf`, ...). Active or parked job claims preserve that task, not unrelated siblings. Off until you set `scratchRoot`. Protected names keep the task unless `agentScratchProtectedCopies: "archive"` saves a verified private copy first; those archives never expire automatically |
 | Its own archives | `archiveExpiryDays` (30) after the archive became the only copy; scratch protected-copy archives stay indefinitely |
 | Old release builds and release evidence | Off until configured: [docs/CONFIGURATION.md](docs/CONFIGURATION.md) |
@@ -158,7 +158,8 @@ they rebuild it when they resume. The pressure check runs during a `tick` that h
   `evidence` (proof kept for the marked-evidence window; set `markedEvidenceExpiryDays=0` for indefinite retention), `customer` (customer data), `release-runtime-rollback` (what a release or
   its rollback needs). An `evidence` marker on a job's own cache cannot outlive the job's promise: once that job is
   cancelled and `evidenceExpiryDays` has passed, the cache keeps only the normal window instead of forever. `disposable`
-  is the opposite: it allows removal, still subject to every other check.
+  is the opposite: it allows removal, still subject to every other check. In a job-cache child, it never overrides retained
+  credential, key or record names anywhere inside the folder.
 - Anything a process has open or names on its command line. A source-only working directory is exempt only for the guarded exact-output route described above.
 - Anything reached through a symlink, on another volume, owned by another user, outside the configured folders, or carrying immutable, no-unlink or restricted filesystem flags. System-protected temp directories stay; flags are never cleared.
 - Your home folder or a system folder as a root, even if the configuration says so.

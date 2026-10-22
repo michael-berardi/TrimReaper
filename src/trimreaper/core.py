@@ -1917,6 +1917,10 @@ def reap_item_retention(item: dict, prove: bool = True) -> str:
                 break
             parent = os.path.dirname(parent)
     found = reap_cache_retention(item["path"])
+    if found == REAP_DISPOSABLE and item.get("class") == "job-cache-subdir" and not reap_no_retained_names(item["path"]):
+        # A disposable marker never authorizes removing key material: a retained credential, key or record name inside
+        # the folder keeps it, exactly as for an unmarked folder.
+        return "ambiguous"
     if found != "unmarked":
         return found
     cls = item.get("class")
@@ -5896,7 +5900,10 @@ def evidence_walk(root: str, cutoff: float, deadline: float, marked: bool = Fals
             if not marked or reap_cache_retention(current) != "evidence":
                 kept.append(f"{rel or '.'}:retention-marker")
                 return
-            active_cutoff = marked_cutoff if marked_cutoff is not None else cutoff
+            # The job root's own marker marks the job; its loose files are not a marked folder and keep the
+            # job-age window. A marked child folder takes the separate marked cutoff.
+            if rel:
+                active_cutoff = marked_cutoff if marked_cutoff is not None else cutoff
         if any(reap_is_git(n) or reap_protected(n) for n in names) or ("objects" in folded and folded & {"head", "refs", "packed-refs", "reftable"}):
             kept.append(f"{rel or '.'}:git-or-protected")
             return
@@ -6041,7 +6048,11 @@ def evidence_expire_job_owned(conn, job: dict, days: int, dry_run: bool, actor: 
     deadline = time.monotonic() + EVIDENCE_JOB_SECONDS
     try:
         marked = marked_evidence_job(job["id"])
-        files, kept = evidence_walk(root, cutoff if days else float("-inf"), deadline, marked=marked,
+        # Unmarked files follow the documented window measured from when the JOB finished: a job that
+        # finished less than `days` ago expires none of them, whatever their own file dates, even when the separate
+        # five-day rule is already expiring its marked folders.
+        unmarked_cutoff = cutoff if days and clock <= cutoff else float("-inf")
+        files, kept = evidence_walk(root, unmarked_cutoff, deadline, marked=marked,
                                    marked_cutoff=now() - marked_evidence_expiry_days(load_policy()) * 86400) if days or marked else ([], [])
     except ReapRefused as refusal:
         if str(refusal) != "evidence-scan-incomplete":
