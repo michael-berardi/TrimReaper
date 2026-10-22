@@ -92,6 +92,11 @@ folder that aged out between the listing and the removal is refused as `retentio
 A folder marked `disposable` should be marked when the work is done, not when the folder is created: the marker makes
 the folder disposable whatever the proof says.
 
+The listing of the whole root keeps the budget of the caller that asked for it: every folder's walk gets what is left of
+it, so one listing never spends more than its caller's budget on the whole root. A folder the listing could not prove in
+time is kept, unproven (a marker still decides), and is proved again on the next pass - nothing is removed on a guess
+and nothing is removed on a guess that ran out of time either.
+
 The proof reads mtimes only. A tree that arrives in the scratch root with its old times preserved (moved in with `mv`,
 copied with `cp -a` or `rsync -a`, unpacked from an archive that keeps them) looks idle, and a folder that is not held by
 a claim, an open file, a protected name or a git proof can go on the next pass. Mark such a folder (`trimreaper mark

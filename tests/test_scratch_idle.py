@@ -424,6 +424,49 @@ class ScratchIdle(Home):
         held = next(i for i in out["items"] if i["path"] == str(task))
         self.assertEqual(held["reason"], "idle-expiry-off")
 
+    def test_the_listing_keeps_its_own_budget(self):
+        # A listing that may spend its own budget on the whole root: a folder it could not prove is kept, unproven.
+        task = self.scratch("late-task")
+        self.put(task, "inner.txt")
+        self.age(task, 20)
+
+        items = core.reap_agent_scratch_items(deadline=time.monotonic() - 1)
+
+        held = next(i for i in items if i["path"] == str(task))
+        self.assertEqual(held["retention"], "unmarked")
+        self.assertNotIn("idleProof", held)
+
+    def test_the_listing_proves_a_folder_within_its_budget(self):
+        task = self.scratch("early-task")
+        self.put(task, "inner.txt")
+        self.age(task, 20)
+
+        items = core.reap_agent_scratch_items(deadline=time.monotonic() + 30)
+
+        gone = next(i for i in items if i["path"] == str(task))
+        self.assertEqual(gone["retention"], core.REAP_DISPOSABLE)
+
+    def test_the_listing_gives_every_folder_only_what_is_left_of_its_budget(self):
+        # The whole listing may spend its budget once: the first folder takes what is left, the next one gets nothing.
+        first, second = self.scratch("first-task"), self.scratch("second-task")
+        for task in (first, second):
+            self.put(task, "inner.txt")
+            self.age(task, 20)
+        spent = []
+
+        def proof(path, policy=None, seconds=None):
+            spent.append(seconds)
+            return {"idle": False, "reason": "recent-change", "detail": "", "entries": 1, "bytes": 0,
+                    "newest": time.time(), "budget": {"entries": 1, "bytes": 0, "seconds": 10}, "elapsed": 0.0}
+
+        with mock.patch.object(core, "reap_scratch_idle_proof", side_effect=proof):
+            items = core.reap_agent_scratch_items(deadline=time.monotonic() + 0.05)
+
+        self.assertEqual(len(spent), 2, spent)
+        self.assertGreater(spent[0], 0.0)
+        self.assertLessEqual(spent[1], spent[0])
+        self.assertTrue(all(i["retention"] == "unmarked" for i in items), items)
+
     def test_the_proof_names_the_newest_mtime_it_saw(self):
         task = self.scratch("newest-task")
         self.put(task, "sub/inner.txt")
