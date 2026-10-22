@@ -406,8 +406,14 @@ def reap_fd_walk(top: str, visit, limit: int, deadline: float | None = None, inc
     def walk(fd, rel, level):
         nonlocal listed
         try:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise ReapRefused(incomplete)
             with os.scandir(fd) as entries:
-                names = [entry.name for entry in entries]
+                names = []
+                for entry in entries:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise ReapRefused(incomplete)
+                    names.append(entry.name)
         except OSError:
             if soft is None:
                 raise
@@ -1894,16 +1900,12 @@ def reap_item_retention(item: dict, prove: bool = True) -> str:
         # and the budget it spent) rides on the item, so the receipt says why the folder stayed instead of naming an
         # unmarked folder and nothing else.
         if found == "unmarked":
-            seconds = item.get("idleSeconds")
-            if item.get("idleDeadline") is not None:
-                remaining = max(0.0, item["idleDeadline"] - time.monotonic())
-                seconds = remaining if seconds is None else min(seconds, remaining)
             if not prove:
                 item["idleProof"] = {"idle": False, "reason": "budget-time-exceeded", "detail": "listing-budget-exhausted",
                                      "entries": 0, "bytes": 0, "newest": None, "elapsed": 0.0,
                                      "budget": {**reap_scratch_idle_budget(), "seconds": 0.0}}
                 return found
-            proof = reap_scratch_idle_proof(item["path"], seconds=seconds)
+            proof = reap_scratch_idle_proof(item["path"], seconds=reap_scratch_proof_seconds(item))
             item["idleProof"] = proof
             if proof["idle"]:
                 return REAP_DISPOSABLE
@@ -3066,11 +3068,26 @@ def reap_scratch_idle_budget(policy: dict | None = None) -> dict:
             "seconds": whole("agentScratchIdleMaxSeconds", AGENT_SCRATCH_IDLE_SECONDS, 1, 0)}
 
 
+def reap_scratch_changed(info) -> float:
+    """Last data or metadata change. Unlike mtime, a preserved-time copy cannot backdate ctime."""
+    return max(info.st_mtime, info.st_ctime)
+
+
+def reap_scratch_proof_seconds(item: dict) -> float | None:
+    """Honor a caller's absolute idle deadline at every re-proof, without restarting its clock."""
+    seconds = item.get("idleSeconds")
+    if item.get("idleDeadline") is not None:
+        left = max(0.0, item["idleDeadline"] - time.monotonic())
+        seconds = left if seconds is None else min(seconds, left)
+    return seconds
+
+
 def reap_scratch_idle_proof(path: str, policy: dict | None = None, seconds: float | None = None) -> dict:
     """Whether nothing in the folder changed within evidenceExpiryDays, and what the walk that says so spent.
 
     The proof covers the whole tree: the walk is descriptor-relative (a symlink is never followed, a directory swapped
-    for one is never entered) and it reads every entry's mtime, so a change anywhere in the tree is seen, however deep.
+    for one is never entered) and it reads max(mtime, ctime) for the root and every entry, so preserved mtimes cannot
+    hide a fresh copy or metadata change. A different-device entry is refused before it can be opened or counted.
     The budget is per folder and honest: a walk that runs out of it is not idle, and the budget it spent is part of the
     answer, so the receipt says why the folder stayed. The walk's own failures keep a folder that would otherwise be
     idle: an entry it cannot read, a protected name it must not enter, and expiry turned off. `seconds` is the caller's
@@ -3092,9 +3109,11 @@ def reap_scratch_idle_proof(path: str, policy: dict | None = None, seconds: floa
     def visit(rel, name, info, level, device):
         if info is None:
             raise ReapRefused("protected-leaf")  # a protected name is named, never stat'ed, opened or entered
-        if info.st_mtime > newest[0]:
-            newest[0] = info.st_mtime
-        if info.st_mtime > cutoff:
+        if info.st_dev != device:
+            raise ReapRefused("mountpoint")
+        changed = reap_scratch_changed(info)
+        newest[0] = max(newest[0], changed)
+        if changed > cutoff:
             raise ReapRefused("recent-change")
         proof["entries"] += 1
         if proof["entries"] > budget["entries"]:
@@ -3110,11 +3129,15 @@ def reap_scratch_idle_proof(path: str, policy: dict | None = None, seconds: floa
         return True  # enter a directory: the whole tree is covered, the budget is what bounds the walk
 
     try:
+        if time.monotonic() >= deadline:
+            raise ReapRefused("budget-time-exceeded")
         root = os.lstat(path)
         if not stat.S_ISDIR(root.st_mode):
             raise ReapRefused("walk-root-not-a-directory")
-        newest[0] = root.st_mtime
-        if root.st_mtime > cutoff:
+        if root.st_dev != os.lstat(os.path.dirname(os.path.abspath(path))).st_dev:
+            raise ReapRefused("mountpoint")
+        newest[0] = reap_scratch_changed(root)
+        if newest[0] > cutoff:
             raise ReapRefused("recent-change")
         if time.monotonic() >= deadline:
             raise ReapRefused("budget-time-exceeded")
@@ -3124,15 +3147,18 @@ def reap_scratch_idle_proof(path: str, policy: dict | None = None, seconds: floa
         again = os.lstat(path)  # the same folder, still: a root that was swapped under the walk keeps the folder
         if (again.st_dev, again.st_ino) != (root.st_dev, root.st_ino):
             raise ReapRefused("walk-root-changed")
-        if again.st_mtime > cutoff:
+        newest[0] = max(newest[0], reap_scratch_changed(again))
+        if newest[0] > cutoff:
             raise ReapRefused("recent-change")  # the root changed while the walk ran: it is not quiet
+        if time.monotonic() >= deadline:
+            raise ReapRefused("budget-time-exceeded")
     except ReapRefused as refusal:
         proof["reason"] = str(refusal)
     except OSError as error:
         proof["reason"], proof["detail"] = "unreadable", f"oserror:{getattr(error, 'errno', 0)}"
     proof["elapsed"] = round(time.monotonic() - started, 3)
     if proof["reason"] and proof["reason"] not in ("recent-change", "protected-leaf", "budget-exceeded", "budget-time-exceeded",
-                                                   "budget-bytes-exceeded", "too-deep", "unreadable"):
+                                                   "budget-bytes-exceeded", "too-deep", "unreadable", "mountpoint"):
         proof["detail"] = proof["reason"]
         proof["reason"] = "unreadable"  # a root that is not a folder, a folder that changed under the walk, a read error
     proof["newest"] = newest[0] or None
@@ -3144,7 +3170,7 @@ def reap_scratch_idle_proof(path: str, policy: dict | None = None, seconds: floa
 
 
 def reap_scratch_idle(path: str) -> bool:
-    """Nothing in the folder (every entry below it, names and mtimes only, never followed) changed within
+    """Nothing in the folder (root and every entry's mtime and ctime, never following links) changed within
     evidenceExpiryDays. The walk's own budget, an unreadable entry, a protected name or expiry turned off is not idle."""
     return reap_scratch_idle_proof(path)["idle"]
 
@@ -4911,7 +4937,7 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
                 if item.get("idleListed") and not isinstance(proof, dict):
                     raise ReapRefused("retention-preserved:unmarked")
                 if not isinstance(proof, dict):
-                    proof = reap_scratch_idle_proof(item["path"], seconds=item.get("idleSeconds"))
+                    proof = reap_scratch_idle_proof(item["path"], seconds=reap_scratch_proof_seconds(item))
                 item["idleProof"], result["idleProof"] = proof, proof
                 if item.get("idleSeconds") is not None:  # a missing budget is no cap, not zero seconds
                     item["idleSeconds"] = max(0.0, float(item["idleSeconds"]) - proof["elapsed"])  # what is left of it
@@ -6509,6 +6535,7 @@ REAP_REASON_ACTIONS = {
     "idle-unreadable": "an entry of the folder could not be read: kept; nothing is removed on a guess",
     "idle-protected-leaf": "the folder holds a protected name (.env*, .dev.vars*, .wrangler, .vercel): kept",
     "idle-too-deep": "the folder is deeper than the walk may go (128 levels): kept; nothing is removed on a guess",
+    "idle-mountpoint": "the folder is a mount or holds an entry on another device: kept without entering it",
     "idle-expiry-off": "evidence expiry is off: every unmarked agent-scratch folder is kept (one marked disposable still goes)",
     "retention-ambiguous": "conflicting retention markers: kept; leave exactly one marker",
     "dirty": "uncommitted changes: archived under <archive root>/<job>/ then removed once the job is past cloneExpiryDays",

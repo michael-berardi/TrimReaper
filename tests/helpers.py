@@ -13,7 +13,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from trimreaper import clean, cli
+from trimreaper import clean, cli, core
 
 GIT_ENV = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com", "GIT_COMMITTER_NAME": "t",
            "GIT_COMMITTER_EMAIL": "t@example.com", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}
@@ -118,3 +118,31 @@ class Home(unittest.TestCase):
             for name in files + dirs:
                 os.utime(os.path.join(current, name), (stamp, stamp), follow_symlinks=False)
         os.utime(path, (stamp, stamp))
+
+
+class ScratchHome(Home):
+    """Synthetic old ctimes for idle-proof tests only; no production clock or backdating switch.
+
+    Aged entries are keyed by their full identity and change stamp. A later chmod, write, replacement or preserved-time
+    copy keeps its real ctime, so the fixture cannot hide a new change. Other reaper gates always see real stat data.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.aged_changes = {}
+
+        def changed(info):
+            key = (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns)
+            return max(info.st_mtime, self.aged_changes.get(key, info.st_ctime))
+
+        patch = mock.patch.object(core, "reap_scratch_changed", side_effect=changed)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def age(self, path: Path, days: float):
+        super().age(path, days)
+        for current, dirs, files in os.walk(path, followlinks=False):
+            for entry in [Path(current), *(Path(current) / name for name in dirs + files)]:
+                info = entry.lstat()
+                key = (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns)
+                self.aged_changes[key] = info.st_mtime

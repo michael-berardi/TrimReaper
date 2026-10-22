@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.13 (2026-10-22)
+
+- Agent-scratch idle proofs read `max(st_mtime, st_ctime)` for the root and every entry. A fresh copy with preserved
+  modification times or a metadata-only change restarts the quiet window; `idleProof.newest` records that change time.
+- Refuse mount roots and nested other-device entries as `idle-mountpoint`, without entering or counting them.
+- Check idle deadlines while enumerating directory names and before and after walking, including empty folders. A
+  caller-supplied absolute idle deadline is honored at every re-proof, without restarting its clock.
+- Preserve 0.6.12's item-carried listing proofs, rotating discovery cursor and independent per-folder sweep budgets.
+  The older unpublished pass-wide sweep deadline is superseded by 0.6.12's starvation fix, not reintroduced here.
+- Tests synthesize old ctimes only for unchanged fixture identities; real-copy fixtures retain OS-assigned ctimes.
+
 ## 0.6.12 (2026-10-22)
 
 - Keep the scratch listing's proof on the item it proved, so the pass that follows does not walk every retained folder a
