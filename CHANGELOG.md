@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.7.2 (2026-10-22)
+
+- Preserve three safeguards already shipped by the embedding host; this restores the existing behavior, not a new
+  retention policy. A disposable marker on a job-cache child never overrides a retained credential, key or record name
+  anywhere inside it; the whole folder stays as ambiguous.
+- A job-root evidence marker does not shorten the ordinary cutoff for loose files. Unmarked files wait for
+  `evidenceExpiryDays` after the job finished, regardless of their own ages, while marked child folders can expire under
+  the separate `markedEvidenceExpiryDays` rule.
+- Keep 0.7.1's positive product-identity release safeguards and the protected-copy archive rules unchanged.
+
 ## 0.7.1 (2026-10-22)
 
 - Keep release targets that mix an older product bundle with a foreign installer such as `UltraTerm-Helper_1.0.0.pkg`.

@@ -67,6 +67,22 @@ class RetainedNamesBelowTheFolder(Home):
         self.assertEqual(out["deleted"], 1, out)
         self.assertFalse(child.exists())
 
+    def test_a_disposable_marker_never_removes_key_material(self):
+        # Preserve the shipped host safeguard: a marker cannot override retained names below a job-cache child.
+        root = self.home / ".cache/trimreaper/jobs/J-0060"
+        for name, extra in (("plain", None), ("withkey", "service-account.json")):
+            self.put(root, f"{name}/data.bin", b"d" * 100)
+            self.put(root, f"{name}/.ut-retention-disposable", b"")
+            if extra:
+                self.put(root, f"{name}/{extra}", b"{}")
+        self.add_job("J-0060", finished_ago=2 * DAY)
+        out = self.cli("reap", "--job", "J-0060")
+        reasons = {i["path"].rsplit("/", 1)[-1]: i["reason"] for i in out["items"]}
+        self.assertIsNone(reasons["plain"], out)
+        self.assertEqual(reasons["withkey"], "retention-preserved:ambiguous", out)
+        self.assertTrue((root / "withkey/service-account.json").exists())
+        self.assertFalse((root / "plain").exists())
+
     def test_a_nested_credential_keeps_the_whole_folder(self):
         self.add_job("J-0060", finished_ago=2 * DAY)
         root = self.home / ".cache/trimreaper/jobs/J-0060"
