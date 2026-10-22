@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.11 (2026-10-22)
+
+- Fix retention of superseded release targets: only known older artifacts of the installed product may be reclaimed.
+  Installed, rollback and newer versions stay; unknown or ambiguous identity/version and incomplete inventories fail
+  closed. Versions must be complete three-part versions, and bundle-name/plist disagreement keeps the artifact.
+  This corrects the existing reaper rule, not a new retention class; locks, live claims and Git safeguards are unchanged.
+
 ## 0.6.10 (2026-10-21)
 
 - The listing of the agent-scratch root keeps the budget of the caller that asked for it. The idle proof of 0.6.9 reads
