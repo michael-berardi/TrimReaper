@@ -127,6 +127,39 @@ CACHEDIR_TAG = "CACHEDIR.TAG"
 CACHEDIR_SIGNATURE = b"Signature: 8a477f597d28d172789f06886806bc55"   # bford.net/cachedir: the first 43 bytes of a valid tag
 REAP_SCAN_DEPTH = 4                   # directory levels searched for regenerable dirs inside one clone
 REAP_SCAN_ENTRIES = 100000            # entries one bounded walk may list before it reports itself incomplete
+# A release artifact a cargo target can hold: a bundle, a disk image, a package. Its version decides whether the target
+# may go, so the scan below has to find all of them and read their versions. The class counts the engine's own set (the
+# one reap_target_release_bearing uses); the scan looks wider, because an archive or an installer of the product is a
+# release artifact too. It records a file when its suffix is a release artifact or an installer of one, when its name
+# names the installed product and carries a version, or when its name mentions the installed product in any spelling and
+# carries a version. A file of the product whose version cannot be read keeps the folder: what it holds is not a release
+# the rule may compare. A Cargo package archive (".crate") is the library's version, not the app's release, so it is not
+# recorded at all. A release file that neither carries one of those suffixes nor names or mentions the installed product
+# is not recorded, even when it carries a clear version: the class's names-only check never saw it either.
+REAP_RELEASE_ARTIFACTS = (".app", ".dmg", ".pkg", ".ipa", ".msix")
+REAP_RELEASE_SIGNATURES = (".sig", ".asc")
+# The scan looks wider than the class: an archive or an installer of the same product is a release artifact as well, and
+# the class's names-only check never sees it. The class itself keeps its own set: widening it would hold more targets
+# than today, which is a retention change this rule does not ask for.
+REAP_RELEASE_SCAN_ARTIFACTS = REAP_RELEASE_ARTIFACTS + REAP_RELEASE_SIGNATURES + (
+    ".zip", ".tar.gz", ".msi", ".exe", ".appimage", ".deb", ".rpm", ".mpkg", ".xip", ".appx", ".appxbundle",
+    ".msixbundle")
+# The characters that may follow the product's name in a file name: a release is published as "UltraTerm_3.8.4.dmg",
+# as "UltraTerm.app.tgz" or as "ultraterm-3.8.4.tgz".
+REAP_RELEASE_SEPARATORS = " _.+-"
+# A file that names the product is a release when it carries one of these extensions, or a bundle inside it, or a version.
+REAP_RELEASE_SHAPES = (".zip", ".tar", ".tar.gz", ".tar.xz", ".tar.zst", ".tar.bz2", ".tgz", ".txz", ".7z", ".xip", ".gz",
+                        ".bz2", ".xz", ".zst", ".lz", ".lzma", ".lzh", ".cab", ".msu", ".rar", ".iso", ".img", ".snap",
+                        ".flatpak", ".msi", ".exe", ".appimage", ".deb", ".rpm", ".appx", ".appxbundle", ".msixbundle",
+                        ".mpkg", ".app", ".dmg", ".pkg", ".ipa", ".msix")
+REAP_RELEASE_SCAN_ENTRIES = 500000     # entries one release-artifact scan may list before it gives up
+REAP_RELEASE_SCAN_DEPTH = 32           # levels below the target the release-artifact scan may enter
+REAP_RELEASE_VERSION_BYTES = 1 << 20  # a bundle's Info.plist is small; a bigger one is not read
+# No directory is skipped because of its name: a folder that happens to be called "deps" or "examples" may hold a
+# distributable, and a scan that skipped it could not prove that the target holds no other release. A protected name
+# and a git directory are never entered (the engine's own rules everywhere), and a release artifact is read, not
+# entered. The entry budget and the depth cap keep the folder when they are reached.
+REAP_RELEASE_VERSION = re.compile(r"(\d+\.\d+\.\d+)")
 REAP_WALK_ENTRIES = 500000            # entries the names-only protected scan may list before it refuses
 REAP_MAX_DEPTH = 128                  # directory levels a scan or the removal descends; deeper fails closed
 REAP_AUDIT_SECONDS = 240              # default wall-clock budget of one reap-status sizing pass
@@ -1196,7 +1229,7 @@ def reap_protected_scan(path: str, allow_git: bool = False, markers: bool = Fals
             if any(marked_evidence_keep(n) for n in names):
                 raise ReapRefused("marked-evidence-kept-record:" + (rel or "."))
         if (rel or allow_git) and reap_fold(os.path.basename(current)) == "target" and reap_cache_retention(current) != REAP_DISPOSABLE \
-                and reap_target_release_bearing(current):
+                and reap_target_release_bearing(current) and not reap_target_release_superseded(current):
             # Also protect a release-bearing target when an enclosing clone/cache is
             # considered: otherwise whole-clone cleanup would bypass output retention.
             raise ReapRefused("retention-preserved:release-runtime-rollback:" + (rel or "target"))
@@ -1328,12 +1361,14 @@ def reap_retention(item: dict) -> str:
 
 
 def reap_target_release_bearing(path: str) -> bool:
-    """Names-only check of Cargo's target/release and target/<triple>/release layouts.
-    Signed/distributable artifacts at these levels also require an explicit output disposable marker.
+    """Names-only check of Cargo's target/release and target/<triple>/release layouts: a release directory, or a
+    release artifact at the top of the target or one level below it.
+    A target this class holds is kept unless the rule below (reap_target_release_superseded) proves that every
+    release artifact it holds is a superseded release of the installed product.
     Unreadable or over-budget inventories preserve; protected directories and symlinks are never entered.
     """
     listed = 0
-    artifacts = (".app", ".dmg", ".pkg", ".ipa", ".msix", ".sig", ".asc")
+    artifacts = REAP_RELEASE_ARTIFACTS + REAP_RELEASE_SIGNATURES  # the engine's own release-artifact set
     def scan(fd, depth):
         nonlocal listed
         with os.scandir(fd) as entries:
@@ -1363,6 +1398,307 @@ def reap_target_release_bearing(path: str) -> bool:
             os.close(fd)
     except OSError:
         return True
+
+
+# ---- a superseded release candidate's cargo target -------------------------------------------------------------------
+# A cargo target that holds a release artifact is kept: the installed version and the single rollback must survive. The
+# class never asked WHICH release it holds, so a target that holds a build the host replaced long ago was held for good. The rule below asks what the artifact is and what version it carries: a bundle's own
+# CFBundleShortVersionString and CFBundleIdentifier, a disk image or package's version in its file name. The target may
+# go only when every artifact it holds is an artifact of the INSTALLED PRODUCT and carries a version older than the
+# installed one, and none of them is the installed version or the retained rollback. An unknown installed version,
+# rollback version, product identifier or product name, a version that cannot be read, a target whose artifacts cannot
+# all be enumerated and a target that holds no release artifact at all are all kept: over-retention is the safe answer.
+
+
+def reap_release_product_version(name: str, product: str) -> str | None:
+    """The version a file name carries when it names the installed product: the product's name, a separator and its
+    version. None when the name is not the product's, when it carries no version, or when it carries a second one:
+    which version is the release is then not said."""
+    match = re.fullmatch(re.escape(reap_fold(product)) + "[" + re.escape(REAP_RELEASE_SEPARATORS) +
+                         r"]v?(\d+\.\d+\.\d+)([" + re.escape(REAP_RELEASE_SEPARATORS) + r"].*)?", reap_fold(name))
+    if not match or REAP_RELEASE_VERSION.search(match.group(2) or ""):
+        return None
+    return match.group(1)
+
+
+def reap_release_mentions_product(name: str, product: str) -> bool:
+    """True when a file name names the installed product: its name is in it, followed by a separator or the end of the
+    name, or its name is in it with the separators left out and followed by a version ("ultra-term-3.8.4.tar.xz" is
+    "My App" too). A longer word that starts with the product's name ("UltraTermHelper_1.0.0.pkg") is something else."""
+    folded, literal = reap_fold(name), reap_fold(product)
+    if not literal:
+        return False
+    start = folded.find(literal)
+    while start >= 0:
+        end = start + len(literal)
+        before = folded[start - 1] if start else ""
+        if (not before or not before.isalpha()) and (end == len(folded) or not folded[end].isalpha()):
+            return True
+        start = folded.find(literal, start + 1)
+    def bare(text: str) -> str:
+        for separator in REAP_RELEASE_SEPARATORS:
+            text = text.replace(separator, "")
+        return text
+    stem, stripped = bare(literal), bare(folded)
+    if not stem:
+        return False
+    start = stripped.find(stem)
+    while start >= 0:
+        end = start + len(stem)
+        before = stripped[start - 1] if start else ""
+        if (not before or not before.isalpha()) and (end == len(stripped) or not stripped[end].isalpha()):
+            return True
+        start = stripped.find(stem, start + 1)
+    return False
+
+
+def reap_release_product_shape(name: str) -> bool:
+    """True when a file name looks like a release of the installed product: it carries a compression or installer
+    extension, or a bundle inside it. A name that merely carries a version is not a release: a crate archive
+    ("ultraterm-0.1.0.crate") is the library's version, not the app's."""
+    folded = reap_fold(name)
+    if any(folded.endswith(suffix) for suffix in REAP_RELEASE_SHAPES):
+        return True
+    return any("." + suffix.lstrip(".") in folded for suffix in REAP_RELEASE_ARTIFACTS)
+
+
+def reap_release_artifact_kind(name: str) -> str | None:
+    """What a name is for the release rule: a bundle, disk image, package, archive or installer ('release'), or a
+    signature of one ('signature'). None for every other name."""
+    folded = reap_fold(name)
+    if any(folded.endswith(suffix) for suffix in REAP_RELEASE_SCAN_ARTIFACTS):
+        return "signature" if any(folded.endswith(suffix) for suffix in REAP_RELEASE_SIGNATURES) else "release"
+    return None
+
+
+def reap_release_listing(fd: int, budget: list[int]) -> list[tuple[str, str]] | None:
+    """The names in one open directory with their kind ('d' a directory, 'f' a file, 'l' a symlink): a symlink is named,
+    never followed. None when the directory cannot be read or the scan's budget is gone."""
+    try:
+        entries = []
+        with os.scandir(fd) as scan:
+            for entry in scan:
+                budget[0] -= 1
+                if budget[0] < 0:
+                    return None
+                try:
+                    info = entry.stat(follow_symlinks=False)
+                except OSError:
+                    return None
+                kind = "l" if stat.S_ISLNK(info.st_mode) else ("d" if stat.S_ISDIR(info.st_mode) else "f")
+                entries.append((entry.name, kind))
+        return entries
+    except OSError:
+        return None
+
+
+def reap_release_bundle_info(fd: int) -> tuple[str | None, str | None]:
+    """The version and the bundle identifier of an open .app bundle, read from its own Info.plist: a symlink is never
+    followed, a fifo never blocks the read, and only a small regular file this user owns is read. None, None when it
+    cannot be read."""
+    try:
+        contents = os.open("Contents", REAP_DIR_FLAGS, dir_fd=fd)
+    except OSError:
+        return None, None
+    try:
+        try:
+            plist = os.open("Info.plist", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=contents)
+        except OSError:
+            return None, None
+        try:
+            try:
+                meta = os.fstat(plist)
+                if not stat.S_ISREG(meta.st_mode) or meta.st_uid != os.getuid() or meta.st_nlink != 1 \
+                        or meta.st_size > REAP_RELEASE_VERSION_BYTES:
+                    return None, None
+                data = os.read(plist, REAP_RELEASE_VERSION_BYTES + 1)
+            except OSError:
+                return None, None
+        finally:
+            os.close(plist)
+    finally:
+        os.close(contents)
+    if len(data) > REAP_RELEASE_VERSION_BYTES:
+        return None, None
+    try:
+        values = plistlib.loads(data)
+        version, identifier = values.get("CFBundleShortVersionString"), values.get("CFBundleIdentifier")
+    except Exception:  # a malformed plist, or one that is not a dictionary, carries no readable version
+        return None, None
+    return (version if isinstance(version, str) else None,
+            identifier.strip() if isinstance(identifier, str) else None)
+
+
+def reap_target_release_artifacts(path: str, product: str | None = None) -> tuple[list[dict], bool]:
+    """Every release artifact a cargo target holds, and whether the scan could enumerate them all.
+
+    Each artifact is a record: its path below the target, the version it carries (None when it carries none that can
+    be read), the bundle identifier of a bundle (None for everything else), whether it is a bundle, whether it names the
+    installed product, and whether it is opaque (a directory that is named like an artifact but is not a bundle:
+    nothing can be read from it). A file is an artifact when its suffix is a release artifact or an installer of one,
+    when its name names the installed product and carries a version, or when its name mentions the installed product in
+    any spelling and carries a version. A file of the product whose version cannot be read keeps the folder: what it
+    holds is not a release the rule may compare. A Cargo package archive (".crate") is the library's version, not the
+    app's release, so it is not recorded at all. A release file that neither carries one of those suffixes nor names or
+    mentions the installed product is not recorded, even when it carries a clear version.
+    The version and the identifier of a bundle are read while the bundle is in hand, descriptor-relative, so no path
+    can be swapped in between. The scan walks the whole target and enters every directory except a protected name, a
+    git directory and a release artifact itself. A directory that cannot be read, a tree deeper than the cap, a scan
+    that ran out of budget and a directory whose identity changed make the scan incomplete: an incomplete scan keeps
+    the folder, because the scan is what proves the folder holds no other release."""
+    budget = [REAP_RELEASE_SCAN_ENTRIES]
+    artifacts: list[dict] = []
+
+    def record(rel: str, version: str | None, identifier: str | None, bundle: bool = False,
+               product_artifact: bool = False, opaque: bool = False) -> None:
+        artifacts.append({"path": rel, "version": version, "identifier": identifier, "bundle": bundle,
+                          "product": product_artifact, "opaque": opaque})
+
+    def scan(fd: int, rel: str, depth: int) -> bool:
+        listing = reap_release_listing(fd, budget)
+        if listing is None:
+            return False
+        # Every artifact of this listing is recorded before anything below it is entered: the order inside a listing
+        # must not decide what a scan with a tight budget finds.
+        for name, kind in listing:
+            child = f"{rel}/{name}" if rel else name
+            artifact = reap_release_artifact_kind(name)
+            named = reap_release_product_version(name, product) if product else None
+            # A file is an artifact when its suffix is a known release artifact, or when it names the installed product
+            # and looks like a release of it: a name that carries the product's name, a separator and its version, or
+            # the product's name and an archive, an installer or a bundle inside it.
+            shaped = bool(product and reap_release_product_shape(name))
+            mentions = bool(product and reap_release_mentions_product(name, product))
+            versioned = bool(mentions and REAP_RELEASE_VERSION.search(name))
+            crate = reap_fold(name).endswith(".crate")
+            if kind == "d":
+                # A directory is a bundle when it is named like one; any other directory is not an artifact.
+                if artifact is None:
+                    continue
+            elif artifact is None and not mentions and named is None:
+                continue  # not a release artifact, and not named for the installed product
+            if kind != "d":
+                if artifact is not None:
+                    # A known release artifact: the product's, when its name says so, and something else's otherwise.
+                    version = named
+                    product_artifact = version is not None
+                    if version is None and mentions:
+                        versions = set(REAP_RELEASE_VERSION.findall(name))
+                        version = versions.pop() if len(versions) == 1 else None
+                        product_artifact = True
+                    record(child, version, None, bundle=False, product_artifact=product_artifact)
+                    continue
+                if crate:
+                    continue  # a Cargo package archive is the library's version, not the app's release
+                if named is not None:
+                    # The product's name and its version, but not a format the rule knows: what the file holds is not
+                    # a release this rule may compare, so its version stays unclear and the folder is kept.
+                    record(child, None, None, bundle=False, product_artifact=True)
+                    continue
+                if mentions and shaped:
+                    # The product's own file: the version is whatever the name carries, and a name that carries no
+                    # clear version keeps the folder.
+                    versions = set(REAP_RELEASE_VERSION.findall(name))
+                    record(child, versions.pop() if len(versions) == 1 else None, None, bundle=False,
+                           product_artifact=True)
+                    continue
+                if versioned:
+                    # The product's name and a version, but not a format the rule knows: what the file holds is not a
+                    # release the rule may compare, so its version stays unclear and the folder is kept.
+                    record(child, None, None, bundle=False, product_artifact=True)
+                    continue
+                continue
+            if not reap_fold(name).endswith(".app"):
+                record(child, named, None, bundle=False, product_artifact=named is not None, opaque=True)
+                continue
+            try:
+                info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                bundle = os.open(name, REAP_DIR_FLAGS, dir_fd=fd)
+            except OSError:
+                record(child, named, None, bundle=False, product_artifact=named is not None, opaque=True)
+                continue
+            try:
+                try:
+                    opened = os.fstat(bundle)
+                except OSError:
+                    record(child, named, None, bundle=False, product_artifact=named is not None, opaque=True)
+                    continue
+                if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                    record(child, named, None, bundle=False, product_artifact=named is not None, opaque=True)
+                    continue
+                version, identifier = reap_release_bundle_info(bundle)
+            finally:
+                os.close(bundle)
+            if named is not None and version is not None and named != version:
+                # The name and the bundle's own plist disagree about the version: which one is the release is not said.
+                version = None
+            record(child, version, identifier, bundle=True, product_artifact=True)
+        for name, kind in listing:
+            if kind != "d" or reap_release_artifact_kind(name) is not None:
+                continue  # a file, a symlink or an artifact: never entered, and it holds no release of its own
+            child = f"{rel}/{name}" if rel else name
+            if depth + 1 > REAP_RELEASE_SCAN_DEPTH:
+                return False  # deeper than the cap: what is below cannot be proved
+            if reap_protected(name) or reap_is_git(name):
+                continue
+            try:
+                info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                child_fd = os.open(name, REAP_DIR_FLAGS, dir_fd=fd)
+            except OSError:
+                return False
+            try:
+                try:
+                    opened = os.fstat(child_fd)
+                except OSError:
+                    return False
+                if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                    return False  # the directory was swapped for another one: what is below cannot be proved
+                if not scan(child_fd, child, depth + 1):
+                    return False
+            finally:
+                os.close(child_fd)
+        return True
+
+    try:
+        root = os.open(path, REAP_ROOT_FLAGS)
+    except OSError:
+        return [], False
+    try:
+        complete = scan(root, "", 0)
+    finally:
+        os.close(root)
+    return artifacts, complete
+
+
+def reap_target_release_superseded(path: str) -> bool:
+    """True when the target holds release artifacts of the installed product and every one of them carries a version
+    older than the installed one, and none of them is the installed version or the retained rollback. An unknown
+    installed version, rollback version, product identifier or product name, an unreadable artifact version, an opaque
+    artifact, an artifact of another product, an artifact the scan could not enumerate, or no artifact at all: False,
+    which keeps the folder."""
+    marks = reap_release_marks()
+    installed = reap_version_tuple(marks.get("installed") or "")
+    rollback = reap_version_tuple(marks.get("rollback") or "")
+    identifier, product = marks.get("identifier"), marks.get("name")
+    if installed is None or rollback is None or not identifier or not product:
+        return False
+    artifacts, complete = reap_target_release_artifacts(path, product)
+    if not complete or not artifacts:
+        return False
+    for artifact in artifacts:
+        if artifact.get("opaque"):
+            return False  # a directory named like an artifact: nothing can be read from it
+        if artifact.get("bundle"):
+            if not artifact.get("identifier") or artifact["identifier"].strip() != identifier.strip():
+                return False  # a bundle of another product, or one that does not say which product it is
+        elif not artifact.get("product"):
+            return False  # not the installed product's artifact: its name says nothing about the installed one
+        version = reap_version_tuple(artifact.get("version") or "")
+        if version is None:
+            return False
+        if version >= installed or version == rollback:
+            return False
+    return True
 
 
 def marked_evidence_expiry_days(policy: dict) -> int:
@@ -1515,7 +1851,7 @@ def reap_item_retention(item: dict, prove: bool = True) -> str:
     if os.path.basename(item["path"]) == "target" and cls in ("job-derived-output", "job-clone-regenerable", "job-cache-subdir"):
         # Cargo's release profile can contain either rebuildable binaries or retained signed releases.
         # Neither the target name, cache tag nor a parent disposable marker resolves that ambiguity.
-        if reap_target_release_bearing(item["path"]):
+        if reap_target_release_bearing(item["path"]) and not reap_target_release_superseded(item["path"]):
             return "release-runtime-rollback"
     if cls == "job-derived-output" and item.get("kind") in REAP_OUTPUT_KINDS \
             and os.path.basename(item["path"]) == item["kind"]:
@@ -5724,12 +6060,36 @@ def reap_tick_owned(conn, policy: dict, live: list, actions: list, errors: list,
 
 # ---- superseded release candidates ----------------------------------------------------------------------------------
 
-def reap_app_version(app: Path) -> str | None:
+def reap_app_plist(app: Path) -> tuple[str | None, str | None]:
+    """The version and the bundle identifier of a macOS app, read from its own plist: the plist itself is never
+    followed through a symlink, a fifo never blocks the read, and only a small regular file this user owns is read.
+    None, None when it cannot be read."""
     try:
-        with open(app / "Contents" / "Info.plist", "rb") as stream:
-            version = plistlib.load(stream).get("CFBundleShortVersionString")
-    except (OSError, ValueError, plistlib.InvalidFileException):
-        return None
+        fd = os.open(app / "Contents" / "Info.plist", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return None, None
+    try:
+        meta = os.fstat(fd)
+        if not stat.S_ISREG(meta.st_mode) or meta.st_uid != os.getuid() or meta.st_nlink != 1 \
+                or meta.st_size > REAP_RELEASE_VERSION_BYTES:
+            return None, None
+        data = os.read(fd, REAP_RELEASE_VERSION_BYTES + 1)
+    except OSError:
+        return None, None
+    finally:
+        os.close(fd)
+    try:
+        values = plistlib.loads(data)
+        version, identifier = values.get("CFBundleShortVersionString"), values.get("CFBundleIdentifier")
+    except Exception:  # a malformed plist, or one that is not a dictionary, carries nothing
+        return None, None
+    return (version if isinstance(version, str) else None,
+            identifier.strip() if isinstance(identifier, str) else None)
+
+
+def reap_app_version(app: Path) -> str | None:
+    """The version of a macOS app, read from its own plist. None when it cannot be read."""
+    version, _ = reap_app_plist(app)
     return version if isinstance(version, str) and re.match(r"^\d+\.\d+\.\d+", version) else None
 
 
