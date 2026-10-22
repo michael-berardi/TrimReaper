@@ -2750,6 +2750,8 @@ def reap_scratch_idle_proof(path: str, policy: dict | None = None, seconds: floa
         again = os.lstat(path)  # the same folder, still: a root that was swapped under the walk keeps the folder
         if (again.st_dev, again.st_ino) != (root.st_dev, root.st_ino):
             raise ReapRefused("walk-root-changed")
+        if again.st_mtime > cutoff:
+            raise ReapRefused("recent-change")  # the root changed while the walk ran: it is not quiet
     except ReapRefused as refusal:
         proof["reason"] = str(refusal)
     except OSError as error:
@@ -4503,7 +4505,8 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
                 # not taken now: the next pass lists it as disposable and removes it, so a removal receipt always says so.
                 proof = reap_scratch_idle_proof(item["path"], seconds=item.get("idleSeconds"))
                 item["idleProof"], result["idleProof"] = proof, proof
-                item["idleSeconds"] = max(0.0, float(item.get("idleSeconds") or 0) - proof["elapsed"])  # what is left of it
+                if item.get("idleSeconds") is not None:  # a missing budget is no cap, not zero seconds
+                    item["idleSeconds"] = max(0.0, float(item["idleSeconds"]) - proof["elapsed"])  # what is left of it
                 if proof["idle"]:
                     raise ReapRefused("retention-changed")
                 raise ReapRefused(reap_item_idle_reason(item))
@@ -4538,7 +4541,8 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
             if item.get("class") == "agent-scratch":
                 if isinstance(item.get("idleProof"), dict):
                     result["idleProof"] = item.get("idleProof")  # the proof this call just took, with the budget it spent
-                    item["idleSeconds"] = max(0.0, float(item.get("idleSeconds") or 0) - item["idleProof"].get("elapsed", 0.0))
+                    if item.get("idleSeconds") is not None:
+                        item["idleSeconds"] = max(0.0, float(item["idleSeconds"]) - item["idleProof"].get("elapsed", 0.0))
             if retention != REAP_DISPOSABLE:
                 if item.get("class") == "agent-scratch" and retention == "unmarked":
                     raise ReapRefused(reap_item_idle_reason(item))

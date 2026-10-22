@@ -84,11 +84,10 @@ failures keep a folder that would otherwise be idle: an entry it cannot read, a 
 was swapped under the walk, a tree deeper than the walk may go, and expiry turned off. The proof is taken again before
 the removal, and a folder that changed in between is kept.
 
-Every folder the reaper keeps says why, except the ones another gate keeps (a marker, a claim, a protected name, a git
-proof): an unmarked folder kept by its idle proof names it (`idle-recent-change`, `idle-budget-exceeded`,
+An unmarked folder kept by its idle proof names why (`idle-recent-change`, `idle-budget-exceeded`,
 `idle-budget-time-exceeded`, `idle-budget-bytes-exceeded`, `idle-unreadable`, `idle-protected-leaf`, `idle-too-deep`,
-`idle-expiry-off`). A folder that aged out between the listing and the removal is refused as `retention-changed` and
-goes on the next pass.
+`idle-expiry-off`); a folder kept by another gate (a marker, a claim, a git proof) carries that gate's own reason. A
+folder that aged out between the listing and the removal is refused as `retention-changed` and goes on the next pass.
 
 A folder marked `disposable` should be marked when the work is done, not when the folder is created: the marker makes
 the folder disposable whatever the proof says.
