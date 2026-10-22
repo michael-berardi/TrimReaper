@@ -207,6 +207,7 @@ RELEASE_EVIDENCE_NAME = re.compile(r"^(?:(?P<product>[a-z][a-z-]*?)-)?(?P<versio
 AGENT_SCRATCH_IDLE_MAX_ENTRIES = 200000   # entries one folder's idle walk may list; past it the walk stops and says so
 AGENT_SCRATCH_IDLE_MAX_BYTES = 0          # bytes one folder's idle walk may see; 0 = no byte bound (bytes bound no work)
 AGENT_SCRATCH_IDLE_SECONDS = 10           # wall-clock budget of one folder's idle walk; past it the walk stops and says so
+AGENT_SCRATCH_LIST_SECONDS = 20           # the whole listing of the agent-scratch root may spend this long proving folders
 AGENT_SCRATCH_TICK_SECONDS = 3600     # the tick sweeps agent scratch at most hourly
 
 
@@ -1476,8 +1477,11 @@ def reap_no_retained_names(path: str) -> bool:
     return not hit
 
 
-def reap_item_retention(item: dict) -> str:
-    """A marker decides; without one, `disposable` is derived only in the three self-cleaning cases (see REAP_DERIVED_KINDS)."""
+def reap_item_retention(item: dict, prove: bool = True) -> str:
+    """A marker decides; without one, `disposable` is derived only in the three self-cleaning cases (see REAP_DERIVED_KINDS).
+
+    `prove` is the caller's own budget in one flag: a listing whose budget is spent asks for the retention without the
+    idle proof, so an agent-scratch folder is kept unproven (a marker still decides) instead of being walked again."""
     if item.get("class") == "job-cache-subdir" and marked_evidence_keep(os.path.basename(item["path"])):
         return "evidence"
     if reap_marked_evidence_item(item):
@@ -1532,6 +1536,9 @@ def reap_item_retention(item: dict) -> str:
         # and the budget it spent) rides on the item, so the receipt says why the folder stayed instead of naming an
         # unmarked folder and nothing else.
         if found == "unmarked":
+            if not prove:
+                item.pop("idleProof", None)  # the caller's budget is spent: the folder is kept, unproven
+                return found
             proof = reap_scratch_idle_proof(item["path"], seconds=item.get("idleSeconds"))
             item["idleProof"] = proof
             if proof["idle"]:
@@ -2821,8 +2828,12 @@ def reap_release_evidence_items() -> list[dict]:
     return items
 
 
-def reap_agent_scratch_items() -> list[dict]:
-    """Every top-level folder of the agent-scratch root as an item. Names only; symlinks and protected names are not items."""
+def reap_agent_scratch_items(deadline: float | None = None) -> list[dict]:
+    """Every top-level folder of the agent-scratch root as an item. Names only; symlinks and protected names are not items.
+
+    `deadline` bounds the idle proof the listing takes: every folder's walk gets what is left of it, so one listing never
+    spends more than its caller's budget on the whole root. A folder the listing could not prove is kept, unproven (a
+    marker still decides), and the next pass proves it again."""
     root = reap_agent_scratch_root()
     try:
         entries = sorted(os.scandir(root), key=lambda e: e.name)
@@ -2834,6 +2845,12 @@ def reap_agent_scratch_items() -> list[dict]:
             continue
         item = {"path": reap_canon(entry.path), "root": reap_canon(root), "owner": AGENT_SCRATCH_OWNER, "jobs": [],
                 "class": "agent-scratch", "kind": "agent-scratch", "ownership": "agent-scratch-dir"}
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            items.append({**item, "retention": reap_item_retention(item, prove=False)})  # the budget is spent: kept, unproven
+            continue
+        if remaining is not None:
+            item["idleSeconds"] = remaining  # the walk gets what is left of the caller's budget
         items.append({**item, "retention": reap_item_retention(item)})
     return items
 
@@ -5770,10 +5787,10 @@ def reap_agent_scratch(dry_run: bool) -> dict:
     """Idle folders of the agent-scratch root through the same guarded per-item path (reap --agentScratch, and the tick)."""
     mode, ctx = ("dry-run" if dry_run else "delete"), {"run": uuid.uuid4().hex[:12]}
     if mode != "delete":
-        done, stopped = reap_sweep(reap_agent_scratch_items(), mode, ctx)
+        done, stopped = reap_sweep(reap_agent_scratch_items(time.monotonic() + AGENT_SCRATCH_LIST_SECONDS), mode, ctx)
     else:
         with reap_cleanup_owner("agent-scratch"):
-            done, stopped = reap_sweep(reap_agent_scratch_items(), mode, ctx)
+            done, stopped = reap_sweep(reap_agent_scratch_items(time.monotonic() + AGENT_SCRATCH_LIST_SECONDS), mode, ctx)
     out = {"items": done, **({"stopped": stopped} if stopped else {})}
     out.update(reap_summarize(done))
     return out
@@ -5846,7 +5863,7 @@ def reap_agent_scratch_tick(conn, actions: list, errors: list) -> None:
         if expired["deleted"]:
             log_event(conn, "archive.expired", None, "tick", {"reclaimedBytes": expired["reclaimedBytes"], "deleted": expired["deleted"]})
             actions.append({"did": "expired-archives", "items": expired["deleted"], "bytes": expired["reclaimedBytes"]})
-    if not any(i["retention"] == REAP_DISPOSABLE for i in reap_agent_scratch_items()):
+    if not any(i["retention"] == REAP_DISPOSABLE for i in reap_agent_scratch_items(time.monotonic() + AGENT_SCRATCH_LIST_SECONDS)):
         return  # idle ticks take no cleanup lease and grow no journal
     out = reap_agent_scratch(False)
     if out.get("stopped"):
@@ -6283,7 +6300,7 @@ def reap_audit(only: str | None, limit: int, include_items: bool, budget: int, p
         release_rows.append(entry)
     scratch_rows = []
     if not only:
-        for item in reap_agent_scratch_items():
+        for item in reap_agent_scratch_items(deadline):  # the listing proves what it can within the audit's own budget
             audited = reap_audit_item(item, None, ctx, deadline)
             scratch_rows.append(audited)
             reap_bucket(categories, reasons, audited, reason_bytes)
