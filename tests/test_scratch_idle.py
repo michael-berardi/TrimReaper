@@ -10,10 +10,10 @@ from unittest import mock
 
 from trimreaper import core
 
-from helpers import Home
+from helpers import ScratchHome
 
 
-class ScratchIdle(Home):
+class ScratchIdle(ScratchHome):
     config_extra = {"scratchRoot": "~/.cache/agent-scratch"}
 
     def scratch(self, name: str) -> Path:
@@ -95,6 +95,52 @@ class ScratchIdle(Home):
         proof = core.reap_scratch_idle_proof(str(task))
 
         self.assertTrue(proof["idle"], proof)  # the link is an entry of its own; the tree it points at is elsewhere
+
+    def test_a_deep_metadata_change_keeps_its_real_ctime_in_the_aged_fixture(self):
+        task = self.scratch("deep-metadata-task")
+        leaf = self.put(task, "a/b/c/inner.txt")
+        self.age(task, 20)
+        before = leaf.stat().st_mtime_ns
+        os.chmod(leaf, 0o600)
+
+        proof = core.reap_scratch_idle_proof(str(task))
+
+        self.assertFalse(proof["idle"], proof)
+        self.assertEqual(proof["reason"], "recent-change")
+        self.assertEqual(leaf.stat().st_mtime_ns, before)
+        self.assertGreaterEqual(proof["newest"], leaf.stat().st_ctime)
+
+    def test_restoring_a_deep_files_mtime_does_not_hide_a_write(self):
+        task = self.scratch("restored-mtime-task")
+        leaf = self.put(task, "a/b/c/inner.txt")
+        self.age(task, 20)
+        stamp = leaf.stat().st_mtime_ns
+        leaf.write_bytes(b"new data")
+        os.utime(leaf, ns=(stamp, stamp))
+
+        proof = core.reap_scratch_idle_proof(str(task))
+
+        self.assertFalse(proof["idle"], proof)
+        self.assertEqual(proof["reason"], "recent-change")
+        self.assertEqual(leaf.stat().st_mtime_ns, stamp)
+
+    def test_a_root_metadata_change_at_the_end_of_the_walk_is_kept(self):
+        task = self.scratch("root-last-look-task")
+        self.put(task, "inner.txt")
+        self.age(task, 20)
+        walk = core.reap_fd_walk
+
+        def changed(*args, **kwargs):
+            result = walk(*args, **kwargs)
+            os.chmod(task, 0o750)
+            return result
+
+        with mock.patch.object(core, "reap_fd_walk", side_effect=changed):
+            proof = core.reap_scratch_idle_proof(str(task))
+
+        self.assertFalse(proof["idle"], proof)
+        self.assertEqual(proof["reason"], "recent-change")
+        self.assertGreaterEqual(proof["newest"], task.stat().st_ctime)
 
     # ---- the budget --------------------------------------------------------------------------------------------------
 
@@ -218,9 +264,9 @@ class ScratchIdle(Home):
         locked = task / "locked"
         locked.mkdir(parents=True)
         self.put(locked, "inner.txt")
-        self.age(task, 20)
         os.chmod(locked, 0o000)
         self.addCleanup(os.chmod, locked, 0o700)
+        self.age(task, 20)
 
         proof = core.reap_scratch_idle_proof(str(task))
 
@@ -609,7 +655,7 @@ class ScratchIdle(Home):
         self.assertEqual(out["reason"], "retention-preserved:unmarked")
         self.assertTrue(task.exists())
 
-    def test_the_proof_names_the_newest_mtime_it_saw(self):
+    def test_the_proof_names_the_newest_change_it_saw(self):
         task = self.scratch("newest-task")
         self.put(task, "sub/inner.txt")
         self.age(task, 20)

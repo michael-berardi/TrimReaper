@@ -70,17 +70,19 @@ anything else is kept.
 
 The proof covers the whole tree. The walk is descriptor-relative end to end: the folder is opened with no symlink in any
 component, every child directory is opened with `O_NOFOLLOW` and compared with the `lstat` that chose it, so a directory
-swapped for a link is never entered, and a link is never followed. It reads every entry's mtime, so a change anywhere in
-the tree is seen, however deep - as long as the change moved a file's mtime (the limit of an mtime rule is named below).
+swapped for a link is never entered, and a link is never followed. It reads the later of mtime and ctime for the root
+and every entry. A copy with preserved modification times and a metadata-only change therefore restart the quiet window.
+A mount root or an entry on another device keeps the folder as `idle-mountpoint`, before it is entered or counted.
 By default a protected name (`.env*`, `.dev.vars*`, `.wrangler`, `.vercel`) is named but never stat'ed, opened or entered,
 and it keeps the folder. The explicit `agentScratchProtectedCopies: "archive"` exception covers only a canonical
-`scratchRoot/<task>` outside job-cache and archive roots. Its idle proof also checks protected descendants' mtimes,
+`scratchRoot/<task>` outside job-cache and archive roots. Its idle proof also checks protected descendants' mtime and ctime,
 within the same budget and no-follow fence: a recent change there keeps the task. Preserving markers and filesystem
 flags still refuse removal. Once all other gates pass, every protected file is saved into a private, verified
 `protected.tar.gz` before the task goes, including files outside a repository and inside dependency output. A fresh
-post-archive tree comparison and the final authority/process checks still run. A missing, failed, oversized or stale
-archive keeps the task. Scratch protected-copy archives never expire automatically, so removal cannot destroy the
-only copy of protected material. A dry run only plans the archive and does not create it.
+post-archive tree comparison and the final authority/process checks still run. At unlink, each protected file must still
+match the exact archived identity and bytes; newly appeared or changed protected material stops removal. A missing,
+failed, oversized or stale archive keeps the task. Scratch protected-copy archives never expire automatically, so removal
+cannot destroy the only copy of protected material. A dry run only plans the archive and does not create it.
 
 The walk is bounded per folder, and the bound is on the record. `agentScratchIdleMaxEntries` (200000) limits how many entries
 one folder's walk may list, `agentScratchIdleMaxBytes` (0: no byte bound) how many bytes it may see, and
@@ -97,7 +99,7 @@ between is kept.
 
 An unmarked folder kept by its idle proof names why (`idle-recent-change`, `idle-budget-exceeded`,
 `idle-budget-time-exceeded`, `idle-budget-bytes-exceeded`, `idle-unreadable`, `idle-protected-leaf`, `idle-too-deep`,
-`idle-expiry-off`); a folder kept by another gate (a marker, a claim, a git proof) carries that gate's own reason. A
+`idle-expiry-off`, `idle-mountpoint`); a folder kept by another gate (a marker, a claim, a git proof) carries that gate's own reason. A
 scratch folder whose last proof stops on a budget is refused by that budget reason (`idle-budget-time-exceeded`); any
 other change at that final look is refused as `retention-changed`, and the folder goes on the next pass. A folder kept
 by any other class's gate is refused as `retention-changed` too.
@@ -118,10 +120,14 @@ re-derived at the gate, and again immediately before the removal) and one sizing
 per-folder budget rather than what the first one left of it. A caller that hands in its own `idleDeadline` can shorten a
 proof, and a shortened proof only keeps a folder.
 
-The proof reads mtimes only. A tree that arrives in the scratch root with its old times preserved (moved in with `mv`,
-copied with `cp -a` or `rsync -a`, unpacked from an archive that keeps them) looks idle, and a folder that is not held by
-a claim, an open file, a protected name or a git proof can go on the next pass. Mark such a folder (`trimreaper mark
-<folder> evidence`) to keep it.
+A caller-supplied absolute idle deadline is shared by every later re-proof, without resetting its clock. Directory-name
+enumeration checks the walk deadline too, including empty folders. These are cooperative bounds on idle-proof work,
+not hard interruptions of filesystem calls or deadlines for the separate git, process, receipt and removal gates.
+
+`idleProof.newest` is the newest change time observed: `max(st_mtime, st_ctime)`, not mtime alone. The OS sets ctime;
+copy and archive tools cannot restore an old one. Metadata changes can only keep a folder longer than an mtime-only
+rule would. This is a quiet-window proof, not indefinite retention: use `trimreaper mark <folder> evidence` when needed.
+Tests synthesize old ctimes for unchanged fixture identities; production has no clock or stat-backdating switch.
 
 ## Narrow exact-output route
 
