@@ -114,6 +114,12 @@ Every command prints one JSON document on stdout. Exit status:
 | Its own archives | `archiveExpiryDays` (30) after the archive became the only copy |
 | Old release builds and release evidence | Off until configured: [docs/CONFIGURATION.md](docs/CONFIGURATION.md) |
 
+Release-target retention allows only known older artifacts of the installed product to be reclaimed. The installed
+version, rollback and anything newer stay. Unknown or ambiguous product identity or version, an incomplete inventory,
+a version without all three numeric parts, or disagreement between a bundle's name and plist fail closed: the affected
+artifacts stay. This fixes the existing reaper rule, not a new retention class; locks, live claims and Git safeguards
+are unchanged.
+
 A host with the producer registry enabled can reclaim an exact `target` or `node_modules` of a settled finished,
 failed, cancelled or verifiably interrupted job even when a continuation keeps the source worktree. This requires the
 producer's source/output identity record, shared build locks, no live claim on the exact output, no open files and

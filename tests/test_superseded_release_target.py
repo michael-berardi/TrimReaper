@@ -383,6 +383,46 @@ class SupersededReleaseTarget(Home):
         self.assertTrue(target.exists())
         self.assertKept(out)
 
+    def test_malformed_bundle_versions_keep_the_target(self):
+        self.configure(self.installed, self.rollback)
+        repo = self.clone("app-j0200")
+        target = self.target_with(repo)
+        plist = target / "release/bundle/macos/UltraTerm.app/Contents/Info.plist"
+        for version in ("3.7.0garbage", "3.7.0.1", "3.7.0\n", "v3.7.0", "3.7.0-beta", "9" * 5000 + ".0.0"):
+            with self.subTest(version=version[:40]):
+                plist.write_bytes(plistlib.dumps({"CFBundleShortVersionString": version,
+                                                  "CFBundleIdentifier": self.IDENTIFIER}))
+                self.assertFalse(core.reap_target_release_superseded(str(target)))
+
+    def test_malformed_file_versions_keep_the_target(self):
+        self.configure(self.installed, self.rollback)
+        for index, name in enumerate(("UltraTerm_3.7.0garbage.dmg", "UltraTerm_3.7.0.1.dmg",
+                                      "UltraTerm_3.7.0_3.7.0.dmg"), start=210):
+            with self.subTest(name=name):
+                repo = self.clone(f"app-j{index:04d}")
+                self.put(repo, f"target/release/bundle/{name}", b"image")
+                self.assertFalse(core.reap_target_release_superseded(str(repo / "target")))
+
+    def test_malformed_host_versions_keep_the_target(self):
+        self.configure(self.installed, self.rollback)
+        repo = self.clone("app-j0201")
+        target = self.target_with(repo)
+        marks = core.reap_release_marks()
+        for field in ("installed", "rollback"):
+            for version in ("3.8.4garbage", "3.8.4.1", "3.8.4\n", "v3.8.4", "3.8.4-beta"):
+                with self.subTest(field=field, version=version):
+                    with mock.patch.object(core, "reap_release_marks", return_value={**marks, field: version}):
+                        self.assertFalse(core.reap_target_release_superseded(str(target)))
+
+    def test_ambiguous_or_misleading_bundle_names_keep_the_target(self):
+        self.configure(self.installed, self.rollback)
+        for index, name in enumerate(("UltraTerm_3.8.4_3.7.0.app", "UltraTerm-osx-3.8.4.app",
+                                      "ultra-term-3.8.4.app", "UltraTerm_3.7.0_1.2.3.app"), start=202):
+            with self.subTest(name=name):
+                repo = self.clone(f"app-j{index:04d}")
+                target = self.target_with(repo, "3.7.0", name=name)
+                self.assertFalse(core.reap_target_release_superseded(str(target)))
+
     def test_a_product_named_file_in_an_unknown_format_keeps_the_target(self):
         # "UltraTerm-3.8.4-osx-full.nupkg" names the product and carries the installed version, but it is not a format
         # the rule knows: what it holds is not a release the rule may compare, so the folder is kept.

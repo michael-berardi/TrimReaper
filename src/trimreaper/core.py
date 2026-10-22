@@ -1410,13 +1410,36 @@ def reap_target_release_bearing(path: str) -> bool:
 # all be enumerated and a target that holds no release artifact at all are all kept: over-retention is the safe answer.
 
 
+def reap_release_strict_version(text: str) -> tuple | None:
+    """Only a complete three-part release version is proof; prefixes and malformed host marks are unknown."""
+    if not isinstance(text, str) or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", text):
+        return None
+    try:
+        return tuple(int(part) for part in text.split("."))
+    except ValueError:  # oversized integer text is unreadable, not a reason to end the pass
+        return None
+
+
+def reap_release_name_version(name: str) -> str | None:
+    """One complete version token in a release name; a numeric prefix is not a version."""
+    matches = list(REAP_RELEASE_VERSION.finditer(name))
+    if len(matches) != 1:
+        return None
+    match = matches[0]
+    tail = name[match.end():]
+    if tail and (tail[0].isalnum() or re.match(r"\.[0-9]", tail)):
+        return None
+    version = match.group(1)
+    return version if reap_release_strict_version(version) is not None else None
+
+
 def reap_release_product_version(name: str, product: str) -> str | None:
     """The version a file name carries when it names the installed product: the product's name, a separator and its
     version. None when the name is not the product's, when it carries no version, or when it carries a second one:
     which version is the release is then not said."""
     match = re.fullmatch(re.escape(reap_fold(product)) + "[" + re.escape(REAP_RELEASE_SEPARATORS) +
                          r"]v?(\d+\.\d+\.\d+)([" + re.escape(REAP_RELEASE_SEPARATORS) + r"].*)?", reap_fold(name))
-    if not match or REAP_RELEASE_VERSION.search(match.group(2) or ""):
+    if not match or reap_release_name_version(name) != match.group(1):
         return None
     return match.group(1)
 
@@ -1583,8 +1606,7 @@ def reap_target_release_artifacts(path: str, product: str | None = None) -> tupl
                     version = named
                     product_artifact = version is not None
                     if version is None and mentions:
-                        versions = set(REAP_RELEASE_VERSION.findall(name))
-                        version = versions.pop() if len(versions) == 1 else None
+                        version = reap_release_name_version(name)
                         product_artifact = True
                     record(child, version, None, bundle=False, product_artifact=product_artifact)
                     continue
@@ -1598,8 +1620,7 @@ def reap_target_release_artifacts(path: str, product: str | None = None) -> tupl
                 if mentions and shaped:
                     # The product's own file: the version is whatever the name carries, and a name that carries no
                     # clear version keeps the folder.
-                    versions = set(REAP_RELEASE_VERSION.findall(name))
-                    record(child, versions.pop() if len(versions) == 1 else None, None, bundle=False,
+                    record(child, reap_release_name_version(name), None, bundle=False,
                            product_artifact=True)
                     continue
                 if versioned:
@@ -1629,8 +1650,9 @@ def reap_target_release_artifacts(path: str, product: str | None = None) -> tupl
                 version, identifier = reap_release_bundle_info(bundle)
             finally:
                 os.close(bundle)
-            if named is not None and version is not None and named != version:
-                # The name and the bundle's own plist disagree about the version: which one is the release is not said.
+            if REAP_RELEASE_VERSION.search(name) and (named is None or named != version):
+                # A versioned name must unambiguously agree with the plist. A second version, a malformed token,
+                # or a nonstandard name that cannot be parsed is not permission to ignore the name and trust the plist.
                 version = None
             record(child, version, identifier, bundle=True, product_artifact=True)
         for name, kind in listing:
@@ -1677,8 +1699,8 @@ def reap_target_release_superseded(path: str) -> bool:
     artifact, an artifact of another product, an artifact the scan could not enumerate, or no artifact at all: False,
     which keeps the folder."""
     marks = reap_release_marks()
-    installed = reap_version_tuple(marks.get("installed") or "")
-    rollback = reap_version_tuple(marks.get("rollback") or "")
+    installed = reap_release_strict_version(marks.get("installed") or "")
+    rollback = reap_release_strict_version(marks.get("rollback") or "")
     identifier, product = marks.get("identifier"), marks.get("name")
     if installed is None or rollback is None or not identifier or not product:
         return False
@@ -1693,7 +1715,7 @@ def reap_target_release_superseded(path: str) -> bool:
                 return False  # a bundle of another product, or one that does not say which product it is
         elif not artifact.get("product"):
             return False  # not the installed product's artifact: its name says nothing about the installed one
-        version = reap_version_tuple(artifact.get("version") or "")
+        version = reap_release_strict_version(artifact.get("version") or "")
         if version is None:
             return False
         if version >= installed or version == rollback:
