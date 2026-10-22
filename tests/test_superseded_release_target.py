@@ -12,13 +12,63 @@ from __future__ import annotations
 import os
 import plistlib
 from pathlib import Path
-from unittest import mock
+from unittest import TestCase, mock
 
 from trimreaper import core
 
 from helpers import Home
 
 KEPT = "retention-preserved:release-runtime-rollback"
+
+
+class ReleaseProductNameBoundary(TestCase):
+    def test_product_name_boundaries(self):
+        cases = (
+            ("UltraTerm-Helper_1.0.0.pkg", "UltraTerm", False),
+            ("UltraTerm_Helper_1.0.0.pkg", "UltraTerm", False),
+            ("UltraTerm Helper_1.0.0.pkg", "UltraTerm", False),
+            ("UltraTerm.Helper_1.0.0.pkg", "UltraTerm", False),
+            ("UltraTerm+Helper_1.0.0.pkg", "UltraTerm", False),
+            ("uLtRaTeRm-hElPeR_1.0.0.pkg", "ULTRATERM", False),
+            ("UltraTerm-  _Helper_1.0.0.pkg", "UltraTerm", False),
+            ("UltraTermHelper_1.0.0.pkg", "UltraTerm", False),
+            ("MyUltraTerm_1.0.0.pkg", "UltraTerm", False),
+            ("ultra-term-helper_1.0.0.pkg", "UltraTerm", False),
+            ("my-app-helper_1.0.0.pkg", "My App", False),
+            ("UltraTerm.app-Helper_1.0.0.pkg", "UltraTerm", False),
+            ("UltraTerm.pkghelper_1.0.0.pkg", "UltraTerm", False),
+            ("UltraTerm-vHelper_1.0.0.pkg", "UltraTerm", False),
+            ("UltraTerm-v1Helper_1.0.0.pkg", "UltraTerm", False),
+            ("UltraTerm-2Pro_1.0.0.pkg", "UltraTerm", False),
+            ("UltraTerm (Helper) 1.0.0.pkg", "UltraTerm", False),
+            ("UltraTerm–Helper_1.0.0.pkg", "UltraTerm", False),
+            ("UltraTermv3.7.0.pkg", "UltraTerm", False),
+            ("ultra-term-2Pro_1.0.0.pkg", "UltraTerm", False),
+            ("Acme-UltraTerm-1.0.0.pkg", "UltraTerm", False),
+            ("UltraTerm-3.8.4.pkg", "UltraTerm", True),
+            ("UltraTerm_3.8.4_aarch64.dmg", "UltraTerm", True),
+            ("UltraTerm.3.8.4.tgz", "UltraTerm", True),
+            ("UltraTerm3.8.4.zip", "UltraTerm", True),
+            ("UltraTerm-v3.8.4.pkg", "UltraTerm", True),
+            ("uLtRaTeRm-3.8.4.PKG", "ULTRATERM", True),
+            ("ultra-term-3.8.4.tar.xz", "UltraTerm", True),
+            ("my-app-3.8.4.tar.xz", "My App", True),
+            ("UltraTerm.app.tgz", "UltraTerm", True),
+            ("UltraTerm.app.zip.sig", "UltraTerm", True),
+            ("UltraTerm.app-3.8.4.tgz", "UltraTerm", True),
+            ("UltraTerm", "UltraTerm", True),
+            ("UltraTerm-3.8.4.pkg", "", False),
+        )
+        for name, product, expected in cases:
+            with self.subTest(name=name, product=product):
+                self.assertEqual(core.reap_release_mentions_product(name, product), expected)
+        for suffix in core.REAP_RELEASE_SHAPES + core.REAP_RELEASE_SIGNATURES:
+            with self.subTest(suffix=suffix):
+                self.assertTrue(core.reap_release_mentions_product("UltraTerm" + suffix, "UltraTerm"))
+        for name in ("UltraTerm-Helper_1.0.0.pkg", "UltraTerm-osx-3.8.4.nupkg"):
+            with self.subTest(candidate=name):
+                self.assertFalse(core.reap_release_mentions_product(name, "UltraTerm"))
+                self.assertTrue(core.reap_release_mentions_product(name, "UltraTerm", identity=False))
 
 
 class SupersededReleaseTarget(Home):
@@ -188,6 +238,64 @@ class SupersededReleaseTarget(Home):
         out = self.cli("reap", "--job", "J-0041")
         self.assertTrue((repo / "target").exists())
         self.assertKept(out)
+
+    def test_a_foreign_helper_installer_keeps_a_superseded_product_bundle(self):
+        self.configure(self.installed, self.rollback)
+        repo = self.clone("app-j0300")
+        target = self.target_with(repo, "3.7.0")
+        installer = self.put(repo, "target/release/bundle/pkg/UltraTerm-Helper_1.0.0.pkg", b"package")
+        self.add_job("J-0300", repo, finished_ago=3600)
+
+        artifacts, complete = core.reap_target_release_artifacts(str(target), "UltraTerm")
+        self.assertTrue(complete)
+        helper = next(a for a in artifacts if a["path"].endswith(installer.name))
+        self.assertFalse(helper["product"], helper)
+        self.assertIsNone(helper["version"], helper)
+        self.assertFalse(core.reap_target_release_superseded(str(target)))
+
+        out = self.cli("reap", "--job", "J-0300")
+
+        self.assertTrue(installer.exists())
+        self.assertTrue((target / "release/bundle/macos/UltraTerm.app").exists())
+        self.assertKept(out)
+
+    def test_ambiguous_product_formats_keep_the_whole_target(self):
+        self.configure(self.installed, self.rollback)
+        repo = self.clone("app-j0305")
+        target = self.target_with(repo, "3.7.0")
+        self.add_job("J-0305", repo, finished_ago=3600)
+        for name in ("UltraTerm-Helper_1.0.0.tar.xz", "UltraTerm-Helper_1.0.0.nupkg",
+                     "UltraTerm-2Pro_1.0.0.pkg", "UltraTerm (Helper) 1.0.0.pkg",
+                     "UltraTerm–Helper_1.0.0.pkg", "UltraTermv3.7.0.pkg",
+                     "Acme-UltraTerm-1.0.0.pkg"):
+            with self.subTest(name=name):
+                installer = self.put(repo, "target/" + name, b"package")
+                artifacts, complete = core.reap_target_release_artifacts(str(target), "UltraTerm")
+                self.assertTrue(complete)
+                artifact = next(a for a in artifacts if a["path"] == name)
+                self.assertFalse(artifact["product"], artifact)
+                self.assertIsNone(artifact["version"], artifact)
+                self.assertFalse(core.reap_target_release_superseded(str(target)))
+                self.assertKept(self.cli("reap", "--job", "J-0305"))
+                self.assertTrue(installer.exists())
+                installer.unlink()  # isolate each synthetic artifact from the next subtest
+
+    def test_a_product_package_still_uses_its_release_version(self):
+        self.configure(self.installed, self.rollback)
+        for index, (version, reclaim) in enumerate((("3.7.0", True), ("3.8.4", False),
+                                                   ("3.8.3", False), ("3.9.0", False)), start=301):
+            with self.subTest(version=version):
+                repo = self.clone(f"app-j{index:04d}")
+                target = self.target_with(repo, "3.7.0")
+                self.put(repo, f"target/release/bundle/pkg/UltraTerm-{version}.pkg", b"package")
+                self.add_job(f"J-{index:04d}", repo, finished_ago=3600)
+                self.assertEqual(core.reap_target_release_superseded(str(target)), reclaim)
+                out = self.cli("reap", "--job", f"J-{index:04d}")
+                self.assertEqual(target.exists(), not reclaim)
+                if reclaim:
+                    self.assertEqual(out["deleted"], 1, out)
+                else:
+                    self.assertKept(out)
 
     def test_a_bundle_without_an_identifier_keeps_the_target(self):
         # The product's own bundle, superseded, but without the identifier: a bundle that does not say which product it

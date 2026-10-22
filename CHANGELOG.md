@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.1 (2026-10-22)
+
+- Keep release targets that mix an older product bundle with a foreign installer such as `UltraTerm-Helper_1.0.0.pkg`.
+  A separator followed by another word, a numeric or punctuation-led extension, or a foreign prefix word no longer
+  proves the installer belongs to the installed product. Numeric release names such as `UltraTerm-3.8.4.pkg`,
+  case-insensitive names and known packaging suffixes remain supported. Ambiguous formats stay in the inventory.
+- Installed, rollback and newer releases, unknown versions, foreign bundles, locks and live claims keep their existing
+  safeguards.
+
 ## 0.7.0 (2026-10-22)
 
 - Add the opt-in `agentScratchProtectedCopies: "archive"` rule. An expired scratch task holding protected names can
