@@ -2703,7 +2703,7 @@ def reap_scratch_idle_proof(path: str, policy: dict | None = None, seconds: floa
     The budget is per folder and honest: a walk that runs out of it is not idle, and the budget it spent is part of the
     answer, so the receipt says why the folder stayed. The walk's own failures keep a folder that would otherwise be
     idle: an entry it cannot read, a protected name it must not enter, and expiry turned off. `seconds` is the caller's
-    own time budget: the walk never takes longer than it."""
+    own time budget: the walk stops at the first entry past that deadline."""
     policy = policy if policy is not None else load_policy()
     budget = reap_scratch_idle_budget(policy)
     if seconds is not None:
@@ -2756,7 +2756,7 @@ def reap_scratch_idle_proof(path: str, policy: dict | None = None, seconds: floa
         proof["reason"], proof["detail"] = "unreadable", f"oserror:{getattr(error, 'errno', 0)}"
     proof["elapsed"] = round(time.monotonic() - started, 3)
     if proof["reason"] and proof["reason"] not in ("recent-change", "protected-leaf", "budget-exceeded", "budget-time-exceeded",
-                                                   "budget-bytes-exceeded", "too-deep"):
+                                                   "budget-bytes-exceeded", "too-deep", "unreadable"):
         proof["detail"] = proof["reason"]
         proof["reason"] = "unreadable"  # a root that is not a folder, a folder that changed under the walk, a read error
     proof["newest"] = newest[0] or None
@@ -4536,8 +4536,8 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
                 checks.extend(["exclusive-output-producer-guard", "producer-locks"])
             retention = reap_retention(item)  # established now, from the directory itself: the declared value is only a claim
             if item.get("class") == "agent-scratch":
-                result["idleProof"] = item.get("idleProof")  # the proof this call just took, with the budget it spent
                 if isinstance(item.get("idleProof"), dict):
+                    result["idleProof"] = item.get("idleProof")  # the proof this call just took, with the budget it spent
                     item["idleSeconds"] = max(0.0, float(item.get("idleSeconds") or 0) - item["idleProof"].get("elapsed", 0.0))
             if retention != REAP_DISPOSABLE:
                 if item.get("class") == "agent-scratch" and retention == "unmarked":
@@ -4686,8 +4686,13 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
             checks.append("no-protected-leaf")
             retention = reap_retention(item)
             if item.get("class") == "agent-scratch":
-                result["idleProof"] = item.get("idleProof")  # the last proof, before anything is removed
+                proof = item.get("idleProof")
+                if isinstance(proof, dict):
+                    result["idleProof"] = proof  # the last proof, before anything is removed
             if retention != REAP_DISPOSABLE:
+                if item.get("class") == "agent-scratch" and isinstance(item.get("idleProof"), dict) \
+                        and item["idleProof"].get("reason", "").startswith("budget"):
+                    raise ReapRefused(reap_item_idle_reason(item))  # the budget is why it stopped: say so
                 raise ReapRefused("retention-changed")
             if reap_authority(item) != evidence:
                 raise ReapRefused("authority-changed")

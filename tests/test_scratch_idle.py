@@ -226,6 +226,7 @@ class ScratchIdle(Home):
 
         self.assertFalse(proof["idle"], proof)
         self.assertEqual(proof["reason"], "unreadable")
+        self.assertTrue(proof["detail"].startswith("oserror:"), proof)
         self.assertTrue(task.exists())
 
     def test_a_protected_name_keeps_the_folder_and_is_never_stat_ed_or_opened(self):
@@ -299,11 +300,13 @@ class ScratchIdle(Home):
         self.put(task, "inner.txt")
         self.cli("mark", str(task), "disposable")
 
-        self.cli("reap", "--scratch")
+        out = self.cli("reap", "--scratch")
 
         result = [r for r in self.receipts() if r.get("phase") == "result" and r.get("path") == str(task)]
         self.assertEqual(len(result), 1, self.receipts())
         self.assertNotIn("idleProof", result[0])
+        item = next(i for i in out["items"] if i["path"] == str(task))
+        self.assertNotIn("idleProof", item)  # a marked folder has no proof: the key is not there at all
 
     def test_the_dry_run_shows_the_proof_of_a_kept_folder(self):
         task = self.scratch("busy-task")

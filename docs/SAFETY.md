@@ -69,8 +69,9 @@ anything else is kept.
 The proof covers the whole tree. The walk is descriptor-relative end to end: the folder is opened with no symlink in any
 component, every child directory is opened with `O_NOFOLLOW` and compared with the `lstat` that chose it, so a directory
 swapped for a link is never entered, and a link is never followed. It reads every entry's mtime, so a change anywhere in
-the tree is seen, however deep. A protected name (`.env*`, `.dev.vars*`, `.wrangler`, `.vercel`) is named but never
-stat'ed, opened or entered, and it keeps the folder.
+the tree is seen, however deep - as long as the change moved a file's mtime (the limit of an mtime rule is named below).
+A protected name (`.env*`, `.dev.vars*`, `.wrangler`, `.vercel`) is named but never stat'ed, opened or entered, and it
+keeps the folder.
 
 The walk is bounded per folder, and the bound is on the record. `agentScratchIdleMaxEntries` (200000) limits how many entries
 one folder's walk may list, `agentScratchIdleMaxBytes` (0: no byte bound) how many bytes it may see, and
@@ -92,8 +93,10 @@ goes on the next pass.
 A folder marked `disposable` should be marked when the work is done, not when the folder is created: the marker makes
 the folder disposable whatever the proof says.
 
-Every folder the reaper keeps says why: `idle-recent-change`, `idle-budget-exceeded`, `idle-budget-time-exceeded`,
-`idle-budget-bytes-exceeded`, `idle-unreadable`, `idle-protected-leaf`, `idle-too-deep` or `idle-expiry-off`.
+The proof reads mtimes only. A tree that arrives in the scratch root with its old times preserved (moved in with `mv`,
+copied with `cp -a` or `rsync -a`, unpacked from an archive that keeps them) looks idle, and a folder that is not held by
+a claim, an open file, a protected name or a git proof can go on the next pass. Mark such a folder (`trimreaper mark
+<folder> evidence`) to keep it.
 
 ## Narrow exact-output route
 
