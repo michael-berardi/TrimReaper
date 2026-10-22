@@ -28,7 +28,9 @@ finishes, in case it is resumed. A **build queue** is any tool that takes a per-
    a bare git folder, a second retention marker or another volume. Protected entries are never stat'ed, opened or entered.
    Immutable, no-unlink and restricted filesystem flags also refuse before removal; they are never cleared. Two protected-name exceptions, both for a whole expired clone: env templates git tracks (`.env.example` ...), which the remote also
    holds, go with it; and under `cloneProtectedCopies: "remove"` the protected copies are read once into an owner-only
-   archive (`protected.tar.gz`), then go with it.
+   archive (`protected.tar.gz`), then go with it. With the separate `agentScratchProtectedCopies: "archive"` rule,
+   an expired top-level agent-scratch task can also go after its protected material has been archived and verified
+   owner-only. That exception is never valid for job caches; its protected-copy archives never expire automatically.
 8. **Git proofs.** For build output: git ignores it (or it is an unignored `.astro` that holds Astro's own cache files) and tracks nothing in it. Uncommitted or
    stashed tracked work, and an unpushed HEAD, are the clone's business, not its output's: they do not preserve build output that
    rebuilds from the source that stays, and the folder is still proved free of tracked files, matched case-insensitively against the index (a tracked file inside is refused even
@@ -70,8 +72,15 @@ The proof covers the whole tree. The walk is descriptor-relative end to end: the
 component, every child directory is opened with `O_NOFOLLOW` and compared with the `lstat` that chose it, so a directory
 swapped for a link is never entered, and a link is never followed. It reads every entry's mtime, so a change anywhere in
 the tree is seen, however deep - as long as the change moved a file's mtime (the limit of an mtime rule is named below).
-A protected name (`.env*`, `.dev.vars*`, `.wrangler`, `.vercel`) is named but never stat'ed, opened or entered, and it
-keeps the folder.
+By default a protected name (`.env*`, `.dev.vars*`, `.wrangler`, `.vercel`) is named but never stat'ed, opened or entered,
+and it keeps the folder. The explicit `agentScratchProtectedCopies: "archive"` exception covers only a canonical
+`scratchRoot/<task>` outside job-cache and archive roots. Its idle proof also checks protected descendants' mtimes,
+within the same budget and no-follow fence: a recent change there keeps the task. Preserving markers and filesystem
+flags still refuse removal. Once all other gates pass, every protected file is saved into a private, verified
+`protected.tar.gz` before the task goes, including files outside a repository and inside dependency output. A fresh
+post-archive tree comparison and the final authority/process checks still run. A missing, failed, oversized or stale
+archive keeps the task. Scratch protected-copy archives never expire automatically, so removal cannot destroy the
+only copy of protected material. A dry run only plans the archive and does not create it.
 
 The walk is bounded per folder, and the bound is on the record. `agentScratchIdleMaxEntries` (200000) limits how many entries
 one folder's walk may list, `agentScratchIdleMaxBytes` (0: no byte bound) how many bytes it may see, and

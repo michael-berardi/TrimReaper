@@ -5,7 +5,7 @@ writes screenshots and logs, and stages scratch folders. Run a few dozen agents 
 
 TrimReaper takes that space back without guessing. It removes a folder only when it can prove the folder is
 disposable: the job that made it has finished, git shows nothing would be lost, no process is using it, and it holds no
-secrets. When a folder still holds unsaved work, TrimReaper archives that work first and verifies the archive. Before it
+unpreserved secrets. When a folder still holds unsaved work, TrimReaper archives that work first and verifies the archive. Before it
 removes anything of yours, it writes the plan to a durable receipt.
 
 It also cleans the rest of a developer machine the same careful way: tool caches through each tool's own cleaner,
@@ -20,7 +20,7 @@ Requires macOS, Python 3.10 or newer, and `git`, `lsof` and `ps`. The `python3` 
 newer one comes from [python.org](https://www.python.org/downloads/) or Homebrew (`brew install python`).
 
 ```sh
-pipx install "git+https://github.com/michael-berardi/TrimReaper@v0.6.12"
+pipx install "git+https://github.com/michael-berardi/TrimReaper@v0.7.0"
 trimreaper --version
 ```
 
@@ -110,8 +110,8 @@ Every command prints one JSON document on stdout. Exit status:
 | Per-job scratch folders (`cacheRoot/J-NNNN/*`) | Tool caches (with a `CACHEDIR.TAG`) once the job finishes; anything else `evidenceExpiryDays` (14) after it finished. An interrupted job whose work a durable continuation took over counts as finished, from its verified interruption clock |
 | Screenshots, recordings, traces and logs in a job's scratch | `evidenceExpiryDays` after the job finished. Each file's name and SHA-256 are logged first |
 | Marked bulky job-cache evidence | Strictly more than `markedEvidenceExpiryDays` (5) after the job finished, only with an existing, non-empty `report.md`. Reports, summary/outcome, handoffs and receipts stay. Retained material, protected names and active claims still prevent removal |
-| Agent scratch folders (`scratchRoot/*`) | Once nothing in them changed for `evidenceExpiryDays`. The idle proof covers the whole tree (every entry's mtime, never following a link), so a folder ages out like a small one instead of being kept for good by the walk's own entry limit - up to its per-folder budget (200000 entries, 10 seconds by default). A folder past that budget is kept as `idle-budget-exceeded` (too many entries) or `idle-budget-time-exceeded` (too slow), and the receipt names the budget and what the walk spent. The proof reads mtimes only: a tree moved or copied in with its old times (`mv`, `cp -a`, `rsync -a`, an archive) looks idle, and `trimreaper mark <folder> evidence` keeps it. Every unmarked folder the reaper keeps names the reason it was kept (`idle-recent-change`, `idle-budget-exceeded`, `idle-unreadable`, `idle-protected-leaf`, ...). Active or parked job claims preserve that task, not unrelated siblings. Off until you set `scratchRoot` |
-| Its own archives | `archiveExpiryDays` (30) after the archive became the only copy |
+| Agent scratch folders (`scratchRoot/*`) | Once nothing in them changed for `evidenceExpiryDays`. The idle proof covers the whole tree (every entry's mtime, never following a link), so a folder ages out like a small one instead of being kept for good by the walk's own entry limit - up to its per-folder budget (200000 entries, 10 seconds by default). A folder past that budget is kept as `idle-budget-exceeded` (too many entries) or `idle-budget-time-exceeded` (too slow), and the receipt names the budget and what the walk spent. The proof reads mtimes only: a tree moved or copied in with its old times (`mv`, `cp -a`, `rsync -a`, an archive) looks idle, and `trimreaper mark <folder> evidence` keeps it. Every unmarked folder the reaper keeps names the reason it was kept (`idle-recent-change`, `idle-budget-exceeded`, `idle-unreadable`, `idle-protected-leaf`, ...). Active or parked job claims preserve that task, not unrelated siblings. Off until you set `scratchRoot`. Protected names keep the task unless `agentScratchProtectedCopies: "archive"` saves a verified private copy first; those archives never expire automatically |
+| Its own archives | `archiveExpiryDays` (30) after the archive became the only copy; scratch protected-copy archives stay indefinitely |
 | Old release builds and release evidence | Off until configured: [docs/CONFIGURATION.md](docs/CONFIGURATION.md) |
 
 Scratch listings share the caller's time budget and carry their proof into the pass. A folder not checked in time stays;
@@ -146,6 +146,9 @@ they rebuild it when they resume. The pressure check runs during a `tick` that h
   does not enter or read them. Two exceptions: env *templates* that git tracks (`.env.example`, `.env.sample`,
   `.dev.vars.template` ...) go with an expired clone, since the remote holds the same file; and with
   `cloneProtectedCopies` set to `"remove"`, the local copies are archived owner-only, then go with the clone.
+  Separately, `agentScratchProtectedCopies: "archive"` preserves protected material from an expired scratch task in a
+  verified owner-only archive before the task goes. Those archives are kept indefinitely. This exception never applies
+  to a job's own cache, and never removes the only copy of protected material.
 - A folder that carries a retention marker other than `disposable`, except expired per-job `evidence` under the five-day rule above: a file named `.ut-retention-<class>` at its top
   level (`ut` is from UltraTerm, where the format started). Write one with `trimreaper mark <folder> <class>`:
   `evidence` (proof kept for the marked-evidence window; set `markedEvidenceExpiryDays=0` for indefinite retention), `customer` (customer data), `release-runtime-rollback` (what a release or

@@ -45,6 +45,7 @@ DEFAULT_POLICY = {
     # "remove": a whole clone's .env*/.dev.vars*/.wrangler/.vercel copies are archived owner-only and go with it.
     # Anything else (the default "keep") keeps every clone that holds one.
     "cloneProtectedCopies": "keep",
+    "agentScratchProtectedCopies": "keep",
     # Disk pressure: at or above this used percent, idle (parked/interrupted) jobs lose their derived build output too.
     "diskWarnPercent": 85,
     # `tick` runs `trimreaper clean` when the volume reaches this used percent, then again only on new pressure (no timer); 0 = off.
@@ -218,6 +219,10 @@ def check_policy(policy: dict) -> None:
         raise HostError(f'policy cloneArchive must be "archive" or "keep", not {json.dumps(merged["cloneArchive"])}')
     if merged["cloneProtectedCopies"] not in ("keep", "remove"):
         raise HostError(f'policy cloneProtectedCopies must be "keep" or "remove", not {json.dumps(merged["cloneProtectedCopies"])}')
+    if merged["agentScratchProtectedCopies"] not in ("keep", "archive"):
+        raise HostError('policy agentScratchProtectedCopies must be "keep" or "archive"')
+    if merged["agentScratchProtectedCopies"] == "archive" and merged["cloneArchive"] != "archive":
+        raise HostError('policy agentScratchProtectedCopies "archive" needs cloneArchive "archive"')
     if merged["cloneProtectedCopies"] == "remove" and merged["cloneArchive"] != "archive":
         raise HostError('policy cloneProtectedCopies "remove" needs cloneArchive "archive": secret copies are archived before they go',
                         'set cloneArchive to "archive", or cloneProtectedCopies to "keep"')
