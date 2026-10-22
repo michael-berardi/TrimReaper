@@ -20,7 +20,7 @@ Requires macOS, Python 3.10 or newer, and `git`, `lsof` and `ps`. The `python3` 
 newer one comes from [python.org](https://www.python.org/downloads/) or Homebrew (`brew install python`).
 
 ```sh
-pipx install "git+https://github.com/michael-berardi/TrimReaper@v0.7.0"
+pipx install "git+https://github.com/michael-berardi/TrimReaper@v0.7.1"
 trimreaper --version
 ```
 
@@ -120,8 +120,12 @@ subsequent passes give other folders a turn. A listing proof never replaces the 
 Release-target retention allows only known older artifacts of the installed product to be reclaimed. The installed
 version, rollback and anything newer stay. Unknown or ambiguous product identity or version, an incomplete inventory,
 a version without all three numeric parts, or disagreement between a bundle's name and plist fail closed: the affected
-artifacts stay. This fixes the existing reaper rule, not a new retention class; locks, live claims and Git safeguards
-are unchanged.
+artifacts stay. A name such as `UltraTerm-Helper_1.0.0.pkg` is not proof of an UltraTerm release: a separator followed
+by another word can name a different product, so a known installer with that name keeps the whole target, even beside
+an older valid UltraTerm bundle. Numeric names (`UltraTerm-3.8.4.pkg`), case-insensitive matching and known packaging
+suffixes (`UltraTerm.app.tgz`) remain supported. Ambiguous numeric or punctuation-led product extensions and foreign
+prefix words also keep the target. This fixes the existing reaper rule, not a new retention class; locks, live claims
+and Git safeguards are unchanged.
 
 A host with the producer registry enabled can reclaim an exact `target` or `node_modules` of a settled finished,
 failed, cancelled or verifiably interrupted job even when a continuation keeps the source worktree. This requires the

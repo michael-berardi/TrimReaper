@@ -1463,18 +1463,46 @@ def reap_release_product_version(name: str, product: str) -> str | None:
     return match.group(1)
 
 
-def reap_release_mentions_product(name: str, product: str) -> bool:
-    """True when a file name names the installed product: its name is in it, followed by a separator or the end of the
-    name, or its name is in it with the separators left out and followed by a version ("ultra-term-3.8.4.tar.xz" is
-    "My App" too). A longer word that starts with the product's name ("UltraTermHelper_1.0.0.pkg") is something else."""
+def reap_release_mentions_product(name: str, product: str, *, identity: bool = True) -> bool:
+    """True when a file name names the installed product, literally or with separators left out. A numeric version,
+    an optional v before it, and known packaging suffixes may follow the literal name. A distinct word, even after
+    separators ("UltraTerm-Helper_1.0.0.pkg"), is not proof of the installed product's identity. With identity=False,
+    retain the broader names-only candidate check for inventory: an ambiguous artifact must not disappear from it."""
     folded, literal = reap_fold(name), reap_fold(product)
     if not literal:
         return False
+    def product_tail(tail: str) -> bool:
+        # A separator alone is not an identity boundary: it can join words in another product's name. Permit known
+        # packaging components (including .app.tgz), but never skip an arbitrary word to reach a later version.
+        while tail:
+            following = tail.lstrip(REAP_RELEASE_SEPARATORS)
+            version = re.match(r"v?([0-9]+\.[0-9]+\.[0-9]+)(?=$|[" +
+                               re.escape(REAP_RELEASE_SEPARATORS) + r"])", following)
+            if version and (not following.startswith("v") or following != tail):
+                return True
+            suffix = next((s for s in sorted(REAP_RELEASE_SHAPES + REAP_RELEASE_SIGNATURES, key=len, reverse=True)
+                           if tail.startswith(s)), None)
+            if suffix is None:
+                return False
+            tail = tail[len(suffix):]
+        return True
+
+    if identity:
+        # Match the complete product at the start, allowing the established separator variants of its spelling.
+        # Retain offsets into the original name: stripping version dots/punctuation before checking the tail would
+        # mistake a foreign product such as UltraTerm-2Pro_1.0.0 for a numeric release of UltraTerm.
+        positions = [(char, index) for index, char in enumerate(folded) if char not in REAP_RELEASE_SEPARATORS]
+        stem = "".join(char for char in literal if char not in REAP_RELEASE_SEPARATORS)
+        stripped = "".join(char for char, _ in positions)
+        return bool(stem and stripped.startswith(stem) and
+                    product_tail(folded[positions[len(stem) - 1][1] + 1:]))
+
     start = folded.find(literal)
     while start >= 0:
         end = start + len(literal)
         before = folded[start - 1] if start else ""
-        if (not before or not before.isalpha()) and (end == len(folded) or not folded[end].isalpha()):
+        boundary = end == len(folded) or not folded[end].isalpha()
+        if (not before or not before.isalpha()) and boundary:
             return True
         start = folded.find(literal, start + 1)
     def bare(text: str) -> str:
@@ -1611,13 +1639,16 @@ def reap_target_release_artifacts(path: str, product: str | None = None) -> tupl
             # the product's name and an archive, an installer or a bundle inside it.
             shaped = bool(product and reap_release_product_shape(name))
             mentions = bool(product and reap_release_mentions_product(name, product))
-            versioned = bool(mentions and REAP_RELEASE_VERSION.search(name))
+            # Discovery is broader than identity proof: an ambiguous name in an uncommon format still keeps the
+            # target, but its later version must never turn a distinct product into the installed one.
+            candidate = mentions or bool(product and reap_release_mentions_product(name, product, identity=False))
+            versioned = bool(candidate and REAP_RELEASE_VERSION.search(name))
             crate = reap_fold(name).endswith(".crate")
             if kind == "d":
                 # A directory is a bundle when it is named like one; any other directory is not an artifact.
                 if artifact is None:
                     continue
-            elif artifact is None and not mentions and named is None:
+            elif artifact is None and not candidate and named is None:
                 continue  # not a release artifact, and not named for the installed product
             if kind != "d":
                 if artifact is not None:
@@ -1636,16 +1667,16 @@ def reap_target_release_artifacts(path: str, product: str | None = None) -> tupl
                     # a release this rule may compare, so its version stays unclear and the folder is kept.
                     record(child, None, None, bundle=False, product_artifact=True)
                     continue
-                if mentions and shaped:
-                    # The product's own file: the version is whatever the name carries, and a name that carries no
-                    # clear version keeps the folder.
-                    record(child, reap_release_name_version(name), None, bundle=False,
-                           product_artifact=True)
+                if candidate and shaped:
+                    # A possible product file stays in the inventory, but only proven identity permits a version
+                    # comparison. An ambiguous name or a name without a clear version keeps the folder.
+                    record(child, reap_release_name_version(name) if mentions else None, None, bundle=False,
+                           product_artifact=mentions)
                     continue
                 if versioned:
                     # The product's name and a version, but not a format the rule knows: what the file holds is not a
                     # release the rule may compare, so its version stays unclear and the folder is kept.
-                    record(child, None, None, bundle=False, product_artifact=True)
+                    record(child, None, None, bundle=False, product_artifact=mentions)
                     continue
                 continue
             if not reap_fold(name).endswith(".app"):
