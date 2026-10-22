@@ -383,6 +383,23 @@ class ScratchIdle(Home):
         held = next(i for i in out["items"] if i["path"] == str(task))
         self.assertEqual(held["reason"], "retention-changed")
 
+    def test_a_folder_over_its_budget_at_the_last_look_names_the_budget(self):
+        task = self.scratch("budget-task")
+        self.put(task, "inner.txt")
+        self.age(task, 20)
+        idle = {"idle": True, "reason": "idle", "entries": 1, "bytes": 0, "newest": None,
+                "budget": {"entries": 200000, "bytes": 0, "seconds": 10}, "elapsed": 0.0}
+        slow = {**idle, "idle": False, "reason": "budget-time-exceeded"}
+        proofs = [idle, idle, slow]  # the listing, the re-proof and the last look
+
+        with mock.patch.object(core, "reap_scratch_idle_proof", side_effect=proofs):
+            out = self.cli("reap", "--scratch")
+
+        self.assertEqual(out["deleted"], 0, out)
+        self.assertTrue(task.exists())
+        held = next(i for i in out["items"] if i["path"] == str(task))
+        self.assertEqual(held["reason"], "idle-budget-time-exceeded")
+
     def test_a_disposable_marker_decides_over_the_idle_proof(self):
         # A marker decides as it does everywhere else: a folder marked disposable goes whatever the proof says.
         task = self.scratch("marked-task")
