@@ -658,7 +658,9 @@ def reap_git_input(repo: str, data: str | None, *args: str) -> tuple[int, str]:
                 raise ReapRefused("git-error:unsafe-metadata:config-changed")
         except (OSError, UnicodeError):
             raise ReapRefused("git-error:metadata-unavailable")
-    argv = ["git", "-c", "core.hooksPath=" + os.devnull, "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false", "-c", "submodule.recurse=false",
+    # Bind the exact gated metadata, including linked-worktree pointer files. A broken
+    # .git must fail here, never make discovery prove an enclosing repository instead.
+    argv = ["git", "--git-dir=" + os.path.join(repo, ".git"), "-c", "core.hooksPath=" + os.devnull, "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false", "-c", "submodule.recurse=false",
             "-c", "core.excludesFile=" + os.devnull, "-c", "core.attributesFile=" + os.devnull, "-c", "core.worktree=" + repo, "-C", repo, *args]
     outcome = reap_probe(argv, 120, reap_git_env()) if data is None else reap_probe(argv, 120, reap_git_env(), data)
     if held is not None:  # fail closed per probe: a config rewritten while Git ran (a rewrite always moves ctime) discards this answer

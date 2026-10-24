@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.3 (2026-10-24)
+
+- Git probes bind the exact `.git` of the repository being gated. A broken nested `.git` now fails the probe instead of
+  letting Git discovery answer for an enclosing repository, so a clone inside another repository is never judged by its
+  parent's state.
+
 ## 0.7.2 (2026-10-22)
 
 - Preserve three safeguards already shipped by the embedding host; this restores the existing behavior, not a new
