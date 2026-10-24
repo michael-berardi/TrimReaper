@@ -39,6 +39,10 @@ finishes, in case it is resumed. A **build queue** is any tool that takes a per-
    For a whole clone: every branch, reflog entry and unreachable commit is on a remote, there are no tags or other refs,
    no linked worktree depends on it, and every ignored file is known build output. Git runs with hooks, fsmonitor,
    includes, filters and global config disabled. Repository config that could run a program is refused before git reads it.
+   Probes bind the exact gated Git directory, resolving linked worktree and submodule `.git` files, rather than discovering
+   an enclosing repository. Checkout paths are made absolute before Git changes directory. The `.git` entry, its resolved
+   Git directory and any `commondir` pointer and directory must belong to the running uid; otherwise the gate refuses
+   with `git-error:unsafe-metadata:foreign-owner`, even though explicit `--git-dir` bypasses Git's own ownership check.
 9. **Size.** Bounded metadata walk; an incomplete size refuses (and the next pass gets twice the budget).
 10. **Plan receipt.** A complete JSON line is appended and flushed to disk (`F_FULLFSYNC` on macOS) before anything goes.
     If it cannot be written, nothing is removed.

@@ -540,7 +540,8 @@ def reap_config_stamp(roots: list[str]) -> list:
 def reap_git_metadata_gate(repo: str, allow_alternates: bool = False) -> dict:
     """Fence Git's metadata as well as its index: no protected paths, symlink metadata, include configs or executable
     clean filters. Linked worktree pointers are bounded, nofollow reads of safe metadata only. No native exemption. The
-    metadata tree is walked descriptor-relative; the config files are classified by Git's own parser. Returns the roots and
+    git entry, resolved gitdir and common metadata must belong to our uid: explicit --git-dir bypasses Git's ownership
+    check. The metadata tree is walked descriptor-relative; the config files are classified by Git's own parser. Returns the roots and
     the config stamp the verdict holds for. `allow_alternates` (the archive only, which reads objects and never proves a
     removal from them) admits an objects/info/alternates whose every line names a real `objects` directory outside protected state."""
     def safe_path(path):
@@ -552,6 +553,11 @@ def reap_git_metadata_gate(repo: str, allow_alternates: bool = False) -> dict:
             current = os.path.join(current, part)
             if stat.S_ISLNK(os.lstat(current).st_mode):
                 raise ReapRefused("git-error:unsafe-metadata:symlink")
+        return absolute
+    def owned_path(path):
+        absolute = safe_path(path)
+        if os.lstat(absolute).st_uid != os.getuid():
+            raise ReapRefused("git-error:unsafe-metadata:foreign-owner")
         return absolute
     def read_small(path):
         fd = os.open(safe_path(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
@@ -577,19 +583,20 @@ def reap_git_metadata_gate(repo: str, allow_alternates: bool = False) -> dict:
         if folded == "info/grafts":  # a legacy graft file re-parents commits, so rev-list and fsck would not see the history it hides
             raise ReapRefused("git-error:unsafe-metadata:grafts")
         return True
-    entry = safe_path(os.path.join(repo, ".git"))
+    repo = os.path.abspath(repo)
+    entry = owned_path(os.path.join(repo, ".git"))
     if stat.S_ISREG(os.lstat(entry).st_mode):
         pointer = read_small(entry).strip()
         if not pointer.startswith("gitdir: ") or "\n" in pointer:
             raise ReapRefused("git-error:unsafe-metadata:gitdir-pointer")
-        entry = safe_path(os.path.join(repo, pointer[8:]))
+        entry = owned_path(os.path.join(repo, pointer[8:]))
     roots = [entry]
     common = os.path.join(entry, "commondir")
     if os.path.lexists(common):
-        pointer = read_small(common).strip()
+        pointer = read_small(owned_path(common)).strip()
         if not pointer or "\n" in pointer:
             raise ReapRefused("git-error:unsafe-metadata:commondir-pointer")
-        roots.append(safe_path(os.path.join(entry, pointer)))
+        roots.append(owned_path(os.path.join(entry, pointer)))
     roots = list(dict.fromkeys(roots))
     listed, deadline, alternates, current_root = 0, time.monotonic() + 120, [], [None]
     for root in roots:
@@ -629,6 +636,7 @@ def reap_git_session(repo: str, allow_alternates: bool = False):
     """One metadata gate for all the probes of one proof, and one more when the proof is over. Inside, each probe only
     compares the config files' stamp with the gated one (cheap, and a config rewritten in between refuses), so a clean walk
     over thousands of directories is not thousands of metadata walks. Re-entrant per repository."""
+    repo = os.path.abspath(repo)
     held = _REAP_GIT.__dict__.setdefault("held", {})
     if repo in held:
         yield
@@ -649,18 +657,20 @@ def reap_git_input(repo: str, data: str | None, *args: str) -> tuple[int, str]:
     """Run one Git probe. Outside a proof session the metadata is gated first; inside one the gated config is re-checked
     before the probe AND after it. That detects, and refuses on, a config rewritten before or during the probe; it cannot stop
     Git from having read a config rewritten inside that window, so it is not an immutability guarantee (see docs/SAFETY.md)."""
+    repo = os.path.abspath(repo)
     held = _REAP_GIT.__dict__.setdefault("held", {}).get(repo)
     if held is None:
-        reap_git_gate(repo)
+        gated = reap_git_gate(repo)
     else:
+        gated = held
         try:
             if reap_config_stamp(held["roots"]) != held["stamp"]:
                 raise ReapRefused("git-error:unsafe-metadata:config-changed")
         except (OSError, UnicodeError):
             raise ReapRefused("git-error:metadata-unavailable")
-    # Bind the exact gated metadata, including linked-worktree pointer files. A broken
-    # .git must fail here, never make discovery prove an enclosing repository instead.
-    argv = ["git", "--git-dir=" + os.path.join(repo, ".git"), "-c", "core.hooksPath=" + os.devnull, "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false", "-c", "submodule.recurse=false",
+    # Bind the exact gated metadata, resolving linked-worktree and submodule gitfiles
+    # in the gate, never falling back to discovery of an enclosing repository.
+    argv = ["git", "--git-dir=" + gated["roots"][0], "-c", "core.hooksPath=" + os.devnull, "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false", "-c", "submodule.recurse=false",
             "-c", "core.excludesFile=" + os.devnull, "-c", "core.attributesFile=" + os.devnull, "-c", "core.worktree=" + repo, "-C", repo, *args]
     outcome = reap_probe(argv, 120, reap_git_env()) if data is None else reap_probe(argv, 120, reap_git_env(), data)
     if held is not None:  # fail closed per probe: a config rewritten while Git ran (a rewrite always moves ctime) discards this answer
