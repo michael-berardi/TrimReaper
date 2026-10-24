@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import os
 from pathlib import Path
 from unittest import mock
 
@@ -314,3 +315,23 @@ class ProjectSafety(Home):
             self.assertFalse(any("keep" in entry for entry in entries), entries)
         self.assertFalse(queue.exists())
         self.assertEqual(before, sorted(str(p.relative_to(self.repo)) for p in self.repo.rglob("*.cargo*")))
+
+
+class GitDirBinding(Home):
+    """A broken nested .git must never be answered by an enclosing repository (UltraTerm audit 2026-10-23)."""
+
+    def test_reap_git_binds_the_exact_git_dir_not_an_enclosing_repository(self):
+        from trimreaper import core
+        parent = self.clone("parent")
+        nested = parent / "site-j0100"
+        nested.mkdir()
+        self.git(nested, "init", "-q", "-b", "main")
+        (nested / "README.md").write_text("nested\n")
+        self.git(nested, "add", "-A")
+        self.git(nested, "commit", "-q", "-m", "nested")
+        (nested / ".git" / "HEAD").write_text("garbage\n")
+        code, _ = core.reap_git(str(nested), "rev-parse", "--show-toplevel")
+        self.assertNotEqual(code, 0, "a broken .git must fail instead of proving the parent repository")
+        code, out = core.reap_git(str(parent), "rev-parse", "--show-toplevel")
+        self.assertEqual(code, 0)
+        self.assertEqual(os.path.realpath(out.strip()), os.path.realpath(str(parent)))
