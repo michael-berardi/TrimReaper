@@ -4,7 +4,9 @@
 
 - Git probes bind the exact `.git` of the repository being gated. A broken nested `.git` now fails the probe instead of
   letting Git discovery answer for an enclosing repository, so a clone inside another repository is never judged by its
-  parent's state.
+  parent's state. Git metadata owned by another uid is refused before a probe runs, including a `.git` pointer file,
+  its resolved git directory and common metadata. Linked worktree and submodule probes bind the resolved, gated directory;
+  relative checkout paths are made absolute before Git changes directory.
 
 ## 0.7.2 (2026-10-22)
 
