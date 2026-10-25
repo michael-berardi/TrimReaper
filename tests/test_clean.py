@@ -364,7 +364,12 @@ class Worktrees(Home):
 
     def backdate(self, repo: Path, path: Path, days: float):
         self.age(path, days)
-        self.age(repo / ".git" / "worktrees" / path.name, days)
+        gitdir = repo / ".git" / "worktrees" / path.name
+        pointer = path / ".git"
+        if pointer.is_file():  # the worktree's own gitdir (git suffixes the name when it is taken: tool, tool1 ...)
+            gitdir = Path(pointer.read_text().split("gitdir:", 1)[1].strip())
+            gitdir = gitdir if gitdir.is_absolute() else (path / gitdir).resolve()
+        self.age(gitdir, days)
 
     def items(self, out):
         return {Path(item["path"]).name: item for item in out["items"] if item["name"] == "worktrees"}
@@ -727,3 +732,266 @@ class Server(Home):
         bad = self.call(only=["everything"])
         self.assertTrue(bad["isError"])
         self.assertIn("only entries must be among", bad["structuredContent"]["error"])
+
+
+def core_job_ids(*names):
+    from trimreaper import core
+    return core.reap_job_ids(*names)
+
+
+def lifetime(home, *jobs):
+    """Give finished fixture jobs a real lifetime (created and started before they finished), as the host records them."""
+    with contextlib.closing(home.state()) as conn, conn:
+        for job in jobs:
+            conn.execute("UPDATE jobs SET created_at=finished_at-60, started_at=finished_at-60 WHERE id=? AND finished_at IS NOT NULL", (job,))
+
+
+class PileupRegressions(Worktrees):
+    """The causes of the 2026-10-24 ~/dev pileup: each test failed on 0.7.3."""
+
+    def test_git_status_rewriting_the_index_does_not_keep_an_abandoned_worktree(self):
+        repo = self.clone("app")
+        path = self.worktree(repo, "app-abandoned")  # backdated 10 days
+        self.git(path, "status", "--porcelain")      # what every audit, IDE and agent does: rewrites <gitdir>/index
+        os.utime(repo / ".git" / "worktrees" / "app-abandoned" / "index", None)
+
+        item = self.items(self.cli("clean", "--dry-run", "--only", "worktrees"))["app-abandoned"]
+        self.assertNotIn("keep", item, item)
+
+    def test_a_recently_edited_file_deep_in_the_tree_keeps_the_worktree(self):
+        repo = self.clone("app")
+        path = self.worktree(repo, "app-active")
+        self.put(path, "src/deep/feature.md")
+        self.git(path, "add", "-A")
+        self.git(path, "commit", "-q", "-m", "work")
+        self.backdate(repo, path, 10)
+        os.utime(path / "src" / "deep" / "feature.md", None)  # edited just now, committed earlier
+
+        item = self.items(self.cli("clean", "--dry-run", "--only", "worktrees"))["app-active"]
+        self.assertTrue(item.get("keep", "").startswith("recent:"), item)
+
+    def test_a_job_numbered_worktree_outside_any_clone_base_is_not_left_to_the_job_reaper(self):
+        repo = self.clone("app")
+        nested = repo / ".worktrees"
+        nested.mkdir()
+        (repo / ".gitignore").write_text((repo / ".gitignore").read_text() + ".worktrees/\n")
+        self.git(repo, "add", ".gitignore")
+        self.git(repo, "commit", "-q", "-m", "ignore nested worktrees")
+        self.git(repo, "push", "-q")
+        path = nested / "J-1552"
+        self.git(repo, "worktree", "add", "-b", "job/J-1552", str(path))
+        self.age(path, 10)
+        self.age(repo / ".git" / "worktrees" / "J-1552", 10)
+
+        item = {Path(i["path"]).name: i for i in self.cli("clean", "--dry-run", "--only", "worktrees")["items"]
+                if i["name"] == "worktrees"}["J-1552"]
+        self.assertNotEqual(item.get("keep", ""), "job-folder:reaped-with-its-job", item)
+        self.assertFalse(item.get("keep", "").startswith("recent:"), item)
+        self.assertEqual(core_job_ids("J-1552"), ["J-1552"])  # the dashed name is a job name, so the ownership rule is what decides
+
+    def test_a_top_level_job_clone_is_still_left_to_the_job_reaper(self):
+        repo = self.clone("app")
+        self.worktree(repo, "app-j0042")
+        kept = self.items(self.cli("clean", "--dry-run", "--only", "worktrees"))["app-j0042"]
+        self.assertEqual(kept.get("keep"), "job-folder:reaped-with-its-job")
+
+    def scratch_worktree(self, repo: Path, name: str, quiet_days: float) -> Path:
+        nested = self.home / "scratch"
+        nested.mkdir(exist_ok=True)
+        path = nested / name
+        self.git(repo, "worktree", "add", "-b", "job/" + name, str(path))  # outside the clone base
+        self.backdate(repo, path, quiet_days)
+        return path
+
+    def scratch_item(self, name: str) -> dict:
+        return {Path(i["path"]).name: i for i in self.cli("clean", "--dry-run", "--only", "worktrees")["items"]
+                if i["name"] == "worktrees"}[name]
+
+    def test_a_worktree_named_for_a_long_finished_job_waits_hours_not_days(self):
+        repo = self.clone("app")
+        self.scratch_worktree(repo, "app-j0077", quiet_days=0.5)   # 12 hours quiet: past the 6h job window, short of 7 days
+        self.add_job("J-0077", status="done", finished_ago=5 * DAY)
+        lifetime(self, "J-0077")
+        self.assertNotIn("keep", self.scratch_item("app-j0077"))
+
+    def test_finished_job_work_still_needs_a_short_quiet_period(self):
+        repo = self.clone("app")
+        self.scratch_worktree(repo, "app-j0079", quiet_days=0.05)  # touched about an hour ago
+        self.add_job("J-0079", status="done", finished_ago=5 * DAY)
+        lifetime(self, "J-0079")  # eligible for the short window, so the 6-hour rule is what keeps it
+        self.assertTrue(self.scratch_item("app-j0079").get("keep", "").startswith("recent:0.1d-of-0.25d"))
+
+    def test_an_ancestor_job_name_never_shortens_the_wait(self):
+        repo = self.clone("app")
+        nested = self.home / "scratch" / "j0080-review"
+        nested.mkdir(parents=True)
+        path = nested / "app-copy"
+        self.git(repo, "worktree", "add", "-b", "copy", str(path))
+        self.backdate(repo, path, 0.5)
+        self.add_job("J-0080", status="done", finished_ago=5 * DAY)
+        lifetime(self, "J-0080")  # the parent's job would qualify: only the name rule keeps the full window
+        self.assertTrue(self.scratch_item("app-copy").get("keep", "").startswith("recent:0.5d-of-7d"))
+
+    def test_a_finished_job_with_a_live_successor_keeps_the_full_wait(self):
+        repo = self.clone("app")
+        self.scratch_worktree(repo, "app-j0081", quiet_days=0.5)
+        self.add_job("J-0081", status="done", finished_ago=5 * DAY)
+        lifetime(self, "J-0081")
+        self.add_job("J-0082", status="running")
+        with contextlib.closing(self.state()) as conn, conn:
+            conn.execute("INSERT INTO meta(key,value) VALUES(?,?)", ("cleanup:successor:J-0081",
+                         json.dumps({"job": "J-0081", "successor": "J-0082"})))
+        self.assertTrue(self.scratch_item("app-j0081").get("keep", "").startswith("recent:"))
+
+    def test_a_finished_job_someone_awaits_keeps_the_full_wait(self):
+        repo = self.clone("app")
+        self.scratch_worktree(repo, "app-j0083", quiet_days=0.5)
+        self.add_job("J-0083", status="done", finished_ago=5 * DAY)
+        lifetime(self, "J-0083")
+        self.cli("job", "add", "J-0084", "--status", "parked", "--waits-on", "J-0083")
+        self.assertTrue(self.scratch_item("app-j0083").get("keep", "").startswith("recent:"))
+
+    def test_a_worktree_named_for_a_live_job_still_waits(self):
+        repo = self.clone("app")
+        nested = self.home / "scratch"
+        nested.mkdir()
+        path = nested / "app-j0078"
+        self.git(repo, "worktree", "add", "-b", "job/j0078", str(path))
+        self.add_job("J-0078", status="running")
+
+        item = {Path(i["path"]).name: i for i in self.cli("clean", "--dry-run", "--only", "worktrees")["items"]
+                if i["name"] == "worktrees"}["app-j0078"]
+        self.assertTrue(item.get("keep", ""), item)
+
+
+class ReleaseKeepLapse(Home):
+    def release(self, source: str, by: str, keep: list):
+        with contextlib.closing(self.state()) as conn, conn:
+            conn.execute("INSERT INTO meta(key,value) VALUES(?,?)", ("cleanup:released:" + source,
+                         json.dumps({"by": by, "keep": keep, "at": time.time() - 20 * DAY})))
+
+    def lapsed(self, source: str) -> bool:
+        from trimreaper import core, host
+        with host.db() as conn:  # the engine's own store and helpers, nothing mocked
+            value = host.row(conn, "SELECT value FROM meta WHERE key=?", ("cleanup:released:" + source,))["value"]
+            return core.reap_release_keep_lapsed(conn, source, value)
+
+    def test_keep_lapses_once_every_job_involved_ended_long_ago(self):
+        self.cli("status")
+        for job in ("J-0262", "J-0349", "J-0327"):
+            self.add_job(job, status="cancelled", finished_ago=15 * DAY)
+        lifetime(self, "J-0262", "J-0349", "J-0327")
+        self.release("J-0262", "J-0349", [str(self.dev / "dubhaven-j0327-media")])
+        self.assertTrue(self.lapsed("J-0262"))
+
+    def test_keep_holds_while_a_kept_path_names_a_live_job(self):
+        self.cli("status")
+        for job in ("J-0262", "J-0349"):
+            self.add_job(job, status="cancelled", finished_ago=15 * DAY)
+        self.add_job("J-0327", status="running")
+        self.release("J-0262", "J-0349", [str(self.dev / "dubhaven-j0327-media")])
+        self.assertFalse(self.lapsed("J-0262"))
+
+    def test_keep_whose_owner_is_not_a_job_never_lapses(self):
+        self.cli("status")
+        self.add_job("J-0262", status="cancelled", finished_ago=15 * DAY)
+        self.release("J-0262", "operator", [str(self.dev / "dubhaven-other")])
+        self.assertFalse(self.lapsed("J-0262"))
+
+    def test_keep_holds_while_a_successor_of_the_source_is_live(self):
+        self.cli("status")
+        for job in ("J-0262", "J-0349"):
+            self.add_job(job, status="cancelled", finished_ago=15 * DAY)
+        lifetime(self, "J-0262", "J-0349")
+        self.add_job("J-0400", status="running")
+        with contextlib.closing(self.state()) as conn, conn:
+            conn.execute("INSERT INTO meta(key,value) VALUES(?,?)", ("cleanup:successor:J-0262",
+                         json.dumps({"job": "J-0262", "successor": "J-0400"})))
+        self.release("J-0262", "J-0349", [str(self.dev / "x")])
+        self.assertFalse(self.lapsed("J-0262"))
+
+    def test_keep_holds_inside_the_expiry_window_and_for_unknown_jobs(self):
+        self.cli("status")
+        self.add_job("J-0262", status="done", finished_ago=1 * DAY)
+        self.add_job("J-0349", status="done", finished_ago=15 * DAY)
+        self.release("J-0262", "J-0349", [])
+        self.assertFalse(self.lapsed("J-0262"))
+        self.add_job("J-0500", status="done", finished_ago=15 * DAY)
+        self.release("J-0500", "J-0349", [str(self.dev / "x-j0999")])
+        self.assertFalse(self.lapsed("J-0500"))
+
+
+class IdleWalk(Worktrees):
+    def test_an_over_budget_walk_names_its_reason_and_keeps_the_worktree(self):
+        repo = self.clone("app")
+        path = self.worktree(repo, "app-huge", age=None)
+        for i in range(30):
+            self.put(path, f"f{i}.txt", b"x")
+        self.backdate(repo, path, 10)
+        with mock.patch.object(clean, "CLEAN_IDLE_WALK_ENTRIES", 5):
+            clean.CLEAN_IDLE_CACHE.clear()
+            item = self.items(self.cli("clean", "--dry-run", "--only", "worktrees"))["app-huge"]
+        clean.CLEAN_IDLE_CACHE.clear()
+        self.assertEqual(item.get("keep"), "idle-budget-exceeded:5-entries")
+
+    def test_a_copy_that_preserved_mtimes_still_counts_as_a_change(self):
+        repo = self.clone("app")
+        path = self.worktree(repo, "app-copied")  # backdated 10 days: mtimes and reflog are old
+        clean.CLEAN_IDLE_CACHE.clear()
+        os.chmod(path / "README.md", 0o640)      # a metadata change (ctime now), like `cp -p` onto the tree
+        item = self.items(self.cli("clean", "--dry-run", "--only", "worktrees"))["app-copied"]
+        clean.CLEAN_IDLE_CACHE.clear()
+        self.assertTrue(item.get("keep", "").startswith("recent:"), item)
+
+    def test_the_removal_recheck_never_reuses_a_cached_idle_answer(self):
+        repo = self.clone("app")
+        path = self.worktree(repo, "app-raced")
+        entry = {"path": str(path), "gitdir": str(repo / ".git" / "worktrees" / "app-raced")}
+        clean.CLEAN_IDLE_CACHE.clear()
+        self.assertGreater(clean.clean_idle_days(entry["path"], entry["gitdir"]), 9)  # the plan: idle
+        (path / "README.md").write_text("edited after planning\n")                 # someone works in it now
+        self.assertGreater(clean.clean_idle_days(entry["path"], entry["gitdir"]), 9)  # a planning re-read may reuse the walk
+        self.assertLess(clean.clean_idle_days(entry["path"], entry["gitdir"], fresh=True), 0.01)
+
+    def test_only_a_whole_wellformed_reflog_line_counts(self):
+        import tempfile
+        good = "0" * 40 + " " + "1" * 40 + " A B <a@b> 1700000000 -0300\n"
+        tricky = "0" * 40 + " " + "1" * 40 + " A <a@b> 1700000000 -0300\tcommit: see <x> 1799999999 +0000\n"
+        cases = {good: 1700000000.0, good.rstrip("\n"): None, tricky: 1700000000.0,
+                 "0" * 40 + " " + "1" * 40 + " A <a@b> nan -0300\n": None,
+                 "0" * 40 + " " + "1" * 40 + " A <a@b> 99999999999 +0000\n": None,
+                 "garbage\n": None, "": None}
+        for text, expected in cases.items():
+            with self.subTest(text=text[:20]), tempfile.NamedTemporaryFile("w", delete=False) as handle:
+                handle.write(text)
+            try:
+                self.assertEqual(clean.clean_reflog_last(handle.name), expected)
+            finally:
+                os.unlink(handle.name)
+
+
+class JobNamePattern(Home):
+    def test_dashed_job_ids_are_recognised_and_lookalikes_are_not(self):
+        from trimreaper import core
+        self.assertEqual(core.reap_job_ids("J-1552", "australiatoargentina-J-2807", "app-j0042", ".j0262"),
+                         ["J-1552", "J-2807", "J-0042", "J-0262"])
+        # The dashed form is uppercase only: a lowercase j- prefix is too common in ordinary names.
+        self.assertEqual(core.reap_job_ids("job-2024", "proj-12345", "dj-1234", "v-j12", "app-j-1234", "release-j-2024"), [])
+
+
+class ReflogMaintenance(Worktrees):
+    def test_gc_rewriting_every_reflog_does_not_make_old_worktrees_recent(self):
+        repo = self.clone("app")
+        path = self.worktree(repo, "app-old")  # committed and backdated 10 days
+        old = time.time() - 10 * DAY
+        log = repo / ".git" / "worktrees" / "app-old" / "logs" / "HEAD"
+        lines = log.read_text().splitlines()
+        rewritten = []
+        for line in lines:  # entries written 10 days ago
+            head, _, message = line.partition("\t")
+            parts = head.split(" ")
+            parts[-2] = str(int(old))
+            rewritten.append(" ".join(parts) + "\t" + message)
+        log.write_text("\n".join(rewritten) + "\n")  # the rewrite itself is what gc does: the file's mtime is now
+        item = self.items(self.cli("clean", "--dry-run", "--only", "worktrees"))["app-old"]
+        self.assertNotIn("keep", item, item)

@@ -249,6 +249,29 @@ class ExpiredClones(Home):
         self.assertEqual((restored / "notes.txt").read_text(), "untracked notes\n")
         self.assertIsNotNone(json.loads((archive / "sole-copy-since.json").read_text())["soleCopySince"])
 
+    def test_a_dashed_job_clone_is_archived_before_it_goes(self):
+        repo = self.clone("site-J-0014")
+        (repo / "notes.txt").write_text("untracked notes\n")
+        self.add_job("J-0014", repo, finished_ago=4 * DAY)
+
+        out = self.cli("reap", "--job", "J-0014")
+
+        self.assertFalse(repo.exists(), out)
+        archives = list((self.home / ".cache/trimreaper/archive/J-0014").iterdir())
+        self.assertEqual(len(archives), 1, archives)
+        with tarfile.open(archives[0] / "files.tar.gz") as tar:
+            self.assertIn("notes.txt", tar.getnames())
+
+    def test_a_lowercase_dashed_name_is_not_a_job_clone(self):
+        repo = self.clone("app-j-0015")
+        self.put(repo, "node_modules/pkg/index.js")
+        self.add_job("J-0015", repo, finished_ago=4 * DAY)
+
+        out = self.cli("reap", "--job", "J-0015")
+
+        self.assertEqual([i for i in out["items"] if i.get("path", "").startswith(str(repo))], [], out)
+        self.assertTrue((repo / "node_modules").exists())
+
     def test_a_clone_inside_its_expiry_window_stays(self):
         repo = self.clone("site-j0013")
         self.add_job("J-0013", repo, finished_ago=1 * DAY)

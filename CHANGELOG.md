@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.8.0 (2026-10-24)
+
+Fixes the causes of a 60 GB pileup of abandoned agent worktrees: on one machine the clean pass kept 184 abandoned
+worktrees that had seen no work for up to six weeks.
+
+- The worktree idle clock no longer reads the git index or the reflog file's mtime. Every `git status` (an IDE, an
+  agent, an audit, the reaper's own gates) rewrites the index, and `git gc` rewrites every reflog, so abandoned worktrees
+  read as `recent:0.0d` forever. Idleness now comes from the HEAD file, the timestamp in the HEAD reflog's last complete,
+  well-formed entry, and a walk of the working tree using the later of mtime and ctime (a copy that preserves mtimes still
+  counts as a change). Build output, caches and protected names are skipped, links are never followed and the walk stays on
+  the folder's device. It is bounded (50,000 entries, 5 seconds); past the budget, on an unreadable entry or another device
+  the folder is kept with a named reason (`idle-budget-exceeded`, `idle-budget-time-exceeded`, `idle-unreadable`,
+  `idle-mountpoint`) instead of reading as just changed. One pass walks each folder once.
+- A job-named worktree is left to the job reaper only when the job reaper can find it: a top-level folder of a clone
+  base. Job-named worktrees nested in a repository (`<repo>/.worktrees/J-0042`), in scratch or in `/tmp` were deferred
+  to a pass that never looks there and were kept for good; they are now judged as agent worktrees with every gate.
+- A worktree whose own folder name gives only jobs that all finished `cloneExpiryDays` ago waits 6 quiet hours instead of
+  `worktreeIdleDays`, provided the job reaper's own blocker clears every such job (settled, worker terminal gone, no live job
+  sharing its terminal, nobody awaiting it) and no continuation or accepted successor of it is still live. Job names in
+  parent folders never shorten a wait. Every other gate (clean, pushed, no protected name, no process, no unfinished claim)
+  still holds.
+- Job names in the uppercase dashed form `J-0042` / `app-J-0042` are recognised alongside `app-j0042`, `j0042-app` and
+  `.j0042`. This applies to the job reaper too: a top-level clone-base folder named `*-J-NNNN` now belongs to that job,
+  and once the job finished `cloneExpiryDays` ago it goes like any job clone (unsaved work is archived and verified
+  first; `cloneArchive` decides). The lowercase `j-NNNN` form is not a job name.
+- A scope release's `keep` list lapses once the releasing job, the source and every job its kept paths name, with their
+  whole continuation and successor chains, finished `cloneExpiryDays` ago. A keep list whose owner is not a job, an unknown
+  or live job and an unreadable record keep it in force. Before, one consolidation's keep list protected four cancelled
+  jobs' clones indefinitely.
+
 ## 0.7.3 (2026-10-24)
 
 - Git probes bind the exact `.git` of the repository being gated. A broken nested `.git` now fails the probe instead of
