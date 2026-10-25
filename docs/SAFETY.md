@@ -161,9 +161,15 @@ These also remove files, each with its own checks:
     `.vercel`, nested repository or retention marker other than `disposable`), fresh `lsof`/`ps` probe and
     descriptor-relative removal as a job folder, with the identities of protected names beside it re-taken afterwards. A
     retention marker on the cache root or anywhere inside the folder keeps it.
-  - An agent worktree passes, in order: unlocked; not named for a job (`*-jNNNN*` folders are the job reaper's); its
-    parent may be a removal root; no retention marker but `disposable`; `worktreeIdleDays` without a change to the
-    folder, its top-level entries, its HEAD, index or HEAD reflog; no unfinished job declares it or a folder in or
+  - An agent worktree passes, in order: unlocked; not a job clone the job reaper owns (a `*-jNNNN*` or `*-J-NNNN*`
+    folder directly in a clone base; a job-named worktree anywhere else is judged here); its parent may be a removal
+    root; no retention marker but `disposable`; `worktreeIdleDays` without a change, read from the HEAD file, the
+    timestamp of the HEAD reflog's last complete entry and the later of mtime and ctime of every working-tree file and
+    folder (build output, caches and protected names skipped; no link followed; same device only; bounded by entries and
+    time, and an unprovable walk keeps the folder with a named reason). The git index and the reflog file's mtime are
+    never read: `git status` and `git gc` rewrite them without anyone working. When the folder's own name gives only
+    jobs that finished `cloneExpiryDays` ago, whose job-reaper blocker clears and whose continuation and successor chain
+    has ended, the quiet period is 6 hours instead; no unfinished job declares it or a folder in or
     around it; the protected scan; it is still exactly the linked worktree its repository records (a `.git` file naming
     `<repo>/.git/worktrees/<n>`, whose `gitdir` names the folder back, and git agrees), so a full repository standing at
     an old worktree path is never removed; no lock file now; the engine's closed clean check (no index flag that hides

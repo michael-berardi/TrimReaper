@@ -18,9 +18,11 @@ Everything between the `trimreaper clean` markers can be vendored byte for byte 
 from __future__ import annotations
 
 import json
+import re
 import os
 import shutil
 import subprocess
+import time
 import uuid
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -354,21 +356,115 @@ def clean_worktree_gitdir(repo: str, path: str) -> str | None:
     return None
 
 
-def clean_newest_change(path: str, gitdir: str | None) -> float:
-    """The newest mtime among the folder's top-level entries and its HEAD, index and HEAD reflog. The folder's own mtime and the
-    regenerable output folders are left out: removing one output (or a clean pass removing them) must not make the project look
-    freshly worked on."""
+CLEAN_IDLE_WALK_ENTRIES = 50000   # entries one idle walk may stat
+CLEAN_IDLE_WALK_SECONDS = 5.0     # wall clock one idle walk may spend
+CLEAN_IDLE_SKIP = {".git", "target", "dist", "build", ".venv", "venv", "__pycache__", ".cache", ".pytest_cache", ".ruff_cache",
+                   ".mypy_cache", "coverage", "gen"}
+CLEAN_REFLOG_LINE = re.compile(r"^[0-9a-f]{40,64} [0-9a-f]{40,64} [^\t]*> (\d{1,12}) [+-]\d{4}(?:\t.*)?$")
+CLEAN_IDLE_CACHE: dict = {}       # (path, gitdir) -> (computed-at monotonic, newest, reason); one pass reuses a walk
+
+
+class CLEAN_IDLE_UNPROVED(Exception):
+    """The idle walk could not prove when the folder last changed (over budget, unreadable, another device)."""
+
+
+def clean_reflog_last(path: str) -> float | None:
+    """The time written in the reflog's last complete entry, not the file's mtime: `git gc`, `reflog expire` and pack
+    maintenance rewrite every worktree's reflog file, which made all of a repository's worktrees look worked on at once.
+    Only a whole, well-formed last line with an integer timestamp counts; anything else is None (no evidence either way)."""
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - 65536))
+            data = handle.read()
+    except OSError:
+        return None
+    if not data.endswith(b"\n"):
+        return None  # a partial final write
+    lines = data[:-1].split(b"\n")
+    if size > 65536 and len(lines) < 2:
+        return None  # the last line is longer than the window: never parse a cut-off line
+    match = CLEAN_REFLOG_LINE.match(lines[-1].decode("utf-8", "replace"))
+    if not match:
+        return None
+    stamp = int(match.group(1))
+    return float(stamp) if 0 < stamp <= now() + 86400 else None
+
+
+def clean_newest_change(path: str, gitdir: str | None, fresh: bool = False) -> float:
+    """When someone last worked here: the newest of the HEAD file, the HEAD reflog's last entry and the later of mtime and
+    ctime of every working-tree file and folder (ctime: a copy that preserves mtimes still counts as a change).
+
+    Never the git index: every `git status` (an IDE, an agent, an audit, this reaper's own gates) rewrites it, so reading it
+    made a month-old worktree look touched today and it was kept forever (2026-10-24: 117 abandoned worktrees read as
+    `recent:0.0d`). Regenerable output folders, caches and protected names are skipped, links are never followed and the
+    walk never leaves the folder's device. Raises CLEAN_IDLE_UNPROVED when the walk exceeds its entry or time budget, meets an
+    unreadable entry or another device: nothing is proved idle then. A planning pass computes each folder once; `fresh` (the
+    removal's own recheck) always walks again, so a change made after planning is never hidden by a cached answer."""
+    key = (path, gitdir)
+    cached = None if fresh else CLEAN_IDLE_CACHE.get(key)
+    if cached and time.monotonic() - cached[0] < 300:
+        if cached[2]:
+            raise CLEAN_IDLE_UNPROVED(cached[2])
+        return cached[1]
+    try:
+        newest = clean_newest_change_walk(path, gitdir)
+    except CLEAN_IDLE_UNPROVED as unproved:
+        CLEAN_IDLE_CACHE[key] = (time.monotonic(), None, str(unproved))
+        raise
+    CLEAN_IDLE_CACHE[key] = (time.monotonic(), newest, None)
+    return newest
+
+
+def clean_newest_change_walk(path: str, gitdir: str | None) -> float:
     stamps = []
-    with os.scandir(path) as entries:
-        for entry in entries:
-            if not reap_protected(entry.name) and entry.name not in CLEAN_PROJECT_OUTPUTS and entry.name != "target":
-                stamps.append(entry.stat(follow_symlinks=False).st_mtime)
-    for name in ("HEAD", "index", os.path.join("logs", "HEAD")):
+    if gitdir:
         try:
-            stamps.append(os.lstat(os.path.join(gitdir, name)).st_mtime) if gitdir else None
+            stamps.append(os.lstat(os.path.join(gitdir, "HEAD")).st_mtime)
         except OSError:
             pass
-    return max(stamps) if stamps else os.lstat(path).st_mtime
+        last = clean_reflog_last(os.path.join(gitdir, "logs", "HEAD"))
+        if last is not None:
+            stamps.append(last)
+    try:
+        root = os.lstat(path)
+    except OSError:
+        raise CLEAN_IDLE_UNPROVED("idle-unreadable")
+    deadline = time.monotonic() + CLEAN_IDLE_WALK_SECONDS
+    seen, stack = 0, [path]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    if reap_protected(entry.name) or entry.name in CLEAN_PROJECT_OUTPUTS or entry.name in CLEAN_IDLE_SKIP:
+                        continue
+                    seen += 1
+                    if seen > CLEAN_IDLE_WALK_ENTRIES:
+                        raise CLEAN_IDLE_UNPROVED(f"idle-budget-exceeded:{CLEAN_IDLE_WALK_ENTRIES}-entries")
+                    if not seen % 256 and time.monotonic() > deadline:
+                        raise CLEAN_IDLE_UNPROVED(f"idle-budget-time-exceeded:{CLEAN_IDLE_WALK_SECONDS:g}s")
+                    try:
+                        info = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        raise CLEAN_IDLE_UNPROVED("idle-unreadable")
+                    if info.st_dev != root.st_dev:
+                        raise CLEAN_IDLE_UNPROVED("idle-mountpoint")
+                    stamps.append(reap_scratch_changed(info))  # the later of mtime and ctime, as the scratch idle proof
+                    if entry.is_dir(follow_symlinks=False):
+                        stack.append(entry.path)
+        except OSError:
+            raise CLEAN_IDLE_UNPROVED("idle-unreadable")
+    return max(stamps) if stamps else root.st_mtime
+
+
+def clean_idle_days(path: str, gitdir: str | None, fresh: bool = False) -> float:
+    """Days since the folder last changed; ReapRefused naming why when that cannot be proved."""
+    try:
+        return (now() - clean_newest_change(path, gitdir, fresh)) / 86400
+    except CLEAN_IDLE_UNPROVED as unproved:
+        raise ReapRefused(str(unproved))
 
 
 def clean_linked_identity(entry: dict) -> None:
@@ -395,6 +491,40 @@ def clean_linked_identity(entry: dict) -> None:
         raise ReapRefused("worktree-locked")
 
 
+def clean_job_reaper_owns(path: str) -> bool:
+    """The job reaper will find this folder: it is a top-level entry of a clone base (with that base's required prefix), the
+    only place reap_clone_roots looks. A job-numbered folder anywhere else (`<repo>/.worktrees/J-0042`, `/tmp/j0042-base`, a
+    scratch folder) belongs to no job pass, so deferring it to one kept it forever (2026-10-24: 60 such worktrees)."""
+    parent, name = reap_canon(os.path.dirname(path)), os.path.basename(path)
+    for base, prefix in reap_clone_bases():
+        if reap_canon(str(base)) == parent and (not prefix or name.startswith(prefix)):
+            return True
+    return False
+
+
+def clean_jobs_finished(ids: list, path: str) -> bool:
+    """Every job the folder's own name gives finished cloneExpiryDays ago (the job reaper's clone rule, including later jobs
+    that worked in it), and the job reaper's own blocker clears each one (settled, worker terminal gone, no live job sharing
+    its terminal, nobody awaiting it), and no successor of it is still live. Read without raising: anything unreadable or
+    unknown keeps the full idle window."""
+    try:
+        if not reap_clone_expired(ids, path):
+            return False
+        live_ids = reap_live_ids()
+        if live_ids is None:
+            return False
+        with db() as conn:
+            for job_id in ids:
+                job = row(conn, "SELECT * FROM jobs WHERE id=?", (job_id,))
+                if not job or reap_job_blocker(conn, job, live_ids) is not None:
+                    return False
+                if reap_chain_clock(conn, job) is None:  # a live (or unprovable) continuation or accepted successor
+                    return False
+        return True
+    except Exception:
+        return False
+
+
 def clean_job_claims(path: str) -> None:
     """No unfinished job declares the folder, a folder inside it, or a folder around it (job add --cwd/--worktree)."""
     with db() as conn:
@@ -410,7 +540,8 @@ def clean_worktree_gates(entry: dict, idle_days: int, table: dict | None) -> Non
     path = entry["path"]
     if "locked" in entry["git"]:
         raise ReapRefused("worktree-locked")
-    if reap_job_ids(*Path(path).parts):
+    job_ids = reap_job_ids(*Path(path).parts)
+    if job_ids and clean_job_reaper_owns(path):
         raise ReapRefused("job-folder:reaped-with-its-job")
     if any(reap_protected(part) for part in Path(path).parts):
         raise ReapRefused("protected-ancestor")
@@ -418,9 +549,17 @@ def clean_worktree_gates(entry: dict, idle_days: int, table: dict | None) -> Non
     retention = reap_cache_retention(path)
     if retention not in ("unmarked", REAP_DISPOSABLE):
         raise ReapRefused("retention:" + retention)
-    idle = (now() - clean_newest_change(path, entry["gitdir"])) / 86400
-    if idle < idle_days:
-        raise ReapRefused(f"recent:{idle:.1f}d-of-{idle_days}d")
+    # A worktree whose OWN folder name gives jobs that all finished cloneExpiryDays ago, settled with no open worker, no live
+    # successor and nobody awaiting them, is finished work: it waits CLEAN_PROJECT_JOB_IDLE_HOURS of quiet instead of
+    # worktreeIdleDays (every other gate below still holds). Ancestor names never shorten a wait; an unknown or live job keeps
+    # the full window.
+    idle = clean_idle_days(path, entry["gitdir"], fresh=table is None)  # table None: the removal's fresh recheck
+    limit = idle_days
+    own_ids = reap_job_ids(os.path.basename(path))
+    if own_ids and clean_jobs_finished(own_ids, path):
+        limit = min(idle_days, CLEAN_PROJECT_JOB_IDLE_HOURS / 24)
+    if idle < limit:
+        raise ReapRefused(f"recent:{idle:.1f}d-of-{limit:g}d")
     clean_job_claims(path)
     repos = []
     reap_protected_scan(path, allow_git=True, markers=True, repos=repos, nested_disposable=True)
@@ -744,7 +883,7 @@ def clean_project_gates(entry: dict, table: dict | None) -> None:
     repo = entry["repo"]
     dot_git = os.path.join(repo, ".git")
     gitdir = clean_pointer_target(dot_git) if os.path.isfile(dot_git) else dot_git
-    idle = (now() - clean_newest_change(repo, gitdir)) / 3600
+    idle = clean_idle_days(repo, gitdir, fresh=table is None) * 24
     if idle < limit:
         raise ReapRefused(f"recent:{idle:.0f}h-of-{limit}h")
 

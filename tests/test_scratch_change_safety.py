@@ -8,6 +8,8 @@ from types import SimpleNamespace
 from unittest import mock
 
 from trimreaper import core
+
+REAL_SCRATCH_CHANGED = core.reap_scratch_changed
 from helpers import Home
 
 
@@ -131,8 +133,9 @@ class ScratchChangeSafety(Home):
         self.assertEqual(proof["entries"], 0)
 
     def test_a_newer_mtime_is_not_lost_when_ctime_is_older(self):
-        self.assertEqual(core.reap_scratch_changed(SimpleNamespace(st_mtime=200, st_ctime=100)), 200)
-        self.assertEqual(core.reap_scratch_changed(SimpleNamespace(st_mtime=100, st_ctime=200)), 200)
+        real = REAL_SCRATCH_CHANGED  # the fixture replaces it with a synthetic-ctime reader; test the engine's own
+        self.assertEqual(real(SimpleNamespace(st_mtime=200, st_ctime=100)), 200)
+        self.assertEqual(real(SimpleNamespace(st_mtime=100, st_ctime=200)), 200)
 
     def test_a_root_on_another_device_is_kept_without_opening_it(self):
         task = self.scratch("root-mount-task")

@@ -44,6 +44,20 @@ class Home(unittest.TestCase):
             patch.start()
             self.addCleanup(patch.stop)
         self.addCleanup(self.remove_tmp)
+        # Synthetic old ctimes: aging cannot rewind ctime, so an aged entry's identity and change stamp are recorded and
+        # read back as old. Any later chmod, write, replacement or preserved-time copy keeps its real ctime.
+        self.aged_changes = {}
+
+        def changed(info):
+            key = (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns)
+            return max(info.st_mtime, self.aged_changes.get(key, info.st_ctime))
+
+        for module in (core, clean):  # the clean pass reads the engine's names as its own globals (as when vendored)
+            patch = mock.patch.object(module, "reap_scratch_changed", side_effect=changed)
+            patch.start()
+            self.addCleanup(patch.stop)
+        clean.CLEAN_IDLE_CACHE.clear()
+        self.addCleanup(clean.CLEAN_IDLE_CACHE.clear)
 
     def remove_tmp(self):
         subprocess.run(["chmod", "-R", "u+rwx", str(self.tmp)], capture_output=True)
@@ -110,39 +124,40 @@ class Home(unittest.TestCase):
         path.write_bytes(data)
         return path
 
-    @staticmethod
-    def age(path: Path, days: float):
-        """Backdate a tree's mtimes (files and folders)."""
+    def age(self, path: Path, days: float):
+        """Backdate a tree's mtimes (files and folders), and the time written in every git reflog entry inside it: idleness
+        reads a reflog's last entry, not its mtime."""
         stamp = time.time() - days * DAY
         for current, dirs, files in os.walk(path, topdown=False):
+            for name in files:
+                full = os.path.join(current, name)
+                if os.path.basename(os.path.dirname(full)) == "logs" or f"{os.sep}logs{os.sep}" in full:
+                    Home.backdate_reflog(full, stamp)
             for name in files + dirs:
                 os.utime(os.path.join(current, name), (stamp, stamp), follow_symlinks=False)
         os.utime(path, (stamp, stamp))
+        aged = getattr(self, "aged_changes", None)
+        if aged is not None:
+            for current, dirs, files in os.walk(path, followlinks=False):
+                for entry in [Path(current), *(Path(current) / name for name in dirs + files)]:
+                    info = entry.lstat()
+                    aged[(info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns)] = info.st_mtime
+
+    @staticmethod
+    def backdate_reflog(path: str, stamp: float):
+        try:
+            text = Path(path).read_text()
+        except (OSError, UnicodeError):
+            return
+        lines = []
+        for line in text.splitlines():
+            head, tab, message = line.partition("\t")
+            parts = head.split(" ")
+            if len(parts) >= 6 and parts[-2].isdigit() and parts[-1][:1] in "+-":
+                parts[-2] = str(int(stamp))
+            lines.append(" ".join(parts) + tab + message)
+        Path(path).write_text("\n".join(lines) + ("\n" if text.endswith("\n") else ""))
 
 
 class ScratchHome(Home):
-    """Synthetic old ctimes for idle-proof tests only; no production clock or backdating switch.
-
-    Aged entries are keyed by their full identity and change stamp. A later chmod, write, replacement or preserved-time
-    copy keeps its real ctime, so the fixture cannot hide a new change. Other reaper gates always see real stat data.
-    """
-
-    def setUp(self):
-        super().setUp()
-        self.aged_changes = {}
-
-        def changed(info):
-            key = (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns)
-            return max(info.st_mtime, self.aged_changes.get(key, info.st_ctime))
-
-        patch = mock.patch.object(core, "reap_scratch_changed", side_effect=changed)
-        patch.start()
-        self.addCleanup(patch.stop)
-
-    def age(self, path: Path, days: float):
-        super().age(path, days)
-        for current, dirs, files in os.walk(path, followlinks=False):
-            for entry in [Path(current), *(Path(current) / name for name in dirs + files)]:
-                info = entry.lstat()
-                key = (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns)
-                self.aged_changes[key] = info.st_mtime
+    """Kept for the scratch suites: the synthetic-ctime fixture now lives in Home, so every suite ages folders the same way."""

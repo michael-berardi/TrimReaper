@@ -165,7 +165,8 @@ REAP_MAX_DEPTH = 128                  # directory levels a scan or the removal d
 REAP_AUDIT_SECONDS = 240              # default wall-clock budget of one reap-status sizing pass
 REAP_RECEIPT_LOCK_SECONDS = 10        # bounded blocking wait for the receipt file lock; a longer wait is receipt-unavailable:lock-timeout
 REAP_UNSAFE_CONFIG_SECTIONS = ("include", "includeif", "filter")   # Git config sections that read another file or run a command
-REAP_JOB_NUMBER = re.compile(r"(?:^|[-_.])[jJ](\d{4,5})(?!\d)")
+REAP_JOB_NUMBER = re.compile(r"(?:^|[-_.])(?:[jJ]|J-)(\d{4,5})(?!\d)")  # foo-j0349, j0349-foo, .j0349, foo-J-0349, J-0349 (dashed: uppercase only)
+REAP_JOB_ID = re.compile(r"J-\d{4,5}")
 # An allowed root may not be, enclose or sit inside a system root, and may not be or enclose a system parent.
 REAP_SYSTEM_ROOTS = ("/System", "/Library", "/Applications", "/usr", "/bin", "/sbin", "/etc", "/private/etc", "/opt",
                      "/cores", "/dev", "/Volumes", "/var/db", "/private/var/db")
@@ -316,7 +317,7 @@ def reap_inside_folded(path: str, root: str) -> bool:
 
 
 def reap_job_ids(*names: str) -> list[str]:
-    """Job ids named by directory names: foo-j0349, j0349-foo, .j0349-foo."""
+    """Job ids named by directory names: foo-j0349, j0349-foo, .j0349-foo, foo-J-0349, J-0349."""
     found = []
     for name in names:
         for number in REAP_JOB_NUMBER.findall(name):
@@ -3187,6 +3188,41 @@ def reap_recent_users(scope: str, ids: list, seconds: float) -> list[str]:
     return [j["id"] for j in recent if j["id"] not in ids and any(reap_inside(d, scope) for d in reap_declared_paths(j))]
 
 
+def reap_release_keep_lapsed(conn, source: str, value: str) -> bool:
+    """A scope release's `keep` list protected paths the releasing job still needed. It lapses once the releasing job, the
+    source and every job the kept paths are named for are terminal (or continued and finished) at least cloneExpiryDays ago:
+    the paths are then ordinary finished-job folders. Without that, one consolidation's keep list protected four cancelled
+    jobs' clones for good (2026-10-24: J-0349's keep list, 15 days after every job in it ended). Unreadable records, an
+    unknown job or a live one keep the list in force."""
+    days = load_policy().get("cloneExpiryDays", 3)
+    if not isinstance(days, int) or isinstance(days, bool) or days <= 0:
+        return False
+    try:
+        proof = json.loads(value)
+        kept = proof.get("keep") or []
+        by = proof.get("by")
+    except (ValueError, TypeError, AttributeError):
+        return False
+    if not isinstance(kept, list) or not all(isinstance(p, str) for p in kept):
+        return False
+    if kept and not (isinstance(by, str) and REAP_JOB_ID.fullmatch(by)):
+        return False  # a keep list whose owner is not a job (an operator, "tick", unreadable) never lapses on its own
+    ids = {source}
+    if isinstance(by, str) and REAP_JOB_ID.fullmatch(by):
+        ids.add(by)
+    for path in kept:
+        ids.update(reap_job_ids(*Path(path).parts))
+    for job_id in sorted(ids):
+        job = row(conn, "SELECT * FROM jobs WHERE id=?", (job_id,))
+        if not job:
+            return False
+        # The whole continuation/successor chain must have ended cloneExpiryDays ago: a live heir keeps the list.
+        clock = reap_chain_clock(conn, job)
+        if not clock or now() - clock < days * 86400:
+            return False
+    return True
+
+
 def reap_clone_expired(ids: list, scope: str | None = None) -> bool:
     """Every job the clone is named for finished (done/failed/cancelled, or interrupted with a durable continuation) at least
     cloneExpiryDays ago, and (with `scope`, the clone's path) no other job that declared that folder as its cwd or worktree
@@ -4212,7 +4248,8 @@ def reap_output_authority(item: dict) -> dict:
         blocker = reap_output_terminal_blocker(conn, owner, reap_live_ids())
         if blocker:
             raise ReapRefused(blocker)
-        releases = rows(conn, "SELECT value FROM meta WHERE key LIKE 'cleanup:released:%'")
+        releases = rows(conn, "SELECT key, value FROM meta WHERE key LIKE 'cleanup:released:%'")
+        lapsed = {r["key"]: reap_release_keep_lapsed(conn, r["key"].split(":", 2)[2], r["value"]) for r in releases}
     for record in releases:
         try:
             proof = json.loads(record["value"])
@@ -4221,6 +4258,8 @@ def reap_output_authority(item: dict) -> dict:
                 raise ValueError("invalid keep paths")
         except (ValueError, TypeError, AttributeError):
             raise ReapRefused("output-release-claims-unverified")
+        if lapsed.get(record["key"]):
+            continue
         for path in kept:
             if reap_inside_folded(item["path"], reap_canon(path)) or reap_inside_folded(reap_canon(path), item["path"]):
                 raise ReapRefused("kept-by-release:" + path)
@@ -4620,10 +4659,13 @@ def reap_authority(item: dict) -> dict:
                 successors[proof["job"]] = proof["successor"]
         released = {}
         for r in rows(conn, "SELECT key, value FROM meta WHERE key LIKE 'cleanup:released:%'"):
+            source = r["key"].split(":", 2)[2]
             try:
-                released[r["key"].split(":", 2)[2]] = json.loads(r["value"]) or {"by": "?"}
+                released[source] = json.loads(r["value"]) or {"by": "?"}
             except ValueError:
-                released[r["key"].split(":", 2)[2]] = {"by": "?"}
+                released[source] = {"by": "?"}
+            if reap_release_keep_lapsed(conn, source, r["value"]):
+                released[source] = {**released[source], "keep": []}
     ids = list(dict.fromkeys(item.get("jobs") or []))
     # Scratch tasks and release versions are independent siblings, not claims on their collection root.
     # Repository output still uses its source root so a source consumer preserves its build output.
