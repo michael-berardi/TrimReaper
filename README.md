@@ -20,7 +20,7 @@ Requires macOS, Python 3.10 or newer, and `git`, `lsof` and `ps`. The `python3` 
 newer one comes from [python.org](https://www.python.org/downloads/) or Homebrew (`brew install python`).
 
 ```sh
-pipx install "git+https://github.com/michael-berardi/TrimReaper@v0.8.0"
+pipx install "git+https://github.com/michael-berardi/TrimReaper@v0.9.0"
 trimreaper --version
 ```
 
@@ -52,8 +52,11 @@ trimreaper tick
 `trimreaper status --items` is a metadata-only audit: it deletes nothing. When a pass runs out of time, the jobs it did not reach are shown from an earlier pass and marked `cached`; every path in that earlier view is proved again (metadata only) before it counts, so a path that is gone is never reported as reapable.
 
 `tick` runs once and exits. `trimreaper schedule install` runs it every 30 minutes with launchd (macOS); elsewhere,
-call it from cron or your agent loop. At 85% used, `tick` also runs `trimreaper clean`, targeting 80% used.
-While pressure remains, it retries at most once per ten minutes until the measured 80% goal is met. Changed job-release events can also trigger a retry after that cooldown.
+call it from cron or your agent loop. At 75% used, `tick` also runs `trimreaper clean`, targeting 60% used, and climbs
+the [escalation ladder](#when-the-routine-rules-are-not-enough-the-escalation-ladder) when the routine rules cannot get there.
+While pressure remains, it retries at most once per ten minutes while passes free something, and once an hour after a pass that
+freed nothing, until the measured 60% goal is met. New pressure (the free-space floor or growth) or a finished job (a changed release event) ends the wait. Below 75%, a quiet
+steady pass still runs every six hours (below).
 
 ## Clean the whole machine
 
@@ -64,7 +67,9 @@ trimreaper clean --dry-run   # what would go, what stays and why, plus a report 
 trimreaper clean             # do it
 trimreaper clean --only npm,worktrees
 trimreaper clean --deep      # also the Go module cache, unused Docker images and unavailable simulators
-trimreaper clean --high-watermark 85 --low-watermark 80
+trimreaper clean --high-watermark 75 --low-watermark 60
+trimreaper clean --no-escalate   # the routine rules only, never the ladder
+trimreaper clean --steady        # the quiet pass: long-idle repository output and old finished-job artifacts, whatever the disk level
 ```
 
 | What | How |
@@ -73,7 +78,7 @@ trimreaper clean --high-watermark 85 --low-watermark 80
 | Docker build cache | `docker builder prune -af`, only when Docker is already running on a local socket (never a remote `DOCKER_HOST` or context, never volumes) |
 | Cargo's registry, Xcode's DerivedData | Folder by folder through the same guarded removal as job folders, skipped while Cargo, rust-analyzer or Xcode runs |
 | Agent worktrees | A linked git worktree no job owns goes after `worktreeIdleDays` (7) without a change (HEAD, the last reflog entry and the working-tree files; never the index, which every `git status` rewrites), or after 6 quiet hours when every job its own name gives (`-jNNNN`, `-J-NNNN`) finished `cloneExpiryDays` ago and nothing still depends on it, when it is unlocked and clean (edits hidden by `--skip-worktree` or `--assume-unchanged` count as changes), git ignores nothing in it but build output, it holds no `.env*` or other protected name, no unfinished job declares it, no process uses it, and every commit its HEAD ever pointed at is on a branch, tag or remote. Its branch stays. A worktree whose folder is already gone is forgotten by its repository after 30 days, under the same commit check |
-| Project dependencies and output | `node_modules`, `.next`, `.astro`, `.turbo`, `.svelte-kit`, `.nuxt`, `.parcel-cache`, `.vite`, `.venv` and Python tool caches inside any repository in the code homes, when git ignores the folder, its manifest (`package.json`, `pyproject.toml`, `requirements.txt` ...) sits beside it so one install brings it back, the project has gone `projectIdleHours` (48) without a change (6 hours for a copy named after a finished job), no running job works in it and no process uses anything in it. `dist` and `build` are never touched: some projects commit them |
+| Project dependencies and output | `node_modules`, `.next`, `.astro`, `.turbo`, `.svelte-kit`, `.nuxt`, `.parcel-cache`, `.vite`, `.venv` and Python tool caches inside any repository in the code homes, when git ignores the folder, its manifest (`package.json`, `pyproject.toml`, `requirements.txt` ...) sits beside it so one install brings it back, the project has gone `projectIdleHours` (48) without a change (6 hours for a copy named after a finished job), no running job works in it and no process uses anything in it. The routine rules also want the repository clean, stash-free and pushed. `dist` and `build` are touched only on the ladder (below) |
 | Rust build output | `debug` and `incremental` folders of every `target` in a repository (release artifacts stay), skipped while Cargo or rust-analyzer runs. Discovery is breadth-first and never enters tool caches, virtual environments or dependency stores |
 | Repository-output safeguards | Dependency and Rust output stays when Git cannot prove the repository clean and pushed, the folder ignored and untracked, a running job owns the project, or an enclosing folder up to the reap home carries a retention marker other than `disposable`. Removal holds the build queue's project lock and rechecks every proof |
 | Temp folders | A folder of yours in the shared temp folder after a day without a change, and in your per-user temp folder after three days, when nothing in it changed in that time and no process uses it. Folders the system or running apps manage there (`com.apple.*`, sockets, locks) are never candidates |
@@ -90,8 +95,39 @@ keep their own: `~/.codex/worktrees` (or `$CODEX_HOME/worktrees`), `~/.cursor/wo
 Cleanup sizes candidates, tries the largest first and stops when measured occupancy reaches the low watermark.
 `goalMet` and `remainingBytes` report the actual result; unknown disk measurements produce `null`, not success.
 Protected or active data may prevent reaching the goal. Missing or unreadable candidates are skipped with a named reason;
-independent candidates continue. What was freed is the volume's free space after the pass minus before it, not a sum of folder sizes. A tool's cleaner
+independent candidates continue. A folder the filesystem refuses to release (an ACL that denies delete, immutable flags, another
+owner) is kept with that cause and is not tried again for a day unless it changes. A tool's cleaner
 that fails is listed with its exit status and last line of output, and the command exits 3.
+
+The result reports what happened honestly. `summary.freedBytes` is the volume's free space after the pass minus before it (it can be
+zero or negative while other programs write); `summary.removedBytes` is the size of what the pass actually removed; when the two
+disagree `summary.freedNote` says so. `rungs` lists what each step of the ladder found and freed, and `topBlockers` names the ten
+reasons that keep the most bytes (`recent`, `dirty`, `protected-leaf`, `job:input-pinned-by` ...), so a pass that frees nothing says why.
+
+### When the routine rules are not enough: the escalation ladder
+
+The routine rules wait for time (seven days for a worktree, 48 hours for a project). If they cannot reach the low watermark, the pass
+climbs these rungs one at a time, re-plans with each rung's wider windows and stops at the first rung that reaches the goal. A dry run
+plans every rung. Nothing is escalated when the disk cannot be measured.
+
+| Rung | What it widens |
+|---|---|
+| 0 `routine` | Everything above, with its own windows. |
+| 1 `idle-repositories` | Regenerable output (`node_modules`, `.next`, `.venv`, Rust `debug`/`incremental`, `dist` and `build` that git ignores and tracks nothing of, with a manifest beside and no release artifact inside) of repositories idle for `cleanEscalateRepoHours` (2), whatever their age, even when the repository is dirty or has a stash: output git ignores is not unsaved work. Temp debris after 6 hours. |
+| 2 `worktrees-and-finished-jobs` | Linked worktrees idle for `cleanEscalateWorktreeHours` (24), clean and pushed. Fixtures, candidates, deploy and similar folders of jobs finished `cleanEscalateJobHours` (24) ago, and the clones of those jobs that hold nothing a remote lacks (`cloneExpiryDays` shortened to the same window), through the job reaper's own guarded removal (without a tick's two-jobs limit). |
+| 3 `pinned-folders` | Folders another job lists as an input or waits on, once that job finished, failed, was cancelled or was interrupted `cleanEscalatePinnedHours` (24) ago (a verified interruption clock; a parked, blocked, queued or running job keeps its pin). |
+| 4 `unmarked-retention` | Every unmarked folder of a job finished 24 hours ago, not only the regenerable names. A retention marker, a secret or a key name still keeps the folder. |
+| 5 `archive-then-remove` | Worktrees and job clones with uncommitted files, commits no remote holds, ignored data of unknown kind or a git directory with no `.git` entry: archived first (a git bundle verified in an empty repository, a tar read back against its SHA-256 manifest, stamped as the only copy), compared with the archive again, then removed. The branch stays. A failed or stale archive keeps the folder. |
+
+No rung touches a running or starting job's folder, a folder a process uses, `.env*`, `.dev.vars*`, `.wrangler` or `.vercel`, a release
+artifact, a retention marker, another user's files or a primary clone's own source. A window you set to `0` stays off on every rung.
+`cleanEscalate: false` (or `--no-escalate`) keeps the routine rules only.
+
+### The steady pass
+
+Below `cleanAtPercent` a quiet pass runs every `cleanSteadyHours` (6; `0` turns it off) so the disk never has to reach the watermark: it
+removes regenerable output of repositories idle for `cleanSteadyRepoDays` (3) and the artifacts of jobs finished `cleanSteadyJobHours`
+(48) ago. Nothing else: no tool cleaner, no worktree, no temp folder. `trimreaper clean --steady` runs it by hand.
 
 Every command prints one JSON document on stdout. Exit status:
 
@@ -133,7 +169,7 @@ producer's source/output identity record, shared build locks, no live claim on t
 no running builder. A source working directory alone is not an output handle. Source and retained data stay;
 legacy outputs without producer proof stay on the stricter route. See [the embedding contract](docs/EMBEDDING.md).
 
-Under disk pressure (at or above `diskWarnPercent`, 85%), the build output of parked or interrupted jobs goes too;
+Under disk pressure (at or above `diskWarnPercent`, 75%), the build output of parked or interrupted jobs goes too;
 they rebuild it when they resume. The pressure check runs during a `tick` that has at least one finished job due.
 
 ## What it never removes
@@ -201,7 +237,7 @@ error that names it:
 {
   "cloneBases": [{"path": "~/dev"}],
   "scratchRoot": "~/.cache/agent-scratch",
-  "policy": {"cloneExpiryDays": 3, "evidenceExpiryDays": 14, "cleanAtPercent": 85, "cleanToPercent": 80}
+  "policy": {"cloneExpiryDays": 3, "evidenceExpiryDays": 14, "cleanAtPercent": 75, "cleanToPercent": 60}
 }
 ```
 

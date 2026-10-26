@@ -162,7 +162,8 @@ def cmd_clean(args) -> dict:
         policy["cleanAtPercent"] = args.clean_at_percent
     if getattr(args, "clean_to_percent", None) is not None:
         policy["cleanToPercent"] = args.clean_to_percent
-    return clean.clean_pass(args.dry_run, args.deep, only, report=not args.no_report, policy=policy)
+    return clean.clean_pass(args.dry_run, args.deep, only, report=not args.no_report, policy=policy,
+                            escalate=False if getattr(args, "no_escalate", False) else None, steady=bool(getattr(args, "steady", False)))
 
 
 def write_private(path: Path, text: str, mode: int = 0o600) -> None:
@@ -184,7 +185,7 @@ def launchctl(*args: str) -> tuple[int, str]:
 
 
 def cmd_schedule(args) -> dict:
-    """A launchd agent that runs `trimreaper tick` every few minutes: due jobs, scratch, evidence, and `clean` at cleanAtPercent."""
+    """A launchd agent that runs `trimreaper tick` every few minutes: due jobs, scratch, evidence, and `clean` at cleanAtPercent (a quiet steady pass below it)."""
     plist = Path.home() / "Library" / "LaunchAgents" / f"{SCHEDULE_LABEL}.plist"  # where launchd looks at login
     domain = f"gui/{os.getuid()}"
     tick = [sys.executable, "-m", "trimreaper", "tick", "--record"]
@@ -341,17 +342,19 @@ def parser() -> argparse.ArgumentParser:
     reap.add_argument("--dry-run", action="store_true", help="run every gate, remove and write nothing")
     reap.set_defaults(func=cmd_reap)
 
-    tick = sub.add_parser("tick", help="one scheduled pass: due jobs, scratch, archives, evidence expiry, and clean at cleanAtPercent")
+    tick = sub.add_parser("tick", help="one scheduled pass: due jobs, scratch, archives, evidence expiry, clean at cleanAtPercent (and a quiet steady clean below it)")
     tick.add_argument("--record", action="store_true", help="also write the result to <stateDir>/last-tick.json")
     tick.set_defaults(func=cmd_tick)
 
-    tidy = sub.add_parser("clean", help="free space outside jobs: tool caches, idle agent worktrees; reports models and the rest")
+    tidy = sub.add_parser("clean", help="free space outside jobs: tool caches, idle agent worktrees, idle repositories' output, finished jobs' folders; reports models and the rest")
     tidy.add_argument("--dry-run", action="store_true", help="plan, size and report; remove nothing")
     tidy.add_argument("--deep", action="store_true", help="also the deep tier (Go module cache, unused Docker images)")
     tidy.add_argument("--only", action="append", metavar="NAMES", help="comma-separated targets: " + ",".join(clean.CLEAN_NAMES))
     tidy.add_argument("--no-report", action="store_true", help="skip the models/browsers/disk-image report")
-    tidy.add_argument("--clean-at-percent", "--high-watermark", type=float, help="high-water trigger percent (default 85)")
-    tidy.add_argument("--clean-to-percent", "--low-watermark", type=float, help="stop at this measured occupancy (default 80)")
+    tidy.add_argument("--clean-at-percent", "--high-watermark", type=float, help="high-water trigger percent (default 75)")
+    tidy.add_argument("--clean-to-percent", "--low-watermark", type=float, help="stop at this measured occupancy (default 60)")
+    tidy.add_argument("--no-escalate", action="store_true", help="routine rules only: do not climb the ladder when the goal is unmet")
+    tidy.add_argument("--steady", action="store_true", help="the quiet pass: only long-idle repository output and old finished-job artifacts, whatever the disk level")
     tidy.set_defaults(func=cmd_clean)
 
     schedule = sub.add_parser("schedule", help="run `tick` on a schedule with launchd (macOS)")

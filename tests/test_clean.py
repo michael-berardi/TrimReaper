@@ -657,7 +657,20 @@ class Threshold(Home):
     def cleaned(self, out):
         return [a.get("reason") for a in out["actions"] if a.get("did") == "cleaned-at-disk-pressure"]
 
+    def test_automatic_clean_starts_at_75_by_default(self):
+        repo = self.clone("app")
+        path = repo.parent / "app-old"
+        self.git(repo, "worktree", "add", "-b", "old", str(path))
+        self.age(path, 10)
+        self.age(repo / ".git" / "worktrees" / "app-old", 10)
+        t = time.time()
+        self.assertEqual(self.cleaned(self.tick(74, at=t)), [], "below the default 75%")
+        self.assertTrue(path.exists())
+        self.assertEqual(self.cleaned(self.tick(75, at=t + 1)), ["crossed"])
+        self.assertFalse(path.exists())
+
     def test_automatic_clean_retries_pressure_until_low_with_cooldown(self):
+        self.write_config({"policy": {"cleanAtPercent": 85, "cleanToPercent": 80}})
         repo = self.clone("app")
         path = repo.parent / "app-old"
         self.git(repo, "worktree", "add", "-b", "old", str(path))
