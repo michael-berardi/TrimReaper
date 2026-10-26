@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.9.0 (2026-10-26)
+
+Fixes a disk that stayed full. On one machine at 97% used the automatic clean logged `goalMet: false, freedBytes: -12460032` on every
+tick for days; its dry run found 328 MB to take from 175 worktrees (77 GB), 85 dependency folders (30 GB) and 3,200 temp folders that
+every rule kept, and 60 temp folders were attempted and logged as a bare `refused` error on every pass.
+
+Root causes, in the code:
+
+- **The clean pass could only wait.** Every rule was a time window (7 days for a worktree, 48 hours for a project, 1 and 3 days for temp),
+  checked once. When the windows kept everything, the pass freed nothing, reported `goalMet: false` and the next tick did the same
+  thing. Nothing widened a window as the disk filled.
+- **Ignored output waited on unrelated state.** `node_modules`, `.next` and Rust `target` folders were kept when their repository was
+  dirty, had a stash or had unpushed commits (57 dirty, 27 with a stash: 30 GB), although git ignoring a folder and tracking nothing in it
+  already proves it is not unsaved work, and the job reaper has long said so for a job's clone.
+- **Job folders were out of the clean pass's reach and slow in the job reaper's.** A name that carries a job number is "reaped with its
+  job" and skipped; the job reaper takes two jobs per tick, keeps an unmarked job folder until `evidenceExpiryDays`, and (in a host that
+  pins a producer's folders for a consumer) keeps a finished job's folders for as long as a later job that lists them as an input has not
+  finished, even if it failed or was interrupted days ago. Disk pressure changed none of it.
+- **A deny-delete ACL made `rmdir` fail on every pass.** The removal error was reported as `refused` with its cause dropped, retried and
+  receipted on every tick, and a removal that had started could stop the whole sweep.
+- **The retry cadence ignored yield.** A pass that removed nothing was retried after ten minutes, and again, filling the log.
+- **The defaults (clean at 85%, to 80%) started late and stopped early.**
+
+What changed:
+
+- **Escalation ladder.** If the routine rules cannot reach `cleanToPercent`, `clean` climbs six rungs, re-planning with each rung's wider
+  windows and stopping at the first that reaches the goal (README, "the escalation ladder"): regenerable output of repositories idle for
+  2 hours (`cleanEscalateRepoHours`), whatever their age and even when dirty or stashed, with `dist` and `build` added when git ignores
+  and tracks none of them and no release artifact is inside; linked worktrees idle for 24 hours and fixtures, candidates, deploy folders
+  of jobs finished 24 hours ago; folders pinned only by a finished, failed, cancelled or long-interrupted job; unmarked retention of jobs
+  finished 24 hours ago; last, archive-then-remove for worktrees and job clones holding unsaved work (a verified git bundle and a
+  hashed tar, stamped as the only copy, compared again before removal; a failed archive keeps the folder). No rung touches a running or
+  starting job's folder, a folder a process uses, `.env*`, `.dev.vars*`, `.wrangler`, `.vercel`, a retention marker, a release artifact
+  or a primary clone's source. A window set to `0` stays off. Nothing escalates when the disk cannot be measured.
+- **Defaults.** `cleanAtPercent` 75, `cleanToPercent` 60, `diskWarnPercent` 75.
+- **Steady pass.** Below the high watermark a quiet pass runs every `cleanSteadyHours` (6): regenerable output of repositories idle for
+  3 days (`cleanSteadyRepoDays`) and the artifacts of jobs finished 48 hours ago (`cleanSteadyJobHours`); nothing else. `trimreaper clean --steady` runs it by hand; `clean_steady_due` lets a host that runs the pass in a child start it.
+- **Honest report.** `summary.removedBytes` is what the pass removed, `summary.freedBytes` the net change of free space (with a note when
+  they disagree), `rungs` what each rung found and freed, `topBlockers` the ten reasons keeping the most bytes. The automatic action
+  carries the same, instead of `freedBytes` alone.
+- **Refusals.** A folder holding an entry whose ACL denies delete is kept as `filesystem-protected-acl:<entry>` before anything is tried
+  (the ACL is never cleared); any other removal the filesystem refuses is kept with its cause, remembered for a day, and is not an error.
+  Failed items in `errors` now carry their `reason`.
+- **Retry cadence.** After a pass that removed nothing the next waits an hour; a finished job ends the wait.
+- **Engine.** `reap_escalated`, `reap_policy` and `reap_pin_released` (the one place a pin ends: a done, failed or cancelled job never pins;
+  an interrupted one stops pinning only inside a rung, after 24 hours on a verified clock); `reap_acl_denies`; a removal that meets an ACL
+  names it. Embedding hosts: see docs/EMBEDDING.md ("the clean pass").
+
 ## 0.8.0 (2026-10-24)
 
 Fixes the causes of a 60 GB pileup of abandoned agent worktrees: on one machine the clean pass kept 184 abandoned

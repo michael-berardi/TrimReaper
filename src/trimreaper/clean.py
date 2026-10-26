@@ -39,7 +39,10 @@ CLEAN_HOST_NAMES = ("reap_worktree_homes",)
 CLEAN_TOOL_SECONDS = 900       # one native cleaner; longer is a named timeout
 CLEAN_SIZE_SECONDS = 20        # one size walk; longer is reported as incomplete
 CLEAN_AUTO_SECONDS = 600       # stampede guard: retry sustained pressure at most once per ten minutes
+CLEAN_AUTO_QUIET_SECONDS = 3600  # ... and after a pass that removed nothing, once per hour: the windows it waits for are hours long
+CLEAN_AUTO_RUNNING_SECONDS = 1800  # a climbing pass can take minutes: no second pass starts while one stamped itself running this recently
 CLEAN_AUTO_KEY = "clean:auto"
+CLEAN_STEADY_KEY = "clean:steady"
 CLEAN_TOOL_ENV = {"HOMEBREW_NO_AUTO_UPDATE": "1", "HOMEBREW_NO_ENV_HINTS": "1", "HOMEBREW_NO_AUTOREMOVE": "1"}  # cleanup never uninstalls a formula
 # Tools run from the home folder, so a project's own config (.npmrc, a pinned yarn) never changes which cache they clean.
 
@@ -162,9 +165,72 @@ CLEAN_FOLDERS = (
      "roots": lambda: [clean_home("Library", "Developer", "Xcode", "DerivedData")]},
 )
 CLEAN_WORKTREES = "worktrees"
-CLEAN_EXTRA_NAMES = ("rust-build-output", "project-dependencies", "agent-leftovers", "browser-clones", "playwright")
+CLEAN_EXTRA_NAMES = ("rust-build-output", "project-dependencies", "agent-leftovers", "browser-clones", "playwright", "finished-jobs")
 CLEAN_RUST_BUSY = ("cargo", "rustc", "rust-analyzer", "clippy", "clippy-driver", "cargo-clippy")
 CLEAN_NAMES = tuple(t["name"] for t in CLEAN_TOOLS) + tuple(f["name"] for f in CLEAN_FOLDERS) + (CLEAN_WORKTREES,) + CLEAN_EXTRA_NAMES
+
+# ---- the ladder -----------------------------------------------------------------------------------------------------------------
+# When the routine rules cannot reach the goal, the pass climbs these rungs one at a time and stops at the first that does. A rung
+# widens one kind of window and never relaxes a proof that protects work or secrets: a starting or running job's folder, a folder a
+# process uses, a protected name (.env*, .dev.vars*, .wrangler, .vercel), a release artifact, a primary clone's own source and
+# a folder holding git state nobody proved saved all stay, whatever the rung. Only the last rung touches unsaved work, and only
+# after a verified archive of it (bundles for commits, a hashed tar for files).
+CLEAN_RUNGS = ("routine", "idle-repositories", "worktrees-and-finished-jobs", "pinned-folders", "unmarked-retention", "archive-then-remove")
+CLEAN_STEADY = "steady"
+CLEAN_STEADY_NAMES = ("rust-build-output", "project-dependencies", "finished-jobs")   # the quiet pass takes nothing else
+CLEAN_POLICY = {"cleanEscalate": True, "cleanEscalateRepoHours": 2, "cleanEscalateWorktreeHours": 24, "cleanEscalateJobHours": 24,
+                "cleanEscalatePinnedHours": 24, "cleanSteadyHours": 6, "cleanSteadyRepoDays": 3, "cleanSteadyJobHours": 48,
+                "worktreeIdleDays": 7, "projectIdleHours": 48}   # the fallbacks of a host whose policy predates a key
+CLEAN_OUTPUT_PROOF = ("clean", "pushed", "ignored", "untracked")
+CLEAN_IGNORED_PROOF = ("ignored", "untracked")      # regenerable output needs git to ignore it and track none of it, not a clean tree
+CLEAN_REFUSED_SECONDS = 86400    # a removal the filesystem refused is not retried for this long, unless the folder changed
+CLEAN_REFUSED_PREFIX = "clean:refused:"
+CLEAN_REFUSED_CAUSES = ("removal-error:", "removal-stopped:filesystem", "removal-stopped:foreign", "removal-stopped:mountpoint",
+                        "filesystem-protected", "foreign-owner", "not-owned-by-user", "mountpoint", "protected-leaf-appeared", "nested-git-appeared")
+CLEAN_JOB_REGENERABLE = re.compile(r"(?i)^(?:fixtures?|candidates?|deploy.*|release-?candidates?|.*-candidates?|candidate-.*|.*-fixtures?|fixtures?-.*|"
+                                   r"checkouts?|wt|worktrees?|.*-wt|builds?|dist|out|outputs?|native-runs|runs|tmp|temp)$")
+CLEAN_JOB_SECONDS = 120          # wall clock one rung's job sweep may spend, dry run or not
+CLEAN_RELEASE_SUFFIXES = (".dmg", ".pkg", ".app", ".zip", ".tgz", ".tar.gz", ".tar.xz", ".xz", ".deb", ".rpm", ".msi", ".exe", ".appimage",
+                          ".ipa", ".apk", ".whl", ".crate", ".vsix", ".nupkg")
+CLEAN_WIDE_OUTPUTS = {"dist": ("package.json",), "build": ("package.json",)}   # from the first rung up: ignored, untracked, never a release
+
+
+def clean_setting(policy: dict, key: str):
+    value = policy.get(key, CLEAN_POLICY[key])
+    return CLEAN_POLICY[key] if value is None else value
+
+
+def clean_profile(policy: dict, rung: int | str) -> dict:
+    """What one rung of the ladder (or the steady pass) lets the gates accept. Windows an operator turned off (0) stay off."""
+    days, hours = clean_setting(policy, "worktreeIdleDays"), clean_setting(policy, "projectIdleHours")
+    profile = {"rung": rung, "name": rung if isinstance(rung, str) else CLEAN_RUNGS[rung], "worktreeHours": days * 24, "projectHours": hours,
+               "temp": dict(CLEAN_TEMP_IDLE_HOURS), "outputProof": CLEAN_OUTPUT_PROOF, "wide": False, "archive": False, "job": None, "tools": True}
+    if rung == CLEAN_STEADY:
+        steady = clean_setting(policy, "cleanSteadyRepoDays") * 24
+        profile.update(projectHours=max(hours, steady) if hours else 0, tools=False,
+                       job={"hours": clean_setting(policy, "cleanSteadyJobHours"), "filter": "all", "pinned": False, "clones": True, "keepUnsaved": False})
+        return profile
+    if rung >= 1:
+        profile.update(projectHours=min(hours, clean_setting(policy, "cleanEscalateRepoHours")) if hours else 0,
+                       temp={"shared": CLEAN_TEMP_ESCALATED_HOURS, "user": CLEAN_TEMP_ESCALATED_HOURS}, outputProof=CLEAN_IGNORED_PROOF,
+                       wide=True, tools=False)
+    if rung >= 2:
+        profile["worktreeHours"] = min(profile["worktreeHours"], clean_setting(policy, "cleanEscalateWorktreeHours")) if days else 0
+        profile["job"] = {"hours": clean_setting(policy, "cleanEscalateJobHours"), "filter": "regenerable", "pinned": False, "clones": True,
+                          "keepUnsaved": True}
+    if rung >= 3:
+        profile["job"]["pinned"] = clean_setting(policy, "cleanEscalatePinnedHours")
+    if rung >= 4:
+        profile["job"]["filter"] = "all"
+    if rung >= 5:
+        profile["job"]["keepUnsaved"] = False
+        profile["archive"] = True
+    return profile
+
+
+def clean_ladder(policy: dict, escalate: bool | None) -> list:
+    on = clean_setting(policy, "cleanEscalate") if escalate is None else escalate
+    return list(range(len(CLEAN_RUNGS))) if on else [0]
 
 
 def clean_tilde(path: str) -> str:
@@ -202,7 +268,7 @@ def clean_directory(entry, label: str, errors: list) -> bool:
 
 
 def clean_goals(policy: dict) -> tuple[float, float]:
-    high, low = policy.get("cleanAtPercent", 85), policy.get("cleanToPercent", 80)
+    high, low = policy.get("cleanAtPercent", 85), policy.get("cleanToPercent", 80)  # a host's missing keys read as the engine's historical goals
     if high == 0 and not isinstance(high, bool):
         high = 85  # automatic off is not a refusal of an explicitly requested manual clean
     if any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in (high, low)) or not 0 < low < high <= 100:
@@ -534,10 +600,13 @@ def clean_job_claims(path: str) -> None:
                     raise ReapRefused(f"declared-by-unfinished-job:{job['id']}")
 
 
-def clean_worktree_gates(entry: dict, idle_days: int, table: dict | None) -> None:
+def clean_worktree_gates(entry: dict, idle_days: float, table: dict | None, archive: bool = False) -> None:
     """Every reason to keep a worktree, cheapest first, the process probe last; raises ReapRefused naming the first.
-    `table` None probes fresh."""
+    `table` None probes fresh. With `archive` (the ladder's last rung) work no remote holds (uncommitted files, commits only this
+    worktree has, ignored data of unknown kind) does not keep the worktree: it is listed in `entry["unsaved"]` for a verified
+    archive to save before anything is removed. Every other gate holds."""
     path = entry["path"]
+    entry.pop("unsaved", None)
     if "locked" in entry["git"]:
         raise ReapRefused("worktree-locked")
     job_ids = reap_job_ids(*Path(path).parts)
@@ -561,20 +630,35 @@ def clean_worktree_gates(entry: dict, idle_days: int, table: dict | None) -> Non
     if idle < limit:
         raise ReapRefused(f"recent:{idle:.1f}d-of-{limit:g}d")
     clean_job_claims(path)
-    repos = []
-    reap_protected_scan(path, allow_git=True, markers=True, repos=repos, nested_disposable=True)
+    unsaved = []
+    def unsaved_work(refusal: ReapRefused, kinds: tuple) -> None:
+        if not archive or not str(refusal).startswith(kinds):
+            raise refusal
+        unsaved.append(str(refusal))
+    repos, git_dirs = [], [] if archive else None  # archive mode: a git directory with no `.git` entry is saved whole, not a reason to keep
+    reap_protected_scan(path, allow_git=True, markers=True, repos=repos, git_dirs=git_dirs, nested_disposable=True)
     if {reap_canon(r) for r in repos} != {path}:
         raise ReapRefused("nested-repository")
+    if git_dirs:
+        unsaved_work(ReapRefused("unproved-git-dir:" + sorted(set(git_dirs))[0]), ("unproved-git-dir:",))
     with reap_git_session(path):
         clean_linked_identity(entry)
         code, out = reap_git_clean_closed(path)  # index flags that hide edits (skip-worktree, assume-unchanged) refuse
         if code != 0:
             raise ReapRefused(f"git-error:status:{code}")
         if out.strip():
-            raise ReapRefused("dirty")
-        reap_git_ignored_known(path)
-        clean_commits_saved(path, "HEAD")
+            unsaved_work(ReapRefused("dirty"), ("dirty",))
+        try:
+            reap_git_ignored_known(path)
+        except ReapRefused as refusal:
+            unsaved_work(refusal, ("ignored-unknown:",))
+        try:
+            clean_commits_saved(path, "HEAD")
+        except ReapRefused as refusal:
+            unsaved_work(refusal, ("unsaved-commits",))
     reap_holders(path, path, table)
+    if unsaved:
+        entry["unsaved"] = unsaved
 
 
 def clean_commits_saved(repo: str, head: str) -> None:
@@ -675,17 +759,19 @@ def clean_leftover_roots() -> list[tuple[str, bool]]:
 # Temp folders any tool may leave behind: a user's own folder in the shared temp folder after a day without a change, one in the per-user
 # temp folder after three days. Names the system or a running app manages there are never candidates.
 CLEAN_TEMP_IDLE_HOURS = {"shared": 24, "user": 72}
+CLEAN_TEMP_ESCALATED_HOURS = 6   # from the first rung up
 CLEAN_TEMP_SYSTEM = re.compile(r"(?i)^(?:\.|com\.apple\.|TemporaryItems$|.*\.(?:sock|socket|pid|lock)$|launchd|tmux-|ssh-|powerlog|"
                                r"CoreSimulator|xcrun_db|KSOutOfProcessFetcher)")
 
 
-def clean_temp_roots() -> list[tuple[str, int]]:
+def clean_temp_roots(hours: dict | None = None) -> list[tuple[str, int]]:
+    hours = hours or CLEAN_TEMP_IDLE_HOURS
     roots = []
     shared = os.path.realpath("/tmp")
     if os.path.isdir(shared):
-        roots.append((shared, CLEAN_TEMP_IDLE_HOURS["shared"]))
+        roots.append((shared, hours["shared"]))
     if os.environ.get("TMPDIR") and os.path.realpath(os.environ["TMPDIR"]) != shared:
-        roots.append((os.path.realpath(os.environ["TMPDIR"]), CLEAN_TEMP_IDLE_HOURS["user"]))
+        roots.append((os.path.realpath(os.environ["TMPDIR"]), hours["user"]))
     return roots
 
 
@@ -703,31 +789,86 @@ def clean_clone_roots() -> list[str]:
         return []
 
 
-def clean_stale_tree(path: str, hours: int = 6) -> None:
-    """Every entry must be `hours` idle; bounded metadata-only walk, never follow links."""
-    cutoff, count = now() - hours * 3600, 0
+CLEAN_MEMO = threading.local()   # what one pass learned about folders that its next rung would learn again (data: None outside a pass)
+
+
+def clean_memo_get(key):
+    data = getattr(CLEAN_MEMO, "data", None)
+    return data.get(key) if data is not None else None
+
+
+def clean_memo_put(key, value) -> None:
+    data = getattr(CLEAN_MEMO, "data", None)
+    if data is not None:
+        data[key] = value
+
+
+def clean_once(key, check, fresh: bool) -> None:
+    """Run `check()` (which raises ReapRefused to keep a folder) once per pass for a rung-independent proof, and replay its verdict on the
+    next rung. The removal's own last look (`fresh`) always runs it again."""
+    verdict = None if fresh else clean_memo_get(key)
+    if verdict is None:
+        try:
+            check()
+            verdict = ""
+        except ReapRefused as refusal:
+            verdict = str(refusal)
+        if not fresh:
+            clean_memo_put(key, verdict)
+    if verdict:
+        raise ReapRefused(verdict)
+
+
+def clean_tree_walk(path: str, floor: float) -> tuple:
+    """Walk a tree once, metadata only, never following a link: ("refused", reason) for what no window changes (another owner, too many
+    entries or levels), ("recent", newest) at the first entry changed within `floor` hours, else ("idle", newest, acl) with the newest change
+    of the whole tree and the first entry whose ACL denies delete (None when no entry does)."""
+    cutoff, count, newest = now() - floor * 3600, 0, 0.0
     stack = [(path, 0)]
     while stack:
         folder, depth = stack.pop()
         if depth > REAP_MAX_DEPTH:
-            raise ReapRefused("idle-scan-incomplete")
+            return ("refused", "idle-scan-incomplete")
         info = os.lstat(folder)
         if info.st_uid != os.getuid():
-            raise ReapRefused("not-owned-by-user")
+            return ("refused", "not-owned-by-user")
         if info.st_mtime > cutoff:
-            raise ReapRefused(f"recent:less-than-{hours}h")
+            return ("recent", info.st_mtime)
+        newest = max(newest, info.st_mtime)
         with os.scandir(folder) as entries:
             for entry in entries:
                 count += 1
                 if count > REAP_WALK_ENTRIES:
-                    raise ReapRefused("idle-scan-incomplete")
+                    return ("refused", "idle-scan-incomplete")
                 info = entry.stat(follow_symlinks=False)
                 if info.st_uid != os.getuid():
-                    raise ReapRefused("not-owned-by-user")
+                    return ("refused", "not-owned-by-user")
                 if info.st_mtime > cutoff:
-                    raise ReapRefused(f"recent:less-than-{hours}h")
+                    return ("recent", info.st_mtime)
+                newest = max(newest, info.st_mtime)
                 if entry.is_dir(follow_symlinks=False):
                     stack.append((entry.path, depth + 1))
+    return ("idle", newest, reap_acl_denies(path))
+
+
+def clean_stale_tree(path: str, hours: int = 6, fresh: bool = True) -> None:
+    """Every entry must be `hours` idle; bounded metadata-only walk, never follow links. A tree holding an entry whose ACL denies
+    delete is kept and named (`filesystem-protected-acl:<entry>`): it cannot be removed, and trying every pass only fills the receipts.
+    A planning pass walks each tree once however many rungs it climbs (`fresh`, the removal's own last look, always walks again)."""
+    key = ("tree", path)
+    known = None if fresh else clean_memo_get(key)
+    if known is not None and (known[1][0] != "recent" or hours >= known[0]):
+        found = known[1]  # a walk that stopped at a change newer than `known[0]` hours answers every window at least that long
+    else:
+        found = clean_tree_walk(path, hours)
+        if not fresh:
+            clean_memo_put(key, [hours, found])
+    if found[0] == "refused":
+        raise ReapRefused(found[1])
+    if found[0] == "recent" or found[1] > now() - hours * 3600:
+        raise ReapRefused(f"recent:less-than-{hours}h")
+    if found[2]:
+        raise ReapRefused("filesystem-protected-acl:" + found[2][:80])
 
 
 def clean_browser_builds(root: str, errors: list | None = None) -> list[tuple[str, str, int]]:
@@ -772,18 +913,54 @@ CLEAN_PROJECT_JOB_IDLE_HOURS = 6
 CLEAN_CODE_HOMES = ("dev", "Developer", "src", "code", "projects", "repos", "work", ".cache")
 
 
-def clean_project_outputs(errors: list) -> list[tuple[str, str]]:
-    """Every regenerable dependency or output folder inside a repository in the code homes, with the repository it belongs to."""
+def clean_project_outputs(errors: list, wide: bool = False) -> list[tuple[str, str]]:
+    """Every regenerable dependency or output folder inside a repository in the code homes, with the repository it belongs to.
+    `wide` (the ladder's rungs) adds `dist` and `build`, which a project may commit: they go only when git ignores and tracks none
+    of them, a manifest sits beside them and they hold no release artifact."""
+    outputs = {**CLEAN_PROJECT_OUTPUTS, **(CLEAN_WIDE_OUTPUTS if wide else {})}
     found = []
-    for path, repo in clean_repo_walk(errors, frozenset(CLEAN_PROJECT_OUTPUTS), "project-dependencies"):
-        manifests = CLEAN_PROJECT_OUTPUTS[os.path.basename(path)]
+    for path, repo in clean_repo_walk(errors, frozenset(outputs), "project-dependencies"):
+        manifests = outputs[os.path.basename(path)]
         if not manifests or any(os.path.isfile(os.path.join(os.path.dirname(path), m)) for m in manifests):
             found.append((path, repo))
     return found
 
 
+def clean_release_like(path: str) -> str | None:
+    """The first release artifact (an installer, a disk image, a package, an archive) a folder holds within three levels, else None.
+    A scan that cannot finish names itself: `dist` and `build` hold releases for some projects, so they stay unless it is shown
+    they do not."""
+    count, stack = 0, [(path, 0)]
+    while stack:
+        folder, depth = stack.pop()
+        try:
+            with os.scandir(folder) as scan:
+                for entry in scan:
+                    count += 1
+                    if count > 20000:
+                        return "scan-incomplete"
+                    if entry.name.lower().endswith(CLEAN_RELEASE_SUFFIXES):
+                        return entry.name[:80]
+                    if depth < 3 and entry.is_dir(follow_symlinks=False):
+                        stack.append((entry.path, depth + 1))
+        except OSError:
+            return "unreadable"
+    return None
+
+
 def clean_repo_walk(errors: list, wanted: frozenset, label: str) -> list[tuple[str, str]]:
-    """Folders named in `wanted` inside repositories, without entering them or any generated tree."""
+    """Folders named in `wanted` inside repositories, without entering them or any generated tree. One pass discovers them once,
+    however many rungs it climbs; a folder that is gone by the next rung drops out."""
+    key = ("walk", tuple(sorted(wanted)))
+    known = clean_memo_get(key)
+    if known is not None:
+        return [(path, repo) for path, repo in known if os.path.lexists(path)]
+    found = clean_repo_walk_scan(errors, wanted, label)
+    clean_memo_put(key, found)
+    return found
+
+
+def clean_repo_walk_scan(errors: list, wanted: frozenset, label: str) -> list[tuple[str, str]]:
     # The usual code and build homes, never the whole home: a home-wide walk ran out of its entry budget on a real machine
     # (discovery-incomplete) and found nothing. Clone bases and worktree homes add the host's own layout.
     # (Temp-folder build roots are the agent-leftovers target's job: the temp folder holds unreadable system folders.)
@@ -840,8 +1017,15 @@ def clean_repository_output_gates(entry: dict, table: dict | None) -> float:
     path, repo = entry["path"], entry["repo"]
     if path == repo or not reap_inside(path, repo):
         raise ReapRefused("outside-repository")
-    clean_folder_gates(path)
-    reap_git_proof(repo, path, ("clean", "pushed", "ignored", "untracked"))
+    proof = tuple(entry.get("proof") or CLEAN_OUTPUT_PROOF)
+    def static():  # nothing here depends on how long the project has been quiet, so one pass proves it once
+        clean_folder_gates(path)
+        if os.path.basename(path) in CLEAN_WIDE_OUTPUTS:
+            found = clean_release_like(path)
+            if found:
+                raise ReapRefused("release-artifact:" + found)
+        reap_git_proof(repo, path, proof)
+    clean_once(("output", path, proof), static, table is None)
     # A copy made for a job (site-j0042, .worktrees/J-0042): kept while that job is unfinished, and once it is finished its output
     # needs only CLEAN_PROJECT_JOB_IDLE_HOURS of quiet. Every other project needs the operator's idleHours.
     # Only a job with a live worker (starting or running) protects regenerable output; a parked, blocked or queued job's project still
@@ -875,15 +1059,18 @@ def clean_repository_output_gates(entry: dict, table: dict | None) -> float:
     return limit
 
 
+def clean_repo_idle_hours(repo: str, fresh: bool) -> float:
+    dot_git = os.path.join(repo, ".git")
+    gitdir = clean_pointer_target(dot_git) if os.path.isfile(dot_git) else dot_git
+    return clean_idle_days(repo, gitdir, fresh=fresh) * 24
+
+
 def clean_project_gates(entry: dict, table: dict | None) -> None:
     """Dependency output additionally waits for the existing project idle policy."""
     if "idleHours" not in entry:
         raise ReapRefused("project-idle-policy-unproved")
     limit = clean_repository_output_gates(entry, table)
-    repo = entry["repo"]
-    dot_git = os.path.join(repo, ".git")
-    gitdir = clean_pointer_target(dot_git) if os.path.isfile(dot_git) else dot_git
-    idle = clean_idle_days(repo, gitdir, fresh=table is None) * 24
+    idle = clean_repo_idle_hours(entry["repo"], table is None)
     if idle < limit:
         raise ReapRefused(f"recent:{idle:.0f}h-of-{limit}h")
 
@@ -893,17 +1080,21 @@ def clean_extra_gates(entry: dict, table: dict | None = None) -> None:
     if kind == "project-dependencies":
         clean_project_gates(entry, table)
     elif kind != "rust-build-output":
-        clean_folder_gates(path)
+        clean_once(("folder", path), lambda: clean_folder_gates(path), table is None)
     if kind == "project-dependencies":
         pass
     elif kind == "rust-build-output":
         clean_repository_output_gates(entry, table)
+        if "clean" not in (entry.get("proof") or CLEAN_OUTPUT_PROOF) and entry.get("idleHours"):  # a dirty or stashed repo: only an idle one
+            idle = clean_repo_idle_hours(entry["repo"], table is None)
+            if idle < entry["idleHours"]:
+                raise ReapRefused(f"recent:{idle:.0f}h-of-{entry['idleHours']}h")
         busy = sorted(set(CLEAN_RUST_BUSY) & clean_running())
         if busy:
             raise ReapRefused("in-use:" + ",".join(busy))
-        clean_folder_gates(entry["target"])
+        clean_once(("folder", entry["target"]), lambda: clean_folder_gates(entry["target"]), table is None)
     elif kind == "agent-leftovers":
-        clean_stale_tree(path, entry.get("idleHours", 6))
+        clean_stale_tree(path, entry.get("idleHours", 6), fresh=table is None)
     elif kind == "browser-clones":
         info = os.lstat(path)
         if info.st_uid != os.getuid():
@@ -917,23 +1108,28 @@ def clean_extra_gates(entry: dict, table: dict | None = None) -> None:
     reap_holders(entry.get("target", path), entry.get("target", path), table)
 
 
-def clean_extra_entries(only: set, errors: list, idle_hours: int = 48) -> list[dict]:
+def clean_extra_entries(only: set, errors: list, idle_hours: int = 48, rung: dict | None = None) -> list[dict]:
+    """`rung` is a ladder profile (clean_profile); without one the routine rules apply."""
     entries = []
+    proof = tuple(rung["outputProof"]) if rung else CLEAN_OUTPUT_PROOF
+    wide = bool(rung and rung["wide"])
+    temp_hours = rung["temp"]["user"] if rung and rung["rung"] != 0 and rung["name"] != CLEAN_STEADY else None
     def add(name, path, root, **extra):
         entries.append({"name": name, "kind": "debris", "path": path, "root": root, "paths": [path], "tier": "safe", **extra})
     if "rust-build-output" in only:
+        relaxed = {"proof": proof, "idleHours": idle_hours} if proof != CLEAN_OUTPUT_PROOF else {}
         for target, repo in clean_rust_targets(errors):
             debug = os.path.join(target, "debug")
             if os.path.isdir(debug) and not os.path.islink(debug):
-                add("rust-build-output", debug, target, target=target, repo=repo)
+                add("rust-build-output", debug, target, target=target, repo=repo, **relaxed)
             for profile in clean_scan(target, "rust-build-output", errors):
                 path = os.path.join(profile.path, "incremental")
                 if profile.name != "debug" and clean_directory(profile, "rust-build-output", errors) and not reap_protected(profile.name) \
                         and os.path.isdir(path) and not os.path.islink(path):
-                    add("rust-build-output", path, target, target=target, repo=repo)
+                    add("rust-build-output", path, target, target=target, repo=repo, **relaxed)
     if "project-dependencies" in only and idle_hours:
-        for path, repo in clean_project_outputs(errors):
-            add("project-dependencies", path, os.path.dirname(path), repo=repo, idleHours=idle_hours)
+        for path, repo in clean_project_outputs(errors, wide):
+            add("project-dependencies", path, os.path.dirname(path), repo=repo, idleHours=idle_hours, proof=proof)
     if "agent-leftovers" in only:
         for root, sessions in clean_leftover_roots():
             try:
@@ -949,6 +1145,7 @@ def clean_extra_entries(only: set, errors: list, idle_hours: int = 48) -> list[d
         seen = {e["path"] for e in entries}
         sessions_root = os.path.realpath(f"/private/tmp/claude-{os.getuid()}")
         for root, hours in clean_temp_roots():
+            hours = min(hours, temp_hours) if temp_hours else hours
             for child in clean_scan(root, "agent-leftovers", errors):
                 if child.path in seen or os.path.realpath(child.path) == sessions_root or CLEAN_TEMP_SYSTEM.match(child.name) \
                         or reap_protected(child.name) or not clean_directory(child, "agent-leftovers", errors):
@@ -982,9 +1179,72 @@ def clean_extra_entries(only: set, errors: list, idle_hours: int = 48) -> list[d
     return entries
 
 
+# ---- refusals the filesystem makes -------------------------------------------------------------------------------------------------
+# A folder whose removal the filesystem refuses (an ACL that denies delete, immutable flags, another owner) is not retried every pass:
+# the refusal is remembered for CLEAN_REFUSED_SECONDS, or until the folder is a different object, and the folder is listed as kept with
+# the cause. Before this, 60 such temp folders were attempted, receipted and logged as a bare "refused" error on every tick.
+
+def clean_refusal_key(path: str) -> str:
+    return CLEAN_REFUSED_PREFIX + hashlib.sha256(path.encode("utf-8", "surrogateescape")).hexdigest()[:24]
+
+
+def clean_identity(path: str) -> list | None:
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return None
+    return [info.st_dev, info.st_ino, info.st_mtime_ns]
+
+
+def clean_apply_refusals(entries: list[dict]) -> None:
+    """Keep every candidate whose removal the filesystem refused recently, naming the cause. Memory that cannot be read changes nothing."""
+    try:
+        with db() as conn:
+            stored = conn.execute("SELECT key, value FROM meta WHERE key LIKE ?", (CLEAN_REFUSED_PREFIX + "%",)).fetchall()
+    except (sqlite3.Error, OSError, HostError):
+        return
+    known = {}
+    for key, value in stored:
+        try:
+            known[key] = json.loads(value)
+        except ValueError:
+            continue
+    for entry in entries:
+        value = known.get(clean_refusal_key(entry["path"])) if entry.get("path") and "keep" not in entry else None
+        if isinstance(value, dict) and now() - float(value.get("at") or 0) < CLEAN_REFUSED_SECONDS and value.get("identity") == clean_identity(entry["path"]):
+            entry["keep"] = "refused-before:" + str(value.get("reason"))[:160]
+
+
+def clean_remember_refusal(entry: dict, reason: str) -> None:
+    if not entry.get("path") or not reason.startswith(CLEAN_REFUSED_CAUSES):
+        return
+    try:
+        with db() as conn:
+            conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (clean_refusal_key(entry["path"]), json.dumps(
+                {"at": now(), "reason": reason[:200], "identity": clean_identity(entry["path"]), "path": entry["path"]})))
+    except (sqlite3.Error, OSError, HostError):
+        pass
+
+
+def clean_forget_refusals() -> None:
+    """Drop memory older than CLEAN_REFUSED_SECONDS, so the table does not grow with every folder that ever refused."""
+    try:
+        with db() as conn:
+            for key, value in conn.execute("SELECT key, value FROM meta WHERE key LIKE ?", (CLEAN_REFUSED_PREFIX + "%",)).fetchall():
+                try:
+                    at = float(json.loads(value).get("at") or 0)
+                except (ValueError, AttributeError, TypeError):
+                    at = 0
+                if now() - at >= CLEAN_REFUSED_SECONDS:
+                    conn.execute("DELETE FROM meta WHERE key=?", (key,))
+    except (sqlite3.Error, OSError, HostError):
+        pass
+
+
 # ---- the plan -------------------------------------------------------------------------------------------------------
 
-def clean_plan(only: set, deep: bool, errors: list, skipped: list, days: int, hours: int = 48) -> list[dict]:
+def clean_plan(only: set, deep: bool, errors: list, skipped: list, days: float, hours: int = 48, rung: dict | None = None) -> list[dict]:
+    """The candidates of one rung (`rung`: a clean_profile; none means the routine rules with `days` and `hours`)."""
     names = clean_running()
     def probe_tool(spec):
         entry = {"name": spec["name"], "kind": "tool-cache", "command": " ".join(spec["argv"]), "spec": spec,
@@ -1041,6 +1301,7 @@ def clean_plan(only: set, deep: bool, errors: list, skipped: list, days: int, ho
         table = None
         for entry in clean_worktree_entries(errors, skipped):
             entry["tier"], entry["paths"] = "safe", [entry["path"]] if entry["kind"] == "worktree" else []
+            entry["idleDays"], entry["archiveMode"] = days, bool(rung and rung["archive"])
             try:
                 if "keep" in entry:
                     entries.append(entry)
@@ -1051,13 +1312,14 @@ def clean_plan(only: set, deep: bool, errors: list, skipped: list, days: int, ho
                     clean_entry_gates(entry)
                 else:
                     table = table or reap_process_table()  # one snapshot for the plan; removal probes fresh
-                    clean_worktree_gates(entry, days, table)
+                    clean_worktree_gates(entry, days, table, entry["archiveMode"])
             except ReapRefused as refusal:
                 entry["keep"] = str(refusal)
             except OSError as error:
                 entry["keep"] = clean_os_refusal(error)
             entries.append(entry)
-    entries.extend(clean_extra_entries(only, errors, hours))
+    entries.extend(clean_extra_entries(only, errors, hours, rung))
+    clean_apply_refusals(entries)
     return entries
 
 
@@ -1143,6 +1405,7 @@ def clean_remove_folder(entry: dict, run_id: str, root: str, allow_git: bool, la
     after = clean_free()
     entry["outcome"] = result["outcome"] if result["outcome"] != "deleted" else "removed"
     entry["dfDeltaBytes"] = (after - free_before) if None not in (after, free_before) else None
+    entry["removedCount"] = result.get("removed")
     if result.get("reason"):
         entry["reason"] = result["reason"]
     if result.get("stopped"):
@@ -1173,7 +1436,11 @@ def clean_act(entry: dict, run_id: str, days: int) -> None:
         return
     path = entry["path"]
     if entry["kind"] == "worktree":
-        clean_remove_folder(entry, run_id, os.path.dirname(path), True, lambda: clean_worktree_gates(entry, days, None))
+        idle, archive = entry.get("idleDays", days), entry.get("archiveMode", False)
+        if not entry.get("unsaved"):
+            clean_remove_folder(entry, run_id, os.path.dirname(path), True, lambda: clean_worktree_gates(entry, idle, None, archive))
+        else:
+            clean_archive_then_remove(entry, run_id, idle)
         return
     def last_look():
         busy = sorted(set(next(f for f in CLEAN_FOLDERS if f["name"] == entry["name"])["busy"]) & clean_running())
@@ -1182,6 +1449,64 @@ def clean_act(entry: dict, run_id: str, days: int) -> None:
         clean_folder_gates(path)
         reap_holders(path, path)
     clean_remove_folder(entry, run_id, entry["root"], False, last_look)
+
+
+# ---- archive, then remove (the ladder's last rung) ------------------------------------------------------------------------------------
+
+CLEAN_ARCHIVE_OWNER = "clean-worktrees"   # <archiveRoot>/clean-worktrees/<folder>-<time>-<run>/ ; these archives never expire by themselves
+
+
+def clean_worktree_last_look(entry: dict, idle: float, archive: bool) -> None:
+    """The gates again, right before the removal. Unsaved work that appeared since planning is never removed unarchived."""
+    clean_worktree_gates(entry, idle, None, archive)
+    if entry.get("unsaved") and not entry.get("archived"):
+        raise ReapRefused("unsaved-work-appeared:" + entry["unsaved"][0][:80])
+
+
+def clean_archive_item(entry: dict) -> dict:
+    return {"path": entry["path"], "root": os.path.dirname(entry["path"]), "repo": entry["path"], "owner": CLEAN_ARCHIVE_OWNER,
+            "jobs": [CLEAN_ARCHIVE_OWNER], "class": "job-clone-root", "kind": "clone", "ownership": "clean-worktree"}
+
+
+def clean_archive_then_remove(entry: dict, run_id: str, idle: float) -> None:
+    """A worktree holding work no remote has: commits go in a verified git bundle, files in a hashed tar (the engine's archive: verified
+    in an empty repository and by reading the tar back), the archive is stamped as the only copy before the first byte goes, and the
+    folder is compared with the archive once more before and during removal. Any difference, any archive failure and any protected
+    name keeps the worktree. The branch stays either way."""
+    path = entry["path"]
+    clean_worktree_gates(entry, idle, None, True)  # fresh: still removable apart from the work the archive will save
+    if not entry.get("unsaved"):
+        entry["archived"] = False
+        return clean_remove_folder(entry, run_id, os.path.dirname(path), True, lambda: clean_worktree_last_look(entry, idle, True))
+    item = clean_archive_item(entry)
+    repos, git_dirs = [], []
+    reap_protected_scan(path, allow_git=True, markers=True, repos=repos, git_dirs=git_dirs)  # a protected name keeps the worktree whole
+    if {reap_canon(r) for r in repos} != {path}:
+        raise ReapRefused("nested-repository")
+    clean_receipt("plan", entry, run_id, archive=entry["unsaved"])
+    made = reap_archive_create(item, {"reason": entry["unsaved"][0]}, repos, git_dirs, run_id)
+    entry["archive"] = {k: made.get(k) for k in ("path", "bytes", "files", "inputBytes", "bundles", "manifestSha256", "reused")}
+    entry["archived"] = True
+    clean_receipt("archive", entry, run_id, archive=entry["archive"])
+    def last_look():
+        clean_worktree_last_look(entry, idle, True)
+        again, again_dirs = [], []
+        reap_protected_scan(path, allow_git=True, markers=True, repos=again, git_dirs=again_dirs)
+        units, collected = reap_archive_state(item, again, again_dirs)
+        if reap_archive_fingerprint(units, collected) != made["fingerprint"] or collected["stamp"] != made["stamp"]:
+            raise ReapRefused("archive-stale:folder-changed-after-archive")
+        had_stamp = reap_archive_sole_since(made["path"]) is not None
+        if not reap_archive_mark_sole(made["path"], path, run_id):
+            raise ReapRefused("archive-sole-copy-unrecorded")  # no stamp, no removal
+        entry["stamped"] = not had_stamp
+    try:
+        clean_remove_folder(entry, run_id, os.path.dirname(path), True, last_look)
+    finally:
+        if entry.get("stamped") and not entry.get("removedCount"):
+            try:
+                os.unlink(os.path.join(made["path"], "sole-copy-since.json"))  # nothing was removed: the worktree is still the primary copy
+            except OSError:
+                pass
 
 
 # ---- report-only inventory ------------------------------------------------------------------------------------------
@@ -1234,7 +1559,7 @@ def clean_inventory() -> list[dict]:
 # ---- entry points ---------------------------------------------------------------------------------------------------
 
 def clean_shown(entry: dict) -> dict:
-    out = {k: v for k, v in entry.items() if k not in ("spec", "git", "gitdir", "paths", "root", "repo")}
+    out = {k: v for k, v in entry.items() if k not in ("spec", "git", "gitdir", "paths", "sizePaths", "root", "repo")}
     for key in ("path",):
         if out.get(key):
             out[key] = clean_tilde(out[key])
@@ -1243,8 +1568,134 @@ def clean_shown(entry: dict) -> dict:
     return out
 
 
-def clean_pass(dry_run: bool, deep: bool = False, only: list | None = None, report: bool = True, policy: dict | None = None) -> dict:
-    """A bounded candidate snapshot, largest first; stop on measured (not estimated) low-water occupancy."""
+def clean_job_sweep(rung: dict, dry_run: bool, run_id: str, goal_met=None) -> dict:
+    """One rung's pass over finished jobs' folders, through the job reaper's own guarded removal (`reap_sweep`: every gate, lock, handle
+    probe, archive and receipt of a tick) but without the tick's two-jobs-per-run cap, and with the rung's shorter windows: a job
+    counts once it finished `hours` ago; unmarked folders age out after that long (`evidenceExpiryDays`); with `clones`, whole clones
+    too (`cloneExpiryDays`, dirty or unpushed work archived and verified first); with `pinned`, a folder another job lists as an input
+    or waits on is released once that job finished or was interrupted that many hours ago. A window the operator set to 0 stays off.
+    Jobs are read from the host's job store; a job the host calls live, a running worker and every claim keep their folders."""
+    spec = rung["job"]
+    days = max(1, -(-int(spec["hours"]) // 24))
+    windows = {"evidenceExpiryDays": days, **({"cloneExpiryDays": days} if spec["clones"] else {})}
+    out = {"jobs": 0, "items": 0, "removedBytes": 0, "candidateBytes": 0, "kept": {}, "errors": [], "incomplete": None, "stopped": None}
+    started = time.monotonic()
+    def kept(reason: str, items: int, size: int) -> None:
+        found = out["kept"].setdefault(reason.split(":")[0].split(";")[0], {"items": 0, "bytes": 0})
+        found["items"] += items
+        found["bytes"] += size
+    def keep(item: dict) -> bool:
+        if spec["filter"] == "all":
+            return True
+        if item["class"] == "job-cache-subdir":
+            return bool(CLEAN_JOB_REGENERABLE.match(os.path.basename(item["path"])))
+        return item["class"] in ("job-clone-regenerable", "job-clone-root")  # a clone is listed only once its (shortened) window passed
+    try:
+        clones = reap_clone_roots()
+        live_ids, live_idle = reap_live_snapshot()
+        table = reap_process_table() if dry_run else None
+    except (HostError, OSError, ValueError, sqlite3.Error, ReapRefused) as error:
+        out["incomplete"] = "job-sweep-unavailable:" + reap_named(error)
+        return out
+    ctx = {"run": run_id, **({"table": table, "git": {}, "sizeBudget": 20} if dry_run else {})}  # a removal sizes with the engine's own budget
+    with db() as conn:
+        jobs = rows(conn, "SELECT * FROM jobs WHERE status IN ('done','failed','cancelled','interrupted') ORDER BY finished_at")
+    limit = CLEAN_JOB_SECONDS // 3 if dry_run else CLEAN_JOB_SECONDS   # a dry run only estimates
+    for job in jobs:
+        if time.monotonic() - started > limit:
+            out["incomplete"] = f"job-sweep-time-limit:{limit}s"
+            break
+        if goal_met is not None and goal_met():
+            break
+        lock = None
+        try:
+            with reap_escalated(windows, spec["pinned"] or None, spec["keepUnsaved"]), db() as conn:
+                clock = reap_job_finished_clock(conn, job)
+                if not clock or now() - clock < spec["hours"] * 3600:
+                    continue
+                blocker = reap_job_blocker(conn, job, live_ids, live_idle)
+                if blocker:  # sized from the audit the tick last made (an estimate, never a walk): this is what the job holds back
+                    cached = reap_audit_cached(conn, job)
+                    kept(blocker, 1, sum(e.get("bytes") or 0 for e in (cached or {}).get("entries", []) if e.get("state") != "gone"))
+                    continue
+                items, notes = reap_job_items(job, clones)
+                items = reap_output_order([i for i in items if keep(i)])
+                if not items:
+                    continue
+                if not dry_run:
+                    lock = reap_job_lock(job["id"])
+                    try:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except OSError:
+                        kept("reap-already-running", len(items), 0)
+                        continue
+                before = clean_free()
+                results, stopped = reap_sweep(items, "audit" if dry_run else "delete", ctx)
+                after = clean_free()
+                out["jobs"] += 1
+                out["items"] += len(results)
+                for result in results:
+                    size = result["bytes"] or 0
+                    if result["outcome"] == "deleted":
+                        out["removedBytes"] += size
+                    elif result["outcome"] == "would-delete":
+                        out["candidateBytes"] += size
+                    else:
+                        kept(result["reason"] or result["outcome"], 1, size)
+                if not dry_run and any(r["outcome"] == "deleted" for r in results):
+                    log_event(conn, "job.reaped_under_pressure", job["id"], "clean", {
+                        "reclaimedBytes": sum(r["bytes"] or 0 for r in results if r["outcome"] == "deleted"), "deleted": sum(1 for r in results if r["outcome"] == "deleted"),
+                        "dfDeltaBytes": (after - before) if None not in (before, after) else None, "run": run_id, "rung": rung["name"]})
+                if stopped:
+                    out["stopped"] = stopped
+                    break
+        except (HostError, OSError, ValueError, sqlite3.Error, ReapRefused) as error:
+            out["errors"].append({"clean": "finished-jobs", "job": job["id"], "error": str(error)[:200]})
+        finally:
+            if lock is not None:
+                os.close(lock)
+    return out
+
+
+def clean_blockers(entries: list[dict], jobs: dict | None = None) -> list[dict]:
+    """What keeps the most bytes, by reason: the top ten, so a pass that frees nothing says why. `jobs` is the job sweep's own view
+    ({reason: {"items", "bytes"}}): a job it could not touch counts once, with the bytes its last audit sized."""
+    totals: dict = {}
+    for entry in entries:
+        if "keep" in entry:
+            head = entry["keep"].split(":")[0].split(";")[0]
+            found = totals.setdefault(head, {"reason": head, "items": 0, "bytes": 0})
+            found["items"] += 1
+            found["bytes"] += entry.get("bytes") or 0
+    for head, held in (jobs or {}).items():
+        found = totals.setdefault("job:" + head, {"reason": "job:" + head, "items": 0, "bytes": 0})
+        found["items"] += held["items"]
+        found["bytes"] += held["bytes"]
+    return sorted(totals.values(), key=lambda b: (-b["bytes"], -b["items"]))[:10]
+
+
+CLEAN_DONE = ("cleaned", "removed", "worktree-entry-forgotten")
+
+
+def clean_entry_key(entry: dict) -> str:
+    return entry.get("path") or (entry["name"] + ":" + str(entry.get("command")))
+
+
+def clean_pass(dry_run: bool, deep: bool = False, only: list | None = None, report: bool = True, policy: dict | None = None,
+               escalate: bool | None = None, steady: bool = False) -> dict:
+    CLEAN_MEMO.data = {}
+    try:
+        return clean_pass_run(dry_run, deep, only, report, policy, escalate, steady)
+    finally:
+        CLEAN_MEMO.data = None
+
+
+def clean_pass_run(dry_run: bool, deep: bool, only: list | None, report: bool, policy: dict | None, escalate: bool | None, steady: bool) -> dict:
+    """Free space until the measured low watermark is reached. The routine rules run first, largest candidate first; when they cannot
+    reach the goal the pass climbs the ladder (CLEAN_RUNGS), re-planning with each rung's wider windows, and stops at the first rung that
+    reaches it. A dry run plans every rung and removes nothing. `steady` is the quiet pass below the high watermark: it ignores the goal
+    and removes only what is long idle (CLEAN_STEADY_NAMES). The result says what each rung found and freed, what was really removed,
+    the net change of free space and the folders that keep the most bytes, by reason."""
     if only is not None and not only:
         raise HostError("no clean targets named", "omit the target list for all of them: " + ", ".join(CLEAN_NAMES))
     unknown = sorted(set(only or ()) - set(CLEAN_NAMES))
@@ -1255,52 +1706,134 @@ def clean_pass(dry_run: bool, deep: bool = False, only: list | None = None, repo
     high, low = clean_goals(policy)
     disk = clean_disk()
     initial = clean_occupancy(disk, low)
-    days = policy.get("worktreeIdleDays", 7)
-    hours = policy.get("projectIdleHours", 48)
-    entries = clean_plan(chosen, deep, errors, skipped, days, hours)
-    for entry in entries:  # never size job folders, or retained candidates during an actual removal
-        if (not dry_run and "keep" in entry) or str(entry.get("keep")).startswith("job-folder"):
+    rungs = [CLEAN_STEADY] if steady else clean_ladder(policy, escalate)
+    tools = {t["name"] for t in CLEAN_TOOLS} | {f["name"] for f in CLEAN_FOLDERS}
+    run_id = uuid.uuid4().hex[:12]
+    merged: dict = {}      # every entry of every rung, the latest verdict per folder
+    reports, attempted, jobs_kept, job_bytes, stopped = [], {}, {}, 0, None
+    candidate_keys, removed_total, current, last_entries, sizes = set(), 0, initial, [], {}
+    for position, rung_id in enumerate(rungs):
+        if position and not steady and (current["goalMet"] is not False or stopped):
+            break  # the goal is reached (or cannot be measured: then nothing is escalated on a guess): the rest of the ladder is not planned
+        rung = clean_profile(policy, rung_id)
+        names = chosen if rung["tools"] else {n for n in chosen if n not in tools}
+        if steady:
+            names &= set(CLEAN_STEADY_NAMES)
+        days = rung["worktreeHours"] / 24
+        entries = clean_plan(names, deep, errors, skipped, days, rung["projectHours"], rung)
+        for entry in entries:
+            prior = attempted.get(clean_entry_key(entry))
+            if prior is not None and "keep" not in entry:
+                entry["keep"] = prior.get("keep") or "attempted-earlier-this-pass"
+            entry["sizePaths"] = list(entry.get("paths") or [])
+            if (not dry_run and "keep" in entry) or str(entry.get("keep")).startswith("job-folder"):
+                entry["paths"] = []  # never size job folders, or retained candidates during an actual removal
+        to_size = []
+        for entry in entries:  # a folder sized for an earlier rung is not walked again
+            known = sizes.get(clean_entry_key(entry))
+            if known and entry["paths"]:
+                entry["paths"], (entry["bytes"], entry["sizeComplete"]) = [], known
+                if not known[1]:
+                    entry.setdefault("keep", "size-incomplete")
+            elif entry["paths"]:
+                to_size.append(entry)
+            else:
+                entry["bytes"], entry["sizeComplete"] = known or (0, True)
+        clean_size_all(to_size)
+        sizes.update({clean_entry_key(e): (e["bytes"], e["sizeComplete"]) for e in to_size})
+        entries.sort(key=lambda e: ("keep" in e, -e["bytes"]))
+        found = [e for e in entries if "keep" not in e and clean_entry_key(e) not in candidate_keys]
+        report_rung = {"rung": CLEAN_STEADY if steady else position, "name": rung["name"], "candidates": len(found),
+                       "candidateBytes": sum(e["bytes"] for e in found), "done": 0, "removedBytes": 0, "freedBytes": None, "goalMet": None}
+        candidate_keys.update(clean_entry_key(e) for e in found)
+        for entry in entries:
+            key = clean_entry_key(entry)
+            if key not in merged or merged[key].get("outcome") not in CLEAN_DONE:
+                merged[key] = entry
+        last_entries = entries
+        free_before = clean_free()
+        sweeps = rung["job"] is not None and "finished-jobs" in chosen
+        act = not dry_run and (steady or (initial["goalMet"] is not True and current["goalMet"] is not True))
+        if act and (sweeps or any("keep" not in e for e in entries)):
+            with reap_cleanup_owner("clean"):
+                if not steady:
+                    current = clean_occupancy(clean_disk(), low)
+                for entry in entries:
+                    if (not steady and current["goalMet"] is True) or "keep" in entry:
+                        continue
+                    attempted[clean_entry_key(entry)] = entry
+                    try:
+                        clean_act(entry, run_id, days)
+                    except ReapRefused as refusal:
+                        entry["keep"] = str(refusal)
+                        clean_remember_refusal(entry, entry["keep"])
+                    except OSError as error:
+                        entry["keep"] = clean_os_refusal(error)
+                    if entry.get("outcome") == "refused" and entry.get("reason"):
+                        entry["keep"] = entry["reason"]  # the filesystem or a last look said no: kept, with the cause, not an error
+                        clean_remember_refusal(entry, entry["keep"])
+                    if entry.get("outcome") in CLEAN_DONE:
+                        report_rung["done"] += 1
+                        report_rung["removedBytes"] += entry.get("bytes") or 0
+                    if entry.get("stopped"):
+                        stopped = entry["stopped"]
+                        held = getattr(REAP_CLEANUP_OWNER, "held", None)
+                        if held:
+                            held["stopped"] = stopped
+                        break
+                    if not steady:
+                        current = clean_occupancy(clean_disk(), low)
+                if sweeps and not stopped and (steady or current["goalMet"] is not True):
+                    swept = clean_job_sweep(rung, False, run_id, None if steady else (lambda: clean_occupancy(clean_disk(), low)["goalMet"] is True))
+                    report_rung["done"] += swept["jobs"]
+                    report_rung["removedBytes"] += swept["removedBytes"]
+                    report_rung["jobs"] = {k: swept[k] for k in ("jobs", "items", "removedBytes", "incomplete")}
+                    errors.extend(swept["errors"])
+                    jobs_kept = swept["kept"]
+                    stopped = swept["stopped"] or stopped
+                    if not steady:
+                        current = clean_occupancy(clean_disk(), low)
+        elif dry_run and sweeps:
+            swept = clean_job_sweep(rung, True, run_id)
+            report_rung["jobs"] = {k: swept[k] for k in ("jobs", "items", "candidateBytes", "incomplete")}
+            report_rung["candidateBytes"] += max(0, swept["candidateBytes"] - job_bytes)  # the sweeps are cumulative: this rung adds only the difference
+            job_bytes = max(job_bytes, swept["candidateBytes"])
+            errors.extend(swept["errors"])
+            jobs_kept = swept["kept"]
+        free_after = clean_free()
+        report_rung["freedBytes"] = None if dry_run or None in (free_before, free_after) else free_after - free_before
+        removed_total += report_rung["removedBytes"]
+        report_rung["goalMet"] = None if steady else (initial["goalMet"] if dry_run else clean_occupancy(clean_disk(), low)["goalMet"])
+        reports.append(report_rung)
+    if not dry_run and not steady and clean_occupancy(clean_disk(), low)["goalMet"] is not True:
+        sized = [e for e in last_entries if "keep" in e and not e["paths"] and e.get("sizePaths") and not str(e["keep"]).startswith("job-folder")]
+        for entry in sized:
+            entry["paths"] = entry["sizePaths"]
+        clean_size_all(sized)  # the blockers by bytes: only when the goal is still unmet, and only for the last rung's view
+        for entry in sized:
             entry["paths"] = []
-    clean_size_all(entries)
-    entries.sort(key=lambda e: ("keep" in e, -e["bytes"]))
-    stopped = None
-    if not dry_run and initial["goalMet"] is not True and any("keep" not in e for e in entries):
-        run_id = uuid.uuid4().hex[:12]
-        with reap_cleanup_owner("clean"):
-            current = clean_occupancy(clean_disk(), low)
-            for entry in entries:
-                if current["goalMet"] is True:
-                    break
-                if "keep" in entry:
-                    continue
-                try:
-                    clean_act(entry, run_id, days)
-                except ReapRefused as refusal:
-                    entry["keep"] = str(refusal)
-                except OSError as error:
-                    entry["keep"] = clean_os_refusal(error)
-                if entry.get("stopped"):
-                    stopped = entry["stopped"]
-                    held = getattr(REAP_CLEANUP_OWNER, "held", None)
-                    if held:
-                        held["stopped"] = stopped
-                    break
-                current = clean_occupancy(clean_disk(), low)
+    if not dry_run:
+        clean_forget_refusals()
+    all_entries = sorted(merged.values(), key=lambda e: ("keep" in e, -(e.get("bytes") or 0)))
     after = clean_disk()
     final = clean_occupancy(after, low)
-    done = [e for e in entries if e.get("outcome") in ("cleaned", "removed", "worktree-entry-forgotten")]
-    failed = [e for e in entries if e.get("outcome") and e not in done]
-    candidates = [e for e in entries if "keep" not in e]
-    out = {"dryRun": dry_run, "deep": deep, "disk": disk,
+    done = [e for e in all_entries if e.get("outcome") in CLEAN_DONE]
+    failed = [e for e in all_entries if e.get("outcome") and e not in done and "keep" not in e]
+    candidates = [e for e in all_entries if "keep" not in e]
+    freed = None if dry_run or not (disk and after) else after["freeBytes"] - disk["freeBytes"]
+    out = {"dryRun": dry_run, "deep": deep, "mode": CLEAN_STEADY if steady else ("ladder" if len(rungs) > 1 else "routine"), "disk": disk,
            "cleanAtPercent": high, "cleanToPercent": low,
            "initialOccupancy": initial, "finalOccupancy": final,
            "remainingBytes": final["remainingBytes"], "goalMet": final["goalMet"],
-           "summary": {"candidates": len(candidates), "candidateBytes": sum(e["bytes"] for e in candidates),
-                       "kept": len(entries) - len(candidates), "done": len(done), "failed": len(failed),
-                       "keptReasons": dict(sorted(Counter(e["keep"].split(":")[0] for e in entries if "keep" in e).items())),
-                       "freedBytes": None if dry_run or not (disk and after) else after["freeBytes"] - disk["freeBytes"]},
-           "items": [clean_shown(e) for e in sorted(entries, key=lambda e: ("keep" in e, -e["bytes"]))], "skippedRepos": skipped,
-           "errors": errors + [{"clean": e["name"], "path": clean_tilde(e.get("path") or ""), "error": e["outcome"]} for e in failed]}
+           "summary": {"candidates": len(candidates), "candidateBytes": sum(e["bytes"] for e in candidates) + job_bytes,
+                       "kept": len(all_entries) - len(candidates), "done": len(done), "failed": len(failed),
+                       "keptReasons": dict(sorted(Counter(e["keep"].split(":")[0] for e in all_entries if "keep" in e).items())),
+                       "removedBytes": None if dry_run else removed_total, "freedBytes": freed,
+                       "freedNote": ("removed more than the volume gained: other writers used the space meanwhile" if freed is not None and removed_total > 0 and freed < removed_total * 0.5
+                                     else "nothing was removed; free space fell because other programs wrote" if freed is not None and freed < 0 and not removed_total else None)},
+           "rungs": reports, "topBlockers": clean_blockers(all_entries, jobs_kept),
+           "items": [clean_shown(e) for e in all_entries], "skippedRepos": skipped,
+           "errors": errors + [{"clean": e["name"], "path": clean_tilde(e.get("path") or ""), "error": e["outcome"], "reason": e.get("reason")} for e in failed]}
     if not dry_run:
         out["diskAfter"] = after
     if stopped:
@@ -1308,6 +1841,9 @@ def clean_pass(dry_run: bool, deep: bool = False, only: list | None = None, repo
     if report:
         out["report"] = clean_inventory()
     return out
+
+
+CLEAN_PASS = clean_pass  # the pass itself, whatever a host later binds the name clean_pass to (UltraTerm wraps it to watch pressure passes)
 
 
 def clean_auto_state(conn) -> dict:
@@ -1342,52 +1878,98 @@ def clean_auto_observe(conn, policy: dict, disk: dict | None, event=None) -> str
         if state:
             conn.execute("DELETE FROM meta WHERE key=?", (CLEAN_AUTO_KEY,))
         return None
-    if state and now() - float(state.get("at") or 0) < CLEAN_AUTO_SECONDS:
+    event = policy.get("cleanEventToken") if event is None else event
+    # A pass that removed nothing found nothing to wait out in ten minutes: retrying every tick only refills the log. A changed release
+    # event (a job finished) is the exception, and so is new pressure below.
+    if state.get("running") and now() - float(state.get("at") or 0) < CLEAN_AUTO_RUNNING_SECONDS:
+        return None
+    previous = state.get("freeBytes")
+    floor = float(policy.get("cleanFloorGB", 10)) * 1024 ** 3
+    growth = float(policy.get("cleanGrowthGB", 5)) * 1024 ** 3
+    urgent = previous is not None and disk["freeBytes"] < previous and (disk["freeBytes"] < floor or previous - disk["freeBytes"] >= growth)
+    quiet = state.get("removedBytes") == 0 and not urgent and not (event is not None and event != state.get("event"))
+    if state and now() - float(state.get("at") or 0) < (CLEAN_AUTO_QUIET_SECONDS if quiet else CLEAN_AUTO_SECONDS):
         return None
     if not state:
         return "crossed" if percent >= high else None
-    event = policy.get("cleanEventToken") if event is None else event
     if state.get("goalMet") is not True and event is not None and event != state.get("event"):
         return "release"
     if percent < high:
         return "unfinished" if state.get("goalMet") is not True else None
-    previous = state.get("freeBytes")
     if previous is None:
         return "pressure"
-    floor = float(policy.get("cleanFloorGB", 10)) * 1024 ** 3
     if disk["freeBytes"] < floor and disk["freeBytes"] < previous:
         return "floor"
-    growth = float(policy.get("cleanGrowthGB", 5)) * 1024 ** 3
     if disk["freeBytes"] < previous and previous - disk["freeBytes"] >= growth:
         return "growth"
     return "pressure"
 
 
 def clean_auto(conn, policy: dict, actions: list, errors: list, event=None) -> None:
-    """One bounded safe pass, with a pre-pass stamp and post-pass measured goal state."""
+    """One bounded pass, with a pre-pass stamp and post-pass measured goal state: at the high watermark the ladder (until the goal is
+    measured), below it the steady pass when one is due."""
     disk = clean_disk()
     reason = clean_auto_observe(conn, policy, disk, event)
     if not reason:
-        return
+        return clean_steady_tick(conn, policy, actions, errors)
     event = policy.get("cleanEventToken") if event is None else event
-    def save(measurement, goal_met):
+    def save(measurement, goal_met, removed=None, running=False):
         state = {"at": now(), "freeBytes": measurement.get("freeBytes") if measurement else None,
-                 "goalMet": goal_met, "event": event}
+                 "goalMet": goal_met, "event": event, "removedBytes": removed, **({"running": True} if running else {})}
         conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (CLEAN_AUTO_KEY, json.dumps(state)))
-    save(disk, False)
+    save(disk, False, running=True)
     try:
         out = clean_pass(False, report=False, policy=policy)
     except (HostError, ReapRefused, OSError) as error:
         errors.append({"clean": "auto", "error": str(error)})
         return
     after = out.get("diskAfter")
-    freed = after["freeBytes"] - disk["freeBytes"] if after else None
-    save(after, out["goalMet"])
+    freed = after["freeBytes"] - disk["freeBytes"] if after and disk else None
+    removed = out["summary"].get("removedBytes")  # None: the pass did not say, which is not "nothing" (no quiet wait)
+    save(after, out["goalMet"], removed)
     actions.append({"did": "cleaned-at-disk-pressure", "reason": reason, "usedPercent": clean_occupancy(disk, policy.get("cleanToPercent", 80))["usedPercent"],
                     "atPercent": policy.get("cleanAtPercent", 85), "toPercent": policy.get("cleanToPercent", 80),
                     "goalMet": out["goalMet"], "remainingBytes": out["remainingBytes"],
-                    "done": out["summary"]["done"], "freedBytes": freed})
+                    "done": out["summary"]["done"], "freedBytes": freed, "removedBytes": removed or 0,
+                    "rungs": [{k: r[k] for k in ("name", "done", "removedBytes", "goalMet")} for r in out.get("rungs", [])],
+                    "topBlockers": out.get("topBlockers", [])[:3]})
     errors.extend(out["errors"])
     if out.get("stopped"):
         errors.append({"clean": "auto", "stopped": out["stopped"]})
+
+
+def clean_steady_due(conn, policy: dict) -> bool:
+    """A steady pass is due: automatic cleaning and cleanSteadyHours are on and that long has passed since the last one. Starts
+    nothing; a host that runs the pass in a child process asks this to decide whether to start one."""
+    hours = policy.get("cleanSteadyHours")  # a host whose policy has no such key has not opted in: no surprise removals from a partial policy
+    if not isinstance(hours, int) or isinstance(hours, bool) or hours <= 0 or policy.get("cleanAtPercent") == 0:
+        return False
+    stored = row(conn, "SELECT value FROM meta WHERE key=?", (CLEAN_STEADY_KEY,))
+    try:
+        last = float(stored["value"]) if stored else 0.0
+    except (ValueError, TypeError, KeyError):
+        last = 0.0
+    return now() - last >= hours * 3600
+
+
+def clean_steady_tick(conn, policy: dict, actions: list, errors: list) -> None:
+    """Below the high watermark a quiet pass still runs every cleanSteadyHours: regenerable output of repositories idle for
+    cleanSteadyRepoDays and the artifacts of jobs finished cleanSteadyJobHours ago, so the disk never has to reach the watermark to be kept
+    tidy. Nothing else (no tool cache, no young worktree) is touched. Off when automatic cleaning is."""
+    if not clean_steady_due(conn, policy):
+        return
+    conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (CLEAN_STEADY_KEY, str(now())))  # a failed pass is not retried every tick
+    before = clean_disk()
+    try:
+        out = CLEAN_PASS(False, report=False, policy=policy, steady=True)
+    except (HostError, ReapRefused, OSError) as error:
+        errors.append({"clean": "steady", "error": str(error)})
+        return
+    after = out.get("diskAfter")
+    if out["summary"].get("removedBytes") or out["summary"]["done"]:
+        actions.append({"did": "cleaned-steady", "done": out["summary"]["done"], "removedBytes": out["summary"].get("removedBytes") or 0,
+                        "freedBytes": after["freeBytes"] - before["freeBytes"] if after and before else None})
+    errors.extend(out["errors"])
+    if out.get("stopped"):
+        errors.append({"clean": "steady", "stopped": out["stopped"]})
 # <<< trimreaper clean <<<

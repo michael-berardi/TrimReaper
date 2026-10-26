@@ -10,8 +10,9 @@ from trimreaper import clean, core, host
 
 class HostGoalPolicyTests(unittest.TestCase):
     def test_defaults(self):
-        self.assertEqual(host.DEFAULT_POLICY["cleanAtPercent"], 85)
-        self.assertEqual(host.DEFAULT_POLICY["cleanToPercent"], 80)
+        self.assertEqual(host.DEFAULT_POLICY["cleanAtPercent"], 75)
+        self.assertEqual(host.DEFAULT_POLICY["cleanToPercent"], 60)
+        self.assertEqual(host.DEFAULT_POLICY["diskWarnPercent"], 75)
         host.check_policy({})
 
     def test_valid_numeric_goals(self):
@@ -33,7 +34,7 @@ class HostGoalPolicyTests(unittest.TestCase):
         with patch.object(host, "config", return_value={"policy": {"cleanAtPercent": 0}}):
             policy = host.load_policy()
         self.assertEqual(policy["cleanAtPercent"], 0)
-        self.assertEqual(policy["cleanToPercent"], 80)
+        self.assertEqual(policy["cleanToPercent"], 60)
         with patch.object(host, "config", return_value={"policy": {"cleanToPercent": 90}}):
             with self.assertRaises(host.HostError):
                 host.load_policy()
@@ -44,9 +45,9 @@ class HostGoalPolicyTests(unittest.TestCase):
         with patch.object(clean, "clean_disk", return_value=disk), \
                 patch.object(clean, "clean_plan", return_value=[]) as plan, \
                 patch.object(clean, "clean_size_all"):
-            result = clean.clean_pass(True, report=False, policy=policy)
+            result = clean.clean_pass(True, report=False, policy=policy, escalate=False)
         plan.assert_called_once()
-        self.assertEqual((result["cleanAtPercent"], result["cleanToPercent"]), (85, 80))
+        self.assertEqual((result["cleanAtPercent"], result["cleanToPercent"]), (85, 60))
         self.assertEqual(policy["cleanAtPercent"], 0)
 
     def test_off_never_runs_automatic_clean_even_after_release(self):

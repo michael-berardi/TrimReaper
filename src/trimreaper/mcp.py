@@ -52,7 +52,10 @@ TOOLS = [
     {"name": "clean",
      "description": "Free space outside agent jobs: tool caches through each tool's own cleaner (npm, pnpm, yarn, bun, uv, pip, "
                     "go, homebrew, simulators, docker build cache), Cargo's registry and Xcode's DerivedData, and idle agent "
-                    "worktrees (clean, unlocked, every commit still on a branch, tag or remote). Reports local models, browser "
+                    "worktrees (clean, unlocked, every commit still on a branch, tag or remote). When the routine rules cannot reach "
+                    "the low watermark it climbs a ladder of wider but still proved rules (idle repositories' regenerable output, "
+                    "worktrees and finished jobs' folders, archive-then-remove of unsaved work) and reports each rung, the bytes "
+                    "removed and the folders that keep the most bytes. Reports local models, browser "
                     "builds, Docker's disk image and local snapshots without touching them. A dry run (the default) plans and "
                     "sizes; pass dryRun false to clean. Kept items carry the reason.",
      "annotations": {"destructiveHint": True},

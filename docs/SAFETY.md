@@ -56,6 +56,43 @@ finishes, in case it is resumed. A **build queue** is any tool that takes a per-
 15. **After.** The identities of protected files next to the item are re-taken. Any difference stops the whole sweep.
     The result receipt is written while the locks are still held.
 
+## The escalation ladder and the steady pass
+
+`trimreaper clean` stops at its low watermark. When the routine rules cannot reach it, `clean_pass` climbs six rungs (README, "the
+escalation ladder"), re-planning with each rung's windows, and stops at the first rung that reaches the goal. The rungs change
+**windows** (how long a repository, a worktree or a finished job has been quiet) and, for regenerable output only, which git
+proofs are needed (`ignored` and `untracked`, not `clean`, `pushed` and a stash-free repository, because output git ignores and
+tracks nothing of is not unsaved work). They never change what protects work or secrets. On every rung:
+
+- a starting or running job's folder, a folder a job declares, a folder a process has open or is working in, and any folder
+  whose live-job state cannot be read are kept;
+- `.env*`, `.dev.vars*`, `.wrangler` and `.vercel` are never entered, read, archived or removed; a worktree or job folder holding
+  one is kept whole;
+- a retention marker other than `disposable`, a key or certificate name, a release artifact (`dist` and `build` holding an installer,
+  disk image, package or archive stay), another user's file and a primary clone's own source are kept;
+- a window the operator set to `0` stays off, and an override can only shorten a window;
+- the disk measurement must show the goal unmet: an unknown measurement escalates nothing.
+
+Only rung 5 removes work no remote holds, and only after the engine's archive: commits in a git bundle verified in an empty
+repository, files in a tar read back against a SHA-256 manifest, the archive stamped as the only copy before the first byte goes, the
+worktree compared with the archive again, and a second look at every gate. A failed or stale archive, a protected name or a
+nested repository keeps the worktree. Archives of non-job worktrees live in `<archiveRoot>/clean-worktrees/` and do not expire by
+themselves; a job clone's archive follows `archiveExpiryDays` as before.
+
+The job rungs call the job reaper's own removal (`reap_sweep`: every gate in the list above) with shorter windows through
+`reap_escalated`; they only differ from a tick in not stopping after two jobs. `reap_pin_released` is the one place a
+pin ends: a done, failed or cancelled job never pins, and while a rung runs an interrupted job stops pinning
+`cleanEscalatePinnedHours` after a verified interruption clock; a parked, blocked, queued, approved or running job always does.
+
+The steady pass (`cleanSteady*`) is the same machinery with one rung: repository output idle three days and job artifacts finished
+two days, and nothing else: no tool cleaner, no worktree, no temp folder.
+
+**Refused removals.** A folder the filesystem will not release is kept with its cause and remembered for a day (`meta` keys
+`clean:refused:*`, dropped when stale), unless it becomes a different object. Before removal, an agent-leftover folder holding an
+entry whose macOS ACL denies delete is kept as `filesystem-protected-acl:<entry>`; a removal that still meets such an ACL reports
+`removal-error:PermissionError:acl-deny-delete:<entry>`. The ACL itself is never cleared. A refusal is a *kept* item with a reason,
+not an error; only a removal that started and did not finish, or changed protected state, is an error and stops the sweep.
+
 ## The metadata-only audit
 
 `trimreaper status --items` removes nothing and takes no lock it would have to create. When a sizing pass runs out of budget,

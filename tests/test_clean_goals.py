@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from trimreaper import clean, cli
+from trimreaper import clean, cli, host
 
 
 def disk(used=90, free=10):
@@ -51,10 +51,25 @@ class Goals(unittest.TestCase):
             self.measurement = disk(self.measurement["usedBytes"] - entry["fixtureSize"],
                                     self.measurement["freeBytes"] + entry["fixtureSize"])
 
-    def run_pass(self, dry=False, policy=None):
-        return clean.clean_pass(dry, report=False, policy=policy or {})
+    # The goal arithmetic is exercised at 85/80 without the ladder, so each test below stays about one thing; the shipped defaults and the
+    # ladder have their own tests (here and in test_ladder.py).
+    base = {"cleanAtPercent": 85, "cleanToPercent": 80, "cleanEscalate": False}
 
-    def test_default_goals_largest_first_stop_on_measured_low(self):
+    def run_pass(self, dry=False, policy=None):
+        return clean.clean_pass(dry, report=False, policy={**self.base, **(policy or {})})
+
+    def test_default_goals_are_75_and_60_and_stop_on_measured_low(self):
+        self.measurement = disk(70, 30)
+        out = clean.clean_pass(False, report=False, policy={**host.DEFAULT_POLICY, "cleanEscalate": False})
+        self.assertEqual((out["cleanAtPercent"], out["cleanToPercent"]), (75, 60))
+        self.assertEqual(self.acted, ["large"])
+        self.assertEqual(out["initialOccupancy"]["usedPercent"], 70)
+        self.assertEqual(out["finalOccupancy"]["usedPercent"], 58)
+        self.assertEqual(out["remainingBytes"], 0)
+        self.assertIs(out["goalMet"], True)
+        self.assertEqual(out["summary"]["freedBytes"], 12)
+
+    def test_goals_largest_first_stop_on_measured_low(self):
         out = self.run_pass()
         self.assertEqual((out["cleanAtPercent"], out["cleanToPercent"]), (85, 80))
         self.assertEqual(self.acted, ["large"])
@@ -150,7 +165,7 @@ class Goals(unittest.TestCase):
     def test_invalid_goal_bounds_refused_before_planning(self):
         for low, high in ((0, 85), (85, 85), (86, 85), (80, 101), (True, 85), (80, -1), (80, float("nan"))):
             with self.subTest(low=low, high=high), self.assertRaises(clean.HostError):
-                clean.clean_pass(False, report=False, policy={"cleanToPercent": low, "cleanAtPercent": high})
+                clean.clean_pass(False, report=False, policy={"cleanToPercent": low, "cleanAtPercent": high, "cleanEscalate": False})
         clean.clean_plan.assert_not_called()
 
 

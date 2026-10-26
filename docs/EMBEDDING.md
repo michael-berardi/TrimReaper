@@ -19,14 +19,34 @@ It is vendored the same way, after the engine, and calls the engine's gates. Eve
 |---|---|
 | `reap_worktree_homes()` | Folders where agent tools keep worktrees, as `Path`s, or `None` for the built-in list. |
 
-Its entry points are `clean_pass(dry_run, deep=False, only=None, report=True, policy=None)`,
-`clean_auto_observe(conn, policy, disk, event=None)` (why a pass is due; it starts nothing) and
-`clean_auto(conn, policy, actions, errors, event=None)`. Policy defaults are `cleanAtPercent=85`,
-`cleanToPercent=80`, `cleanGrowthGB=5`, `cleanFloorGB=10`, `worktreeIdleDays=7`. `cleanAtPercent=0`
-disables automatic cleaning. The `meta` key `clean:auto` stores measured progress and hysteresis.
+Its entry points are `clean_pass(dry_run, deep=False, only=None, report=True, policy=None, escalate=None, steady=False)`,
+`clean_auto_observe(conn, policy, disk, event=None)` (why a pass is due; it starts nothing),
+`clean_steady_due(conn, policy)` (whether the quiet steady pass is due; it starts nothing either) and
+`clean_auto(conn, policy, actions, errors, event=None)`. The standalone host's policy defaults are `cleanAtPercent=75`,
+`cleanToPercent=60`, `cleanGrowthGB=5`, `cleanFloorGB=10`, `worktreeIdleDays=7` (the engine reads a missing goal key as 85 and 80,
+as before, so a host sets its own), plus the ladder keys (`cleanEscalate`,
+`cleanEscalate{Repo,Worktree,Job,Pinned}Hours`, `cleanSteady{Hours,RepoDays,JobHours}`). A host whose `load_policy()` predates a
+key gets the shipped default for it (`CLEAN_POLICY`), so a stored policy file never has to name the new keys; the one exception is
+`cleanSteadyHours`, which must be present (and positive) for the steady pass to run, so a host's tests that call `clean_auto` with a
+partial policy never start a real pass. `cleanAtPercent=0`
+disables automatic cleaning. The `meta` keys `clean:auto` (measured progress, hysteresis and the bytes the last pass removed),
+`clean:steady` (when the steady pass last ran) and `clean:refused:<digest>` (removals the filesystem refused, kept for a day) are the
+clean pass's.
 Supply a stable `event` token that changes only when jobs finish or outputs are released; an unmet goal may retry
 once for each changed token after the cooldown. Never use the current time or ordinary tick events as this token.
 An embedded copy uses the host's single-owner lock; never add a second cleaner.
+
+`clean_auto` runs the ladder when `clean_auto_observe` names a reason, and otherwise the steady pass when `clean_steady_due`. A host
+that runs `clean_auto` in a child process (UltraTerm does) must start that child when either says so, or the steady pass never
+runs. A host that wraps `clean_pass` to watch pressure passes sees only those: the steady pass calls the unwrapped function
+through `CLEAN_PASS`, because its result says nothing about a goal.
+
+The ladder's job rungs read the host's job store through the names above and through three engine functions a host can use too:
+`reap_escalated(windows, pinned_hours)` (a context manager that shortens `cloneExpiryDays` and `evidenceExpiryDays` for the
+calls inside it, never lengthens one and never turns one on), `reap_policy()` (the policy with those windows applied; the engine
+reads it wherever it read `load_policy()` for a window) and `reap_pin_released(conn, job)`. A host that pins one job's folders for
+another (UltraTerm's artifact inputs) should ask `reap_pin_released` for the pinning job, so a finished or failed job never pins and
+an interrupted one stops pinning only inside a rung, after `cleanEscalatePinnedHours`.
 
 Results include `initialOccupancy`, `finalOccupancy`, `remainingBytes` and `goalMet`.
 `disk_state()` must supply exact `usedBytes` and `freeBytes`: occupancy uses used/(used+free), not an APFS

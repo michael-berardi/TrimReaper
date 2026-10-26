@@ -47,11 +47,25 @@ DEFAULT_POLICY = {
     "cloneProtectedCopies": "keep",
     "agentScratchProtectedCopies": "keep",
     # Disk pressure: at or above this used percent, idle (parked/interrupted) jobs lose their derived build output too.
-    "diskWarnPercent": 85,
-    # `tick` runs `trimreaper clean` when the volume reaches this used percent, then again only on new pressure (no timer); 0 = off.
-    "cleanAtPercent": 85,
+    "diskWarnPercent": 75,
+    # `tick` runs `trimreaper clean` when the volume reaches this used percent, then again while pressure remains; 0 = off.
+    "cleanAtPercent": 75,
     # A clean pass stops at this low-water mark; manual clean uses 85 as its high mark when auto clean is off.
-    "cleanToPercent": 80,
+    "cleanToPercent": 60,
+    # When the routine rules cannot reach cleanToPercent, the pass climbs a ladder of wider but still proved rules, one rung at a
+    # time, and stops at the first rung that reaches the goal: idle repositories' regenerable output after cleanEscalateRepoHours,
+    # worktrees and finished jobs' folders after cleanEscalateWorktreeHours / cleanEscalateJobHours, folders pinned only by
+    # finished or long-interrupted jobs after cleanEscalatePinnedHours, then archive-then-remove of unsaved work.
+    "cleanEscalate": True,
+    "cleanEscalateRepoHours": 2,
+    "cleanEscalateWorktreeHours": 24,
+    "cleanEscalateJobHours": 24,
+    "cleanEscalatePinnedHours": 24,
+    # Below cleanAtPercent a quiet pass still runs every cleanSteadyHours (0 = off): regenerable output of repositories idle for
+    # cleanSteadyRepoDays, and the artifacts of jobs finished cleanSteadyJobHours ago.
+    "cleanSteadyHours": 6,
+    "cleanSteadyRepoDays": 3,
+    "cleanSteadyJobHours": 48,
     # New pressure: this many more GB used since the last automatic pass, or free space under cleanFloorGB.
     "cleanGrowthGB": 5,
     "cleanFloorGB": 10,
@@ -205,9 +219,17 @@ def check_policy(policy: dict) -> None:
     if any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in (high, low)):
         raise HostError("clean goals must be finite numbers satisfying 0 < cleanToPercent < cleanAtPercent <= 100 (cleanAtPercent=0 disables auto clean)")
     # Keep 0 in the effective policy so automatic clean remains off. Manual clean's effective high is 85.
-    effective_high = DEFAULT_POLICY["cleanAtPercent"] if high == 0 else high
+    effective_high = 85 if high == 0 else high
     if not 0 < low < effective_high <= 100:
         raise HostError("clean goals must satisfy 0 < cleanToPercent < cleanAtPercent <= 100 (auto off uses a manual high of 85)")
+    if not isinstance(merged["cleanEscalate"], bool):
+        raise HostError(f"policy cleanEscalate must be true or false, not {json.dumps(merged['cleanEscalate'])}")
+    for key, high in (("cleanEscalateRepoHours", 24 * 365), ("cleanEscalateWorktreeHours", 24 * 365), ("cleanEscalateJobHours", 24 * 365),
+                      ("cleanEscalatePinnedHours", 24 * 365), ("cleanSteadyHours", 24 * 365), ("cleanSteadyRepoDays", 365),
+                      ("cleanSteadyJobHours", 24 * 365)):
+        value = merged[key]
+        if not isinstance(value, int) or isinstance(value, bool) or not (0 if key == "cleanSteadyHours" else 1) <= value <= high:
+            raise HostError(f"policy {key} must be a whole number from {0 if key == 'cleanSteadyHours' else 1} to {high}, not {json.dumps(value)}")
     for key, high in (("cleanGrowthGB", 1000), ("cleanFloorGB", 1000), ("parkedReapHours", 24 * 365), ("projectIdleHours", 24 * 365)):
         value = merged[key]
         if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= high:

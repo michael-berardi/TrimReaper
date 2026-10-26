@@ -85,6 +85,52 @@ REAP_ASTRO_FILES = ("data-store.json", "content-assets.mjs", "content-modules.mj
 # Nothing of a running, approved or queued job is touched, even under pressure.
 REAP_PRESSURE_IDLE = ("parked", "blocked", "interrupted")
 REAP_PRESSURE = threading.local()
+# Escalation: the clean pass climbs a ladder when its goal is unmet and, for one rung, widens the windows that decide when a finished
+# job's artifacts age out. An override only ever SHORTENS a window the operator set to a positive number (0 means off, and
+# stays off), it is thread-local, and no gate other than a window changes: git proofs, locks, handles, secrets, claims and
+# receipts all still run. `pinnedHours` also releases the pin a stale interrupted job puts on the folders it waits on.
+REAP_ESCALATION = threading.local()
+REAP_ESCALATION_WINDOWS = ("cloneExpiryDays", "evidenceExpiryDays")
+
+
+@contextmanager
+def reap_escalated(windows: dict | None = None, pinned_hours: float | None = None, keep_unsaved: bool = False):
+    """For the calls inside: shorter job windows, a shorter pin, and with `keep_unsaved` no archiving, so a clone holding work no remote
+    has is kept as it was instead of being archived at a window the operator did not set (only the ladder's last rung archives)."""
+    previous = getattr(REAP_ESCALATION, "rung", None)
+    REAP_ESCALATION.rung = {"windows": dict(windows or {}), "pinnedHours": pinned_hours, "keepUnsaved": bool(keep_unsaved)}
+    try:
+        yield
+    finally:
+        REAP_ESCALATION.rung = previous
+
+
+def reap_policy() -> dict:
+    """The host's policy with the running escalation rung's shorter windows applied (a window of 0 is off and is never turned on)."""
+    policy = dict(load_policy())
+    rung = getattr(REAP_ESCALATION, "rung", None)
+    for key, days in ((rung or {}).get("windows") or {}).items():
+        value = policy.get(key)
+        if key in REAP_ESCALATION_WINDOWS and isinstance(value, int) and not isinstance(value, bool) and value > 0 \
+                and isinstance(days, int) and not isinstance(days, bool) and 0 < days < value:
+            policy[key] = days
+    if (rung or {}).get("keepUnsaved"):
+        policy["cloneArchive"] = "keep"  # the more conservative value: such a clone's refusal stands
+    return policy
+
+
+def reap_pin_released(conn, other: dict) -> bool:
+    """A job that waits on, or names as an input, another job's folders no longer pins them: it finished (done, failed,
+    cancelled), or, while an escalation rung runs, it was interrupted longer than the rung's `pinnedHours` ago on a verified
+    interruption clock. An unproved clock, a parked, blocked, queued or running job keeps the pin."""
+    if other.get("status") in REAP_TERMINAL:
+        return True
+    rung = getattr(REAP_ESCALATION, "rung", None)
+    hours = (rung or {}).get("pinnedHours")
+    if other.get("status") != "interrupted" or isinstance(hours, bool) or not isinstance(hours, (int, float)) or hours <= 0:
+        return False
+    stamp = reap_interruption_clock(conn, other)
+    return stamp is not None and now() - stamp >= hours * 3600
 
 
 def reap_idle_expired(job: dict, policy: dict) -> bool:
@@ -107,7 +153,7 @@ def reap_pressure_allows(item: dict, job: dict) -> bool:
     """Only derived output of idle jobs, under pressure or after their quiet window."""
     return item.get("class") == "job-clone-regenerable" and item.get("kind") in REAP_DERIVED_KINDS \
         and job["status"] in REAP_PRESSURE_IDLE \
-        and (bool(getattr(REAP_PRESSURE, "on", False)) or reap_idle_expired(job, load_policy())) \
+        and (bool(getattr(REAP_PRESSURE, "on", False)) or reap_idle_expired(job, reap_policy())) \
         and reap_idle_terminal_allows(job)
 
 
@@ -1817,7 +1863,7 @@ def marked_evidence_keep(name: str) -> bool:
 
 def marked_evidence_job(job_id: str) -> bool:
     """Only terminal jobs strictly older than the separate window, with a private surviving report."""
-    days = marked_evidence_expiry_days(load_policy())
+    days = marked_evidence_expiry_days(reap_policy())
     if not days:
         return False
     with db() as conn:
@@ -1872,7 +1918,7 @@ def reap_evidence_marker_void(job_id: str | None) -> bool:
     """A cancelled job's `evidence` marker on its own cache has lost its premise: the acceptance or verification it was
     written for can never complete, so the marker keeps that cache only for the normal evidence window instead of forever.
     A done, failed, parked or running job keeps its marker as written."""
-    days = evidence_expiry_days(load_policy())
+    days = evidence_expiry_days(reap_policy())
     if not job_id or not days:
         return False
     with db() as conn:
@@ -2085,7 +2131,7 @@ def reap_archive_expired(path: str) -> bool:
     not expire. Only an archive with no readable manifest to ask falls back to its own folder's mtime."""
     if reap_archive_scratch(path):
         return False  # protected scratch copies have no automatic expiry, including when they are the sole copy
-    days = load_policy().get("archiveExpiryDays", 30)
+    days = reap_policy().get("archiveExpiryDays", 30)
     if not isinstance(days, int) or isinstance(days, bool) or days <= 0:
         return False
     try:
@@ -2209,7 +2255,7 @@ REAP_ARCHIVE_LIST_MAX = 5000           # left-out entries the manifest names one
 
 
 def reap_archive_on() -> bool:
-    return load_policy().get("cloneArchive", "archive") == "archive"
+    return reap_policy().get("cloneArchive", "archive") == "archive"
 
 
 def reap_jobs_finished_before(ids: list, seconds: float) -> bool:
@@ -2230,7 +2276,7 @@ def reap_jobs_finished_before(ids: list, seconds: float) -> bool:
 
 def reap_archive_eligible(item: dict) -> bool:
     """cloneArchive=archive, a whole clone or a job cache folder, and every job it is named for finished cloneExpiryDays ago."""
-    days = load_policy().get("cloneExpiryDays", 3)
+    days = reap_policy().get("cloneExpiryDays", 3)
     if not reap_archive_on() or item.get("class") not in ("job-clone-root", "job-cache-subdir") \
             or not isinstance(days, int) or isinstance(days, bool) or days <= 0:
         return False
@@ -2251,7 +2297,7 @@ def reap_archive_settles(item: dict, refusal: str, eligible: bool) -> dict:
             raise ReapRefused(f"{refusal};archive-after-expiry")  # named: archived, then removed, once every job is past cloneExpiryDays
         raise ReapRefused(refusal)
     if nongit:
-        days = load_policy().get("cloneExpiryDays", 3) + REAP_NONGIT_GRACE_DAYS
+        days = reap_policy().get("cloneExpiryDays", 3) + REAP_NONGIT_GRACE_DAYS
         if not reap_jobs_finished_before(item.get("jobs") or [item.get("owner")], days * 86400):
             raise ReapRefused(f"{refusal};archive-after-retries:{days}d")
     return {"reason": refusal}
@@ -2435,7 +2481,7 @@ def reap_archive_needs_save(unit: dict) -> bool:
 def reap_archive_protected(item: dict) -> bool:
     """Secret copies and local state (.env*, .dev.vars*, .wrangler, .vercel) of a whole clone are archived (owner-only) before
     cloneProtectedCopies=remove deletes them with the clone: nothing is irrecoverable."""
-    return (item["class"] == "job-clone-root" and load_policy().get("cloneProtectedCopies", "remove") == "remove") \
+    return (item["class"] == "job-clone-root" and reap_policy().get("cloneProtectedCopies", "remove") == "remove") \
         or (item["class"] == "agent-scratch" and reap_scratch_protected(item["path"]))
 
 
@@ -3031,7 +3077,7 @@ def reap_archive_state(item: dict, repos: list, git_dirs: list) -> tuple[list, d
         reap_scratch_scope(item["path"])
         return [], reap_scratch_archive_collect(item)
     units = reap_archive_units(item, repos, git_dirs)
-    days = evidence_expiry_days(load_policy())
+    days = evidence_expiry_days(reap_policy())
     cutoff = now() - days * 86400 if days and reap_jobs_finished_before(item.get("jobs") or [item.get("owner")], days * 86400) else None
     collected = reap_archive_collect(item, units, cutoff, reap_archive_protected(item))
     for unit in units:
@@ -3194,7 +3240,7 @@ def reap_release_keep_lapsed(conn, source: str, value: str) -> bool:
     the paths are then ordinary finished-job folders. Without that, one consolidation's keep list protected four cancelled
     jobs' clones for good (2026-10-24: J-0349's keep list, 15 days after every job in it ended). Unreadable records, an
     unknown job or a live one keep the list in force."""
-    days = load_policy().get("cloneExpiryDays", 3)
+    days = reap_policy().get("cloneExpiryDays", 3)
     if not isinstance(days, int) or isinstance(days, bool) or days <= 0:
         return False
     try:
@@ -3227,7 +3273,7 @@ def reap_clone_expired(ids: list, scope: str | None = None) -> bool:
     """Every job the clone is named for finished (done/failed/cancelled, or interrupted with a durable continuation) at least
     cloneExpiryDays ago, and (with `scope`, the clone's path) no other job that declared that folder as its cwd or worktree
     finished more recently than that."""
-    days = load_policy().get("cloneExpiryDays", 3)
+    days = reap_policy().get("cloneExpiryDays", 3)
     if not ids or not isinstance(days, int) or isinstance(days, bool) or days <= 0:
         return False
     with db() as conn:
@@ -3281,7 +3327,7 @@ def reap_scratch_scope(path: str, private: bool = True) -> None:
 
 
 def reap_scratch_protected(path: str) -> bool:
-    if load_policy().get("agentScratchProtectedCopies", "keep") != "archive" or not reap_archive_on():
+    if reap_policy().get("agentScratchProtectedCopies", "keep") != "archive" or not reap_archive_on():
         return False
     try:
         reap_scratch_scope(path)
@@ -3295,7 +3341,7 @@ def reap_scratch_idle_budget(policy: dict | None = None) -> dict:
     how long it may take. A host may set the three keys in its policy. A budget that cannot be read fails closed: an entry
     budget of zero stops the walk at its first entry, a byte budget of one byte keeps every folder that holds a byte, and
     a time budget of zero stops the walk at once. A byte budget of zero is no byte bound at all (bytes bound no work)."""
-    policy = policy if policy is not None else load_policy()
+    policy = policy if policy is not None else reap_policy()
     def whole(key: str, fallback: int, minimum: int, closed: int) -> int:
         if key not in policy:
             return fallback
@@ -3330,7 +3376,7 @@ def reap_scratch_idle_proof(path: str, policy: dict | None = None, seconds: floa
     answer, so the receipt says why the folder stayed. The walk's own failures keep a folder that would otherwise be
     idle: an entry it cannot read, a protected name it must not enter, and expiry turned off. `seconds` is the caller's
     own time budget: the walk stops at the first entry past that deadline."""
-    policy = policy if policy is not None else load_policy()
+    policy = policy if policy is not None else reap_policy()
     budget = reap_scratch_idle_budget(policy)
     scratch = policy.get("agentScratchProtectedCopies", "keep") == "archive" and reap_scratch_protected(path)
     if seconds is not None:
@@ -3748,7 +3794,7 @@ def reap_job_finished_clock(conn, job: dict) -> float | None:
 def reap_scratch_expired(job_id: str | None) -> bool:
     """The job finished (done/failed/cancelled, or interrupted with a durable continuation) at least
     evidenceExpiryDays ago."""
-    days = evidence_expiry_days(load_policy())
+    days = evidence_expiry_days(reap_policy())
     if not job_id or not days:
         return False
     with db() as conn:
@@ -4700,7 +4746,7 @@ def reap_authority(item: dict) -> dict:
                 raise ReapRefused(f"inherited-by:{chain}({heir['status']})")
             chain = successors.get(chain)
     if item["class"] == "job-clone-root":
-        window = load_policy().get("cloneExpiryDays", 3)
+        window = reap_policy().get("cloneExpiryDays", 3)
         recent = reap_recent_users(scope, ids, window * 86400) if isinstance(window, int) and not isinstance(window, bool) and window > 0 else []
         if recent:
             raise ReapRefused(f"recently-used-by:{recent[0]}")  # a later job worked in this clone: it expires cloneExpiryDays after that job finished
@@ -4714,7 +4760,10 @@ def reap_authority(item: dict) -> dict:
                 raise ReapRefused(f"claimed-by:{job['id']}({job['status']})")
         wait = job_wait(job)
         if wait and wait["job"] in ids:
-            raise ReapRefused(f"awaited-by:{job['id']}({job['status']})")
+            with db() as conn:
+                lapsed = reap_pin_released(conn, job)
+            if not lapsed:
+                raise ReapRefused(f"awaited-by:{job['id']}({job['status']})")
     return {"source": "host-jobs", "owner": item["owner"], "jobs": {job_id: jobs[job_id]["status"] for job_id in ids}, "claims": []}
 
 
@@ -4782,6 +4831,33 @@ def reap_scratch_copy_current(fd: int, name: str, rel: str, expected: tuple, sav
             os.close(source)
     if digest.hexdigest() != saved["hashes"].get(rel) or reap_scratch_entry(os.stat(name, dir_fd=fd, follow_symlinks=False)) != expected:
         raise ReapRefused("scratch-protected-copy-changed:" + rel)
+
+
+REAP_ACL_ENTRY = re.compile(r"^\s*\d+:\s+\S+\s+deny\s+.*\bdelete(?:_child)?\b")
+REAP_ACL_LISTED = 40   # entries with an ACL looked at before a tree is given up on
+
+
+def reap_acl_denies(path: str, seconds: float = 10) -> str | None:
+    """The first entry at or below `path` (named relative to it, "." for `path` itself) whose macOS ACL denies delete, or None. Such
+    an entry cannot be removed by anyone who is not first allowed to change its ACL, and removing the ACL is a protection this
+    reaper never clears, so the folder is kept and named. `find -acl` (metadata only, one process) lists the entries that carry any
+    ACL; only those are read with `ls -le`. A platform without ACLs, a failed listing or a timeout finds nothing, and the removal's
+    own error then still names the cause."""
+    if os.uname().sysname != "Darwin":
+        return None
+    try:
+        found = subprocess.run(["/usr/bin/find", path, "-acl", "-print0"], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                               errors="replace", timeout=seconds)
+        for entry in found.stdout.split("\0")[:REAP_ACL_LISTED]:
+            if not entry:
+                continue
+            listing = subprocess.run(["/bin/ls", "-lde", "--", entry], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                     errors="replace", timeout=seconds)
+            if any(REAP_ACL_ENTRY.match(line) for line in listing.stdout.splitlines()):
+                return os.path.relpath(entry, path)
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        return None
+    return None
 
 
 def reap_empty_directory(fd: int, dev: int, depth: int, rel: str, tally: dict, allow_git: bool, templates: frozenset = frozenset(), base: str = "",
@@ -4901,6 +4977,10 @@ def reap_remove_and_verify(fence: list, path: str, before: list[dict], result: d
         cause = f"removal-stopped:{stop}"
     except Exception as error:
         cause = "removal-error:" + reap_named(error)
+        if isinstance(error, PermissionError):
+            denied = reap_acl_denies(path)
+            if denied:
+                cause += ":acl-deny-delete:" + denied[:80]
     finally:
         changed = reap_changed_identities(before)
         result["removed"] = tally["removed"]
@@ -5313,7 +5393,7 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
                 checks.append("cache-tag-locks")
             repos, proved, git_dirs, archive, templates, secrets = [], set(), [], None, frozenset(), []
             scratch = item["class"] == "agent-scratch" and reap_scratch_protected(item["path"])
-            protected_ok = whole_clone and load_policy().get("cloneProtectedCopies", "remove") == "remove"
+            protected_ok = whole_clone and reap_policy().get("cloneProtectedCopies", "remove") == "remove"
             try:
                 templates = reap_tracked_templates(item["path"]) if whole_clone else frozenset()
                 reap_protected_scan(item["path"], allow_git=allow_git, markers=True, repos=repos if allow_git else None, nested_disposable=whole_clone,
@@ -5551,7 +5631,7 @@ def reap_idle_map(live: list) -> dict:
 def reap_open_terminal_grace_hours(policy: dict | None = None) -> float:
     """`reapOpenTerminalGraceHours`: how long a finished job's still-open worker terminal may stay idle before it stops
     holding that job's folders (0 keeps every folder of a job whose terminal is open)."""
-    value = (policy or load_policy()).get("reapOpenTerminalGraceHours", 0)
+    value = (policy or reap_policy()).get("reapOpenTerminalGraceHours", 0)
     return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0 else 0.0
 
 
@@ -5663,8 +5743,8 @@ def reap_job_blocker(conn, job: dict, live_ids: set | None, idle: dict | None = 
         for sibling in rows(conn, "SELECT id,status FROM jobs WHERE terminal_id=? AND id!=?", (terminal, job["id"])):
             if sibling["status"] not in REAP_TERMINAL:
                 return f"terminal-shared-with:{sibling['id']}({sibling['status']})"
-    for other in rows(conn, "SELECT id,status,meta FROM jobs"):
-        if other["status"] not in REAP_TERMINAL:
+    for other in rows(conn, "SELECT * FROM jobs"):
+        if other["status"] not in REAP_TERMINAL and not reap_pin_released(conn, other):
             wait = job_wait(other)
             if wait and wait["job"] == job["id"]:
                 return f"awaited-by:{other['id']}({other['status']})"
@@ -5696,7 +5776,7 @@ def reap_revisit(job: dict, clones: list) -> dict:
     time to look: when cloneExpiryDays after the job finished make the clone removable, at the latest REAP_REVISIT_SECONDS."""
     if not any(os.path.lexists(root) for root, ids in clones if job["id"] in ids):
         return {"lingering": False}
-    days, revisit = load_policy().get("cloneExpiryDays", 3), now() + REAP_REVISIT_SECONDS
+    days, revisit = reap_policy().get("cloneExpiryDays", 3), now() + REAP_REVISIT_SECONDS
     if isinstance(days, int) and not isinstance(days, bool) and days > 0 and job.get("finished_at"):
         revisit = min(revisit, max(job["finished_at"] + days * 86400 + 60, now() + 60))
     return {"lingering": True, "revisitAt": revisit}
@@ -5796,7 +5876,7 @@ def reap_job_owned(conn, job: dict, dry_run: bool, actor: str, clones: list | No
                 return {**out, "deleted": 0, "reclaimedBytes": 0, "preserved": len(items), "dfDeltaBytes": 0, "reasons": ["reap-already-running"]}
         ctx = {"run": uuid.uuid4().hex[:12]}
         before = reap_free_bytes()
-        REAP_PRESSURE.on = pressure and disk_level(load_policy(), disk_state()) != "ok"
+        REAP_PRESSURE.on = pressure and disk_level(reap_policy(), disk_state()) != "ok"
         try:
             results, stopped = reap_sweep(items, "dry-run" if dry_run else "delete", ctx)
         finally:
@@ -6049,7 +6129,7 @@ def evidence_expire_job(conn, job: dict, days: int, dry_run: bool, actor: str) -
 def marked_evidence_expire_job(conn, job: dict, dry_run: bool) -> dict:
     """Existing guarded folder path, limited to expired marked job-cache children. Keeps the job root and records."""
     items = [i for i in reap_job_items(job, [])[0] if reap_marked_evidence_item(i)]
-    out = {"days": marked_evidence_expiry_days(load_policy()), "items": [], "dfDeltaBytes": 0}
+    out = {"days": marked_evidence_expiry_days(reap_policy()), "items": [], "dfDeltaBytes": 0}
     if not items:
         return {**out, **reap_summarize([])}
     with ExitStack() as stack:
@@ -6107,7 +6187,7 @@ def evidence_expire_job_owned(conn, job: dict, days: int, dry_run: bool, actor: 
         # five-day rule is already expiring its marked folders.
         unmarked_cutoff = cutoff if days and clock <= cutoff else float("-inf")
         files, kept = evidence_walk(root, unmarked_cutoff, deadline, marked=marked,
-                                   marked_cutoff=now() - marked_evidence_expiry_days(load_policy()) * 86400) if days or marked else ([], [])
+                                   marked_cutoff=now() - marked_evidence_expiry_days(reap_policy()) * 86400) if days or marked else ([], [])
     except ReapRefused as refusal:
         if str(refusal) != "evidence-scan-incomplete":
             raise
@@ -6281,7 +6361,7 @@ def evidence_expiry_owned(conn, days: int, due: list, actions: list, errors: lis
         conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",
                      (key, json.dumps({"at": now(), "next": now() + wait, "expired": out["expired"] if out else 0,
                                        "reason": out.get("reason") if out else "error",
-                                       "expiryRule": [days, marked_evidence_expiry_days(load_policy())]}, sort_keys=True)))
+                                       "expiryRule": [days, marked_evidence_expiry_days(reap_policy())]}, sort_keys=True)))
         marked = (out or {}).get("markedEvidence") or {}
         if out and (out["expired"] or marked.get("deleted")):
             worked += 1
@@ -6771,8 +6851,8 @@ def tool_reap_owned(params: dict) -> dict:
         if blocker and (not outputs_only or params.get("expireEvidence")):
             raise HostError(f"{job_id} is not reapable: {blocker}", "only finished jobs whose worker is gone are reaped; run reap-status for the state of every job")
         if params.get("expireEvidence"):
-            days = evidence_expiry_days(load_policy())
-            if not days and not marked_evidence_expiry_days(load_policy()):
+            days = evidence_expiry_days(reap_policy())
+            if not days and not marked_evidence_expiry_days(reap_policy()):
                 raise HostError("evidence expiry is off (both evidenceExpiryDays and markedEvidenceExpiryDays=0)",
                                 f"{REAP_CLI} policy-set markedEvidenceExpiryDays=5 turns marked expiry on")
             try:
@@ -6805,8 +6885,8 @@ def reap_audit_item(item: dict, blocker: str | None, ctx: dict, deadline: float)
             and item.get("kind") in REAP_DERIVED_KINDS:
         with db() as conn:
             job = row(conn, "SELECT * FROM jobs WHERE id=?", (item["owner"],))
-        idle_pressure = disk_level(load_policy(), disk_state()) != "ok"
-        if job and (idle_pressure or reap_idle_expired(job, load_policy())):
+        idle_pressure = disk_level(reap_policy(), disk_state()) != "ok"
+        if job and (idle_pressure or reap_idle_expired(job, reap_policy())):
             blocker = None  # every fresh authority/terminal/process proof still runs below
     if blocker:
         entry = {"state": "blocked", "blocking": blocker}
@@ -7123,6 +7203,6 @@ def reap_quick_summary(conn) -> dict:
         found, _ = reap_job_items(job, clones)
         jobs += 1 if found else 0
         items += len(found)
-    return {"finishedJobsWithArtifacts": jobs, "artifactDirs": items, "autoReap": load_policy().get("autoReap", False),
+    return {"finishedJobsWithArtifacts": jobs, "artifactDirs": items, "autoReap": reap_policy().get("autoReap", False),
             "note": f"sizes and blocking reasons: {REAP_CLI} reap-status"}
 # <<< trimreaper core <<<
