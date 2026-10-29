@@ -171,6 +171,20 @@ class ProjectSafety(Home):
         with self.assertRaisesRegex(clean.ReapRefused, "project-idle-policy-unproved"):
             clean.clean_extra_gates(entry)
 
+    def test_linked_worktree_symlinked_dependency_folder_refused(self):
+        # A job worktree outside the repository symlinks its node_modules-style folder back to the repository's copy.
+        worktree = Path(self.tmp) / "job-wt"
+        self.git(self.repo, "worktree", "add", "--detach", str(worktree))
+        link = worktree / ".next"
+        os.symlink(self.repo / ".next", link)
+        self.addCleanup(lambda: os.path.lexists(link) and os.unlink(link))
+        entry = self.entry("project-dependencies")
+        with self.assertRaisesRegex(clean.ReapRefused, "linked-worktree-symlink:.next"):
+            clean.clean_extra_gates(entry)
+        self.assertTrue(Path(entry["path"]).exists())
+        os.unlink(link)
+        clean.clean_extra_gates(entry)  # without the symlink the same folder is eligible again
+
     def test_broad_home_and_dev_cwd_do_not_claim_idle_repository(self):
         self.add_job("J-4242", cwd=self.home, status="running")
         self.add_job("J-4243", cwd=self.dev, status="running")
