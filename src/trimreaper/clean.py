@@ -1055,6 +1055,12 @@ def clean_repository_output_gates(entry: dict, table: dict | None) -> float:
                 raise ReapRefused(f"in-use-by-running-job:{job['id']}")
     if named_states and not named_states - {"done", "failed", "cancelled"}:
         limit = min(limit, CLEAN_PROJECT_JOB_IDLE_HOURS)
+    # A linked worktree (a job's copy) may symlink its dependency folder to this one, and it lives outside the repository
+    # folder, so the path checks above never see it. Refuse while any such worktree still points at the folder.
+    for worktree in clean_linked_worktrees(repo):
+        if os.path.islink(os.path.join(worktree["worktree"], os.path.basename(path))) and \
+                reap_canon(os.path.realpath(os.path.join(worktree["worktree"], os.path.basename(path)))) == reap_canon(path):
+            raise ReapRefused("linked-worktree-symlink:" + os.path.basename(path))
     reap_holders(repo, repo, table)
     return limit
 

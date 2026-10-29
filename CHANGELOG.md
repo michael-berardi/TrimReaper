@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.1 (2026-10-29)
+
+Fixes a dependency folder being removed while a live job still used it. A job's worktree outside the repository can symlink its
+`node_modules` to the repository's copy; the output gate only checked job paths inside the repository, so the folder was reaped and every
+sibling job then failed with `ERR_MODULE_NOT_FOUND`. The gate now refuses while any linked worktree of the repository still points at the
+folder (`linked-worktree-symlink:<name>`), and a test covers it. Once the symlink is gone the folder is eligible again.
+
 ## 0.9.0 (2026-10-26)
 
 Fixes a disk that stayed full. On one machine at 97% used the automatic clean logged `goalMet: false, freedBytes: -12460032` on every
