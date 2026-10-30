@@ -34,7 +34,7 @@ from pathlib import Path
 
 from .host import (  # noqa: F401  (the engine reads these as module globals)
     REAP_CLI, REAP_OWNER_DIRS, VERSION, HostError, actor_of, db, disk_level, disk_state, iso, job_meta, job_wait, live_all,
-    load_policy, log_event, now, reap_agent_scratch_root, reap_archive_root, reap_cache_root, reap_clone_bases,
+    load_policy, log_event, meta_json, now, reap_agent_scratch_root, reap_archive_root, reap_cache_root, reap_clone_bases,
     reap_home, reap_queue_state, reap_receipt_dir, reap_release_evidence_root, reap_release_marks, reap_release_root, require,
     row, rows, txn, whole_title, reap_output_ownership,
 )
@@ -42,7 +42,7 @@ from .host import (  # noqa: F401  (the engine reads these as module globals)
 # The names an embedding host must define before the engine runs (checked by tests/test_embedding.py).
 HOST_NAMES = (
     "REAP_CLI", "REAP_OWNER_DIRS", "VERSION", "HostError", "actor_of", "db", "disk_level", "disk_state", "iso", "job_meta",
-    "job_wait", "live_all", "load_policy", "log_event", "now", "reap_agent_scratch_root", "reap_archive_root", "reap_cache_root",
+    "job_wait", "live_all", "load_policy", "log_event", "meta_json", "now", "reap_agent_scratch_root", "reap_archive_root", "reap_cache_root",
     "reap_clone_bases", "reap_home", "reap_queue_state", "reap_receipt_dir", "reap_release_evidence_root",
     "reap_release_marks", "reap_release_root", "require", "row", "rows", "txn", "whole_title",
 )
@@ -58,6 +58,9 @@ REAP_SETTLE_SECONDS = 900             # a job that just finished may still be co
 REAP_CLOSED_SETTLE_SECONDS = 30       # ... unless its worker is already closed through the guarded cleanup: nothing can resume it
 REAP_RETRY_SECONDS = (900, 3600, 6 * 3600)   # wait after a pass that preserved something, by attempt
 REAP_TICK_JOBS = 2                    # jobs with artifacts one tick may reap
+REAP_TICK_JOBS_PRESSURE = 8           # ... while the disk is at or above diskWarnPercent (Mike 2026-10-29: the disk filled in a day)
+REAP_SIZE_TTL = 6 * 3600              # a job folder's recorded size is re-measured after this long
+REAP_SIZE_MEASURE_SECONDS = 20        # wall-clock budget for measuring unmeasured job folders in one tick
 REAP_TICK_SECONDS = 60                # wall-clock budget of one tick's reaping
 REAP_REGENERABLE = ("node_modules", ".next", ".open-next", "target", ".turbo", ".astro", "dist")
 # Protected names are leaves the reaper NEVER enters (discovery, checks or removal): there is no carve-out below them (not
@@ -208,7 +211,7 @@ REAP_RELEASE_VERSION_BYTES = 1 << 20  # a bundle's Info.plist is small; a bigger
 REAP_RELEASE_VERSION = re.compile(r"(\d+\.\d+\.\d+)")
 REAP_WALK_ENTRIES = 500000            # entries the names-only protected scan may list before it refuses
 REAP_MAX_DEPTH = 128                  # directory levels a scan or the removal descends; deeper fails closed
-REAP_AUDIT_SECONDS = 240              # default wall-clock budget of one reap-status sizing pass
+REAP_AUDIT_SECONDS = 60               # default wall-clock budget of one reap-status sizing pass; under the 120 s shell guard so a bare reap-status returns
 REAP_RECEIPT_LOCK_SECONDS = 10        # bounded blocking wait for the receipt file lock; a longer wait is receipt-unavailable:lock-timeout
 REAP_UNSAFE_CONFIG_SECTIONS = ("include", "includeif", "filter")   # Git config sections that read another file or run a command
 REAP_JOB_NUMBER = re.compile(r"(?:^|[-_.])(?:[jJ]|J-)(\d{4,5})(?!\d)")  # foo-j0349, j0349-foo, .j0349, foo-J-0349, J-0349 (dashed: uppercase only)
@@ -1944,6 +1947,37 @@ def reap_no_retained_names(path: str) -> bool:
     return not hit
 
 
+REAP_PACKAGE_TREES = ("node_modules", "site-packages", "dist-packages", ".venv", "venv", "__pycache__", ".pnpm-store", "bower_components")
+REAP_SECRET_SUFFIXES = (".p8", ".p12", ".pem", ".pfx", ".cer", ".crt", ".key", ".csr", ".jks", ".keystore", ".p7b", ".p7c",
+                        ".mobileprovision", ".ovpn", ".ppk", ".pkg", ".dmg", ".ipa", ".xcarchive", ".app", ".sig", ".asc")
+REAP_SECRET_NAMES = re.compile(r"(?:id_(?:rsa|dsa|ecdsa|ed25519)(?:\.pub)?|known_hosts|authorized_keys|\.?netrc|\.?npmrc|\.?pypirc|"
+                               r"\.?htpasswd|auth\.json|credentials?(?:\.[a-z]+)?|.*service[-_ ]?account.*\.json|.*adminsdk.*\.json|"
+                               r"\.env.*|\.dev\.vars.*|keychain.*|.*\.keychain(?:-db)?)", re.I)
+
+
+def reap_no_secret_material(path: str) -> bool:
+    """True when nothing below the folder is key, credential, signing or release material. Unlike reap_no_retained_names
+    this ignores words that only sound like a record ("tokenizer", "report.py", "runtime.js") and anything inside an
+    installed package tree (a bundled CA file in a virtualenv is public). Used only for a job that finished past its
+    expiry window (2026-10-29: 5.7 GB of expired dependency and download folders were kept for names like those).
+    A walk that cannot complete keeps the folder."""
+    hit = []
+    def listing(rel, names):
+        parts = {reap_fold(p) for p in Path(rel).parts} if rel else set()
+        if parts & set(REAP_PACKAGE_TREES):
+            return
+        for name in names:
+            low = name.lower()
+            if low.endswith(REAP_SECRET_SUFFIXES) or REAP_SECRET_NAMES.fullmatch(name):
+                hit.append(name)
+                return
+    try:
+        reap_fd_walk(path, lambda rel, name, info, level, device: True, REAP_WALK_ENTRIES, listing=listing)
+    except (OSError, ReapRefused):
+        return False
+    return not hit
+
+
 def reap_item_retention(item: dict, prove: bool = True) -> str:
     """A marker decides; without one, `disposable` is derived only in the three self-cleaning cases (see REAP_DERIVED_KINDS).
 
@@ -2001,6 +2035,8 @@ def reap_item_retention(item: dict, prove: bool = True) -> str:
     if cls == "job-cache-subdir" and reap_fold(os.path.basename(item["path"])) not in EVIDENCE_KEEP_DIRS and item.get("owner") \
             and reap_cache_retention(str(reap_cache_root() / item["owner"])) in ("unmarked", REAP_DISPOSABLE):  # only a preserving parent marker keeps it all
         if (reap_cachedir_tagged(item["path"]) or reap_scratch_expired(item["owner"])) and reap_no_retained_names(item["path"]):
+            return REAP_DISPOSABLE
+        if reap_scratch_expired(item["owner"]) and reap_no_secret_material(item["path"]):
             return REAP_DISPOSABLE
     if cls == "agent-scratch":
         # A marker decides; only an unmarked folder is judged by its own idle proof, and the proof (its reason, its counts
@@ -4538,6 +4574,42 @@ def reap_output_order(items: list[dict]) -> list[dict]:
     return sorted(items, key=lambda i: (i["class"] == "job-clone-root", -scores.get(i["path"], -1)))
 
 
+def reap_job_dir_bytes(conn, job_id: str, deadline: float) -> int:
+    """The job cache folder's size, from the meta index when fresh, else measured with du -sk within the tick budget.
+    Unmeasured folders count as 0 so they are measured on a later tick instead of stalling this one."""
+    key = "reap:size:" + job_id
+    cached = meta_json(conn, key)
+    if cached and now() - float(cached.get("at", 0)) < REAP_SIZE_TTL:
+        return int(cached.get("bytes") or 0)
+    if time.monotonic() >= deadline:
+        return int((cached or {}).get("bytes") or 0)
+    folder = reap_cache_root() / job_id
+    if not folder.is_dir():
+        size = 0
+    else:
+        try:
+            out = subprocess.run(["du", "-xsk", str(folder)], capture_output=True, text=True,
+                                 timeout=max(1.0, deadline - time.monotonic()))
+            size = int(out.stdout.split()[0]) * 1024 if out.stdout.strip() else 0
+        except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+            return int((cached or {}).get("bytes") or 0)
+    conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (key, json.dumps({"bytes": size, "at": now()})))
+    return size
+
+
+def reap_largest_first(conn, jobs: list[dict]) -> list[dict]:
+    """Finished jobs, largest job folder first (Mike 2026-10-29). Oldest-first ordering with a two-job budget never reached
+    the large recent folders, so a day of heavy jobs filled the disk while the reaper worked through old, small ones."""
+    deadline = time.monotonic() + REAP_SIZE_MEASURE_SECONDS
+    if conn is None:
+        # Callers without a connection (a standalone sweep) still get largest-first ordering on their own short one.
+        with db() as own:
+            sizes = {job["id"]: reap_job_dir_bytes(own, job["id"], deadline) for job in jobs}
+    else:
+        sizes = {job["id"]: reap_job_dir_bytes(conn, job["id"], deadline) for job in jobs}
+    return sorted(jobs, key=lambda job: -sizes.get(job["id"], 0))
+
+
 def reap_output_job_order(jobs: list[dict], clones: list) -> list[dict]:
     candidates, deadline = [], time.monotonic() + REAP_OUTPUT_SCHEDULE_SECONDS
     for job in jobs[:REAP_OUTPUT_SCHEDULE_ITEMS]:
@@ -5005,6 +5077,27 @@ REAP_CLEANUP_OWNER = threading.local()
 REAP_CLEANUP_JOURNAL_BYTES = 4 * 1024 * 1024
 
 
+def reap_dead_owner_note(previous: dict | None, phase: str) -> str | None:
+    """Why an unfinished cleanup handoff may be recorded as reviewed without a person, else None: the note is a well-formed
+    'started' record (the sweep was killed: timeout, crash, reboot) whose owner process no longer exists. An error
+    ('interrupted'), a deliberate stop ('stopped'), a fragment, an invalid journal or a live or unknown owner still needs
+    the explicit acknowledgment."""
+    if phase != "started" or not isinstance(previous, dict):
+        return None  # "interrupted" means the sweep raised an error: that is a defect to look at, not a kill
+    pid = previous.get("pid")
+    if type(pid) is not int or pid <= 1 or pid == os.getpid():
+        return None
+    try:
+        os.kill(pid, 0)
+        return None  # alive: it may still be sweeping
+    except ProcessLookupError:
+        pass
+    except OSError:
+        return None  # cannot tell: keep the human acknowledgment
+    return (f"auto-acknowledged: owner pid {pid} of run {previous.get('run')} ({previous.get('scope')}) exited without a final note; "
+            "every planned path passed its gates before its plan receipt and the next sweep re-runs every fresh gate")
+
+
 @contextmanager
 def reap_cleanup_owner(scope: str, acknowledge: dict | None = None, inspect: bool = False, expected: str | None = None):
     """One deleting worker per artifact home, across jobs, releases, ticks and state directories.
@@ -5099,7 +5192,20 @@ def reap_cleanup_owner(scope: str, acknowledge: dict | None = None, inspect: boo
                 if acknowledge["run"] != token:
                     raise ReapRefused("cleanup-acknowledge-stale:read-current-owner-status")
             elif phase not in ("none", "finished", "acknowledged"):
-                raise ReapRefused("cleanup-handoff-incomplete:previous-worker; read reap-owner-status and acknowledge reviewed notes and receipts")
+                dead = reap_dead_owner_note(previous, phase)
+                if not dead:
+                    raise ReapRefused("cleanup-handoff-incomplete:previous-worker; read reap-owner-status and acknowledge reviewed notes and receipts")
+                # A killed sweep (a timeout, a crash, a reboot) left no final note. Its owner is gone, and every path it planned
+                # passed every gate before its plan receipt; the next sweep re-runs all fresh gates on whatever is left. Record
+                # that review in the journal instead of blocking all cleanup until a person signs off (2026-10-29: one killed
+                # run stopped every reap, the tick's included, and the disk kept filling).
+                auto = (json.dumps({"run": token, "pid": previous.get("pid"), "scope": previous.get("scope"), "phase": "acknowledged",
+                                    "outcome": dead, "auto": True, "at": iso()}, sort_keys=True) + "\n").encode()
+                if tail and not tail.endswith(b"\n"):
+                    auto = b"\n" + auto
+                if os.write(fd, auto) != len(auto):
+                    raise ReapRefused("cleanup-handoff-unavailable:short-write")
+                reap_durable(fd)
             owner = {"pid": os.getpid(), "root": str(root), "run": uuid.uuid4().hex[:12], "scope": scope,
                      "receipts": str(reap_receipt_dir()), "previousRun": token if tail or history else None}
             if acknowledge:
@@ -6044,6 +6150,9 @@ def evidence_walk(root: str, cutoff: float, deadline: float, marked: bool = Fals
         if folded & set(EVIDENCE_SKIP_MARKERS):
             kept.append(f"{rel or '.'}:tool-cache")
             return
+        if not rel and "fixtures" in folded:
+            kept.append("fixtures:fixture-namespace")  # the fixture lifecycle owns that folder, never evidence expiry
+            names = [n for n in names if reap_fold(n) != "fixtures"]
         for name in names:
             sub = f"{rel}/{name}" if rel else name
             info = os.stat(name, dir_fd=fd, follow_symlinks=False)
@@ -6175,6 +6284,19 @@ def evidence_expire_job_owned(conn, job: dict, days: int, dry_run: bool, actor: 
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
         return {**out, "reason": "job-folder-not-a-real-directory"}
     item = {"class": "job-cache-subdir", "owner": job["id"], "jobs": [job["id"]], "root": root, "path": root}
+    evidence_root = globals().get("_FIXTURE_EVIDENCE_ROOT")
+    previous_root = getattr(evidence_root, "path", None) if evidence_root is not None else None
+    if evidence_root is not None:
+        evidence_root.path = root
+    try:
+        return evidence_expire_job_rooted(conn, job, days, dry_run, out, cutoff, clock, root, info, item, actor)
+    finally:
+        if evidence_root is not None:
+            evidence_root.path = previous_root
+
+
+def evidence_expire_job_rooted(conn, job: dict, days: int, dry_run: bool, out: dict, cutoff: float, clock: float, root: str,
+                               info, item: dict, actor: str) -> dict:
     authority = reap_authority(item)
     out["markedEvidence"] = marked_evidence_expire_job(conn, job, dry_run)
     if out["markedEvidence"].get("stopped"):
@@ -6512,8 +6634,9 @@ def reap_tick_owned(conn, policy: dict, live: list, actions: list, errors: list,
     live_ids, started, attempted, reaped = {s["id"] for s in live}, time.monotonic(), 0, False
     live_idle = reap_idle_map(live)
     cleanup_owner = getattr(REAP_CLEANUP_OWNER, "held", None)
-    for job in reap_output_job_order(due, clones):
-        if attempted >= REAP_TICK_JOBS or time.monotonic() - started > REAP_TICK_SECONDS:
+    budget = REAP_TICK_JOBS_PRESSURE if disk_level(policy, disk_state()) != "ok" else REAP_TICK_JOBS
+    for job in reap_output_job_order(reap_largest_first(conn, due), clones):
+        if attempted >= budget or time.monotonic() - started > REAP_TICK_SECONDS:
             break
         outcome = reap_one(conn, job, live_ids, clones, errors, live_idle)
         held = cleanup_owner or getattr(REAP_CLEANUP_OWNER, "held", None)

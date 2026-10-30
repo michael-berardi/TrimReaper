@@ -50,7 +50,8 @@ class RetainedNamesBelowTheFolder(Home):
     config_extra = {"policy": {"evidenceExpiryDays": 1, "markedEvidenceExpiryDays": 5, "cloneArchive": "keep"}}
 
     def test_a_nested_retained_name_keeps_the_whole_folder(self):
-        self.add_job("J-0060", finished_ago=2 * DAY)
+        # Within evidenceExpiryDays: past it, RetainedNamesAfterExpiry applies.
+        self.add_job("J-0060", finished_ago=DAY // 2)
         root = self.home / ".cache/trimreaper/jobs/J-0060"
         child = self.put(root, "build/final-report.md").parent
         self.assertFalse(core.reap_no_retained_names(str(child)))
@@ -109,3 +110,27 @@ class DurableRecord(Home):
         root.mkdir(parents=True, exist_ok=True)
         (root / "report.md").write_bytes(b"the record\n")
         self.assertTrue(core.marked_evidence_job("J-0060"))
+
+
+class RetainedNamesAfterExpiry(Home):
+    """Synthetic. Past evidenceExpiryDays a name that only sounds like a record no longer keeps a finished job's folder
+    (2026-10-29: 5.7 GB of expired dependency and download folders were kept for names like report.py or tokenizer);
+    key, credential and signing material still does."""
+    config_extra = {"policy": {"evidenceExpiryDays": 1, "markedEvidenceExpiryDays": 5, "cloneArchive": "keep"}}
+
+    def test_an_expired_record_name_no_longer_keeps_the_folder(self):
+        self.add_job("J-0061", finished_ago=2 * DAY)
+        root = self.home / ".cache/trimreaper/jobs/J-0061"
+        child = self.put(root, "build/final-report.md").parent
+        out = self.cli("reap", "--job", "J-0061")
+        self.assertEqual(out["deleted"], 1, out)
+        self.assertFalse(child.exists())
+
+    def test_expired_key_material_still_keeps_the_folder(self):
+        self.add_job("J-0062", finished_ago=2 * DAY)
+        root = self.home / ".cache/trimreaper/jobs/J-0062"
+        child = self.put(root, "build/deploy.pem").parent
+        out = self.cli("reap", "--job", "J-0062")
+        self.assertEqual(out["deleted"], 0, out)
+        self.assertTrue((child / "deploy.pem").exists())
+

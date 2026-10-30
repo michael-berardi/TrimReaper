@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.10.1 (2026-10-30)
+
+Brings four fixes UltraTerm made in its embedded copy back into TrimReaper, so both run the same engine:
+
+- The job reaper sweeps the largest finished job folders first, and takes up to eight jobs per tick while the disk is under
+  pressure. Oldest-first with a two-job budget never reached the large recent folders.
+- Past `evidenceExpiryDays`, a finished job's folder is no longer kept for names that only sound like records (`report.py`,
+  `tokenizer`); key, credential and signing material still keeps it.
+- A sweep that was killed (timeout, crash, reboot) and whose process is gone no longer blocks every later cleanup until a person
+  acknowledges it. An error or a deliberate stop still needs the acknowledgment.
+- `reap-status` stays under a two-minute shell guard by default (60 s sizing budget).
+
+Hosts now provide `meta_json` (docs/EMBEDDING.md).
+
 ## 0.10.0 (2026-10-30)
 
 New clean target `dedupe-clones`. Agent jobs that check out the same repository each keep their own copy of its large tracked files: on
