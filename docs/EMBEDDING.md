@@ -75,6 +75,7 @@ conservative admission fallback; goals remain `null`, never inferred from shared
 | `row(conn, sql, args)`, `rows(conn, sql, args)` | One row as a dict (or `None`); every row as dicts. |
 | `txn(conn)` | Context manager: `BEGIN IMMEDIATE` ... `COMMIT`, `ROLLBACK` on error. |
 | `log_event(conn, kind, subject, actor, data)` | Append an event. |
+| `meta_json(conn, key)` | The JSON object stored under `key` in the meta table, or `{}`. |
 | `load_policy()` | The policy dict with **every** key in CONFIGURATION.md present. The engine's fallbacks for a missing key are not the standalone defaults (a missing `cloneProtectedCopies` reads as `"remove"`). |
 | `require(params, key)`, `actor_of(params)` | Parameter helpers for the `tool_*` entry points. |
 | `job_meta(job)`, `job_wait(job)` | A job's meta dict; the `{"job": id}` it waits on, or `None`. |

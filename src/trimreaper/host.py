@@ -446,6 +446,16 @@ def rows(conn, sql: str, args=()):
     return [dict(found) for found in conn.execute(sql, args).fetchall()]
 
 
+def meta_json(conn, key: str) -> dict:
+    """A JSON object stored in the meta table, or {} when absent or unreadable."""
+    stored = row(conn, "SELECT value FROM meta WHERE key=?", (key,))
+    try:
+        value = json.loads(stored["value"]) if stored else {}
+    except (ValueError, TypeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
 @contextmanager
 def txn(conn):
     conn.execute("BEGIN IMMEDIATE")
