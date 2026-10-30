@@ -165,7 +165,7 @@ CLEAN_FOLDERS = (
      "roots": lambda: [clean_home("Library", "Developer", "Xcode", "DerivedData")]},
 )
 CLEAN_WORKTREES = "worktrees"
-CLEAN_EXTRA_NAMES = ("rust-build-output", "project-dependencies", "agent-leftovers", "browser-clones", "playwright", "finished-jobs")
+CLEAN_EXTRA_NAMES = ("rust-build-output", "project-dependencies", "agent-leftovers", "browser-clones", "playwright", "finished-jobs", "dedupe-clones")
 CLEAN_RUST_BUSY = ("cargo", "rustc", "rust-analyzer", "clippy", "clippy-driver", "cargo-clippy")
 CLEAN_NAMES = tuple(t["name"] for t in CLEAN_TOOLS) + tuple(f["name"] for f in CLEAN_FOLDERS) + (CLEAN_WORKTREES,) + CLEAN_EXTRA_NAMES
 
@@ -177,7 +177,7 @@ CLEAN_NAMES = tuple(t["name"] for t in CLEAN_TOOLS) + tuple(f["name"] for f in C
 # after a verified archive of it (bundles for commits, a hashed tar for files).
 CLEAN_RUNGS = ("routine", "idle-repositories", "worktrees-and-finished-jobs", "pinned-folders", "unmarked-retention", "archive-then-remove")
 CLEAN_STEADY = "steady"
-CLEAN_STEADY_NAMES = ("rust-build-output", "project-dependencies", "finished-jobs")   # the quiet pass takes nothing else
+CLEAN_STEADY_NAMES = ("rust-build-output", "project-dependencies", "finished-jobs", "dedupe-clones")   # the quiet pass takes nothing else
 CLEAN_POLICY = {"cleanEscalate": True, "cleanEscalateRepoHours": 2, "cleanEscalateWorktreeHours": 24, "cleanEscalateJobHours": 24,
                 "cleanEscalatePinnedHours": 24, "cleanSteadyHours": 6, "cleanSteadyRepoDays": 3, "cleanSteadyJobHours": 48,
                 "worktreeIdleDays": 7, "projectIdleHours": 48}   # the fallbacks of a host whose policy predates a key
@@ -1818,6 +1818,7 @@ def clean_pass_run(dry_run: bool, deep: bool, only: list | None, report: bool, p
         clean_size_all(sized)  # the blockers by bytes: only when the goal is still unmet, and only for the last rung's view
         for entry in sized:
             entry["paths"] = []
+    dedupe_out = clean_dedupe(chosen, dry_run) if CLEAN_DEDUPE_NAME in chosen and (dry_run or steady or initial["goalMet"] is not True) else None
     if not dry_run:
         clean_forget_refusals()
     all_entries = sorted(merged.values(), key=lambda e: ("keep" in e, -(e.get("bytes") or 0)))
@@ -1840,6 +1841,8 @@ def clean_pass_run(dry_run: bool, deep: bool, only: list | None, report: bool, p
            "rungs": reports, "topBlockers": clean_blockers(all_entries, jobs_kept),
            "items": [clean_shown(e) for e in all_entries], "skippedRepos": skipped,
            "errors": errors + [{"clean": e["name"], "path": clean_tilde(e.get("path") or ""), "error": e["outcome"], "reason": e.get("reason")} for e in failed]}
+    if dedupe_out is not None:
+        out["dedupe"] = dedupe_out
     if not dry_run:
         out["diskAfter"] = after
     if stopped:
@@ -1847,6 +1850,173 @@ def clean_pass_run(dry_run: bool, deep: bool, only: list | None, report: bool, p
     if report:
         out["report"] = clean_inventory()
     return out
+
+
+# ---- clone-dedupe ---------------------------------------------------------------------------------------------------------------
+# Agent jobs often check out the same repository again and again; each copy holds the same large tracked files. On APFS a clone
+# shares the blocks of its source until either is written, so replacing a duplicate with a clone of its twin frees the space while
+# every path keeps its exact bytes, mode and times and stays independently writable. Nothing is deleted. Executables and Mach-O
+# files are never touched (rewriting code changes how macOS validates it; 2026-10-30 compressed binaries were SIGKILLed), nor
+# anything under .git, a symlink, a hard-linked file, or a file changed in the last six hours. A running job's folder is never
+# entered. macOS only (`cp -c` is APFS clonefile); elsewhere the target says why it was skipped.
+CLEAN_DEDUPE_NAME = "dedupe-clones"
+CLEAN_DEDUPE_MIN_BYTES = 256 * 1024
+CLEAN_DEDUPE_MIN_AGE_SECONDS = 6 * 3600
+CLEAN_DEDUPE_LIVE = ("running", "starting")
+CLEAN_DEDUPE_TEMP = ".trimreaper-clone"
+CLEAN_DEDUPE_MACHO = frozenset({b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe", b"\xca\xfe\xba\xbe",
+                                b"\xfe\xed\xfa\xcf", b"\xfe\xed\xfa\xce", b"\xbe\xba\xfe\xca"})
+
+
+def clean_dedupe_clone(source: str, target: str) -> None:
+    """APFS clone of `source` at `target` (a new path). Raises OSError with the cause."""
+    if os.uname().sysname != "Darwin":
+        raise OSError("APFS clones need macOS")
+    done = subprocess.run(["/bin/cp", "-c", source, target], capture_output=True, text=True, errors="replace", timeout=300)
+    if done.returncode != 0:
+        raise OSError(f"cp -c failed: {(done.stderr or '').strip()[:200]}")
+
+
+def clean_dedupe_candidate(path: str, at: float):
+    """The file's lstat when it may be cloned over, else None."""
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return None
+    if (not stat.S_ISREG(info.st_mode) or info.st_size < CLEAN_DEDUPE_MIN_BYTES or info.st_nlink != 1 or info.st_mode & 0o111
+            or at - max(info.st_mtime, info.st_ctime) < CLEAN_DEDUPE_MIN_AGE_SECONDS or path.endswith(CLEAN_DEDUPE_TEMP)):
+        return None
+    try:
+        with open(path, "rb") as handle:
+            if handle.read(4) in CLEAN_DEDUPE_MACHO:
+                return None
+    except OSError:
+        return None
+    return info
+
+
+def clean_dedupe_walk(roots: list, at: float):
+    """Candidate (path, lstat) pairs below the roots, same device as each root, never entering .git or a symlink."""
+    for root in roots:
+        try:
+            device = os.lstat(root).st_dev
+        except OSError:
+            continue
+        for folder, dirs, files in os.walk(root):
+            kept = []
+            for name in dirs:
+                try:
+                    info = os.lstat(os.path.join(folder, name))
+                except OSError:
+                    continue
+                if name != ".git" and stat.S_ISDIR(info.st_mode) and info.st_dev == device:
+                    kept.append(name)
+            dirs[:] = kept
+            for name in files:
+                full = os.path.join(folder, name)
+                info = clean_dedupe_candidate(full, at)
+                if info is not None and info.st_dev == device:
+                    yield full, info
+
+
+def clean_dedupe_hash(path: str) -> str:
+    digest = hashlib.blake2b(digest_size=20)
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def clean_dedupe_roots(cache_root, scratch_root, statuses: dict) -> list:
+    """Job folders whose job is not live (a folder no job names is skipped), plus agent scratch."""
+    roots = []
+    if cache_root and os.path.isdir(cache_root) and not os.path.islink(cache_root):
+        for name in sorted(os.listdir(cache_root)):
+            full = os.path.join(cache_root, name)
+            status = statuses.get(name)
+            if status and status not in CLEAN_DEDUPE_LIVE and os.path.isdir(full) and not os.path.islink(full):
+                roots.append(full)
+    if scratch_root and os.path.isdir(scratch_root) and not os.path.islink(scratch_root):
+        roots.append(scratch_root)
+    return roots
+
+
+def clean_dedupe_run(roots: list, dry_run: bool, at: float | None = None, clone=None) -> dict:
+    """Plan (dry run) or perform the clone-dedupe below `roots`. Each replacement is atomic: the original is untouched unless a
+    verified clone of its byte-identical twin is renamed over it."""
+    clone = clone or clean_dedupe_clone
+    result = {"name": CLEAN_DEDUPE_NAME, "dryRun": dry_run, "roots": len(roots), "files": 0, "bytes": 0, "errors": []}
+    if os.uname().sysname != "Darwin":
+        result["skipped"] = "APFS clones need macOS"
+        return result
+    at = time.time() if at is None else at
+    by_size = {}
+    for path, info in clean_dedupe_walk(roots, at):
+        by_size.setdefault(info.st_size, []).append((path, info))
+    for size, group in by_size.items():
+        if len(group) < 2:
+            continue
+        by_hash = {}
+        for path, info in group:
+            try:
+                by_hash.setdefault(clean_dedupe_hash(path), []).append((path, info))
+            except OSError:
+                continue
+        for digest, same in by_hash.items():
+            if len(same) < 2:
+                continue
+            same.sort(key=lambda pair: pair[0])  # deterministic: the first path by name is the source the others share
+            source = same[0][0]
+            for target, scanned in same[1:]:
+                if dry_run:
+                    result["files"] += 1
+                    result["bytes"] += size
+                    continue
+                temp = target + CLEAN_DEDUPE_TEMP
+                try:
+                    clone(source, temp)
+                    current = os.lstat(target)
+                    unchanged = (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns) == \
+                                (scanned.st_dev, scanned.st_ino, scanned.st_size, scanned.st_mtime_ns)
+                    if not unchanged or clean_dedupe_hash(target) != digest or clean_dedupe_hash(temp) != digest:
+                        os.unlink(temp)
+                        continue  # changed since the scan: left exactly as it is
+                    os.chmod(temp, stat.S_IMODE(current.st_mode))
+                    os.utime(temp, ns=(current.st_atime_ns, current.st_mtime_ns))
+                    os.rename(temp, target)
+                    result["files"] += 1
+                    result["bytes"] += size
+                except OSError as error:
+                    result["errors"].append({"path": clean_tilde(target), "error": str(error)})
+                    try:
+                        os.unlink(temp)
+                    except OSError:
+                        pass
+    return result
+
+
+def clean_dedupe(chosen: set, dry_run: bool) -> dict:
+    """Clone byte-identical data files in job folders whose job is not running, and in agent scratch (dedupe.py). Removes nothing;
+    the receipt says how many files and bytes were shared and how much the volume gained."""
+    try:
+        with db() as conn:
+            statuses = {r["id"]: r["status"] for r in rows(conn, "SELECT id, status FROM jobs")}
+        cache, scratch = str(reap_cache_root()), None
+        try:
+            scratch = str(reap_agent_scratch_root())
+        except Exception:
+            scratch = None
+        roots = clean_dedupe_roots(cache, scratch, statuses)
+    except Exception as error:  # an unreadable job table plans nothing: a live job's folder is never guessed at
+        return {"name": CLEAN_DEDUPE_NAME, "dryRun": dry_run, "skipped": f"job states unreadable: {error}", "files": 0, "bytes": 0, "errors": []}
+    before = clean_free()
+    if dry_run:
+        return clean_dedupe_run(roots, True)
+    with reap_cleanup_owner("clean"):
+        result = clean_dedupe_run(roots, False)
+    after = clean_free()
+    result["freedBytes"] = None if None in (before, after) else after - before
+    return result
 
 
 CLEAN_PASS = clean_pass  # the pass itself, whatever a host later binds the name clean_pass to (UltraTerm wraps it to watch pressure passes)

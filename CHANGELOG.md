@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.10.0 (2026-10-30)
+
+New clean target `dedupe-clones`. Agent jobs that check out the same repository each keep their own copy of its large tracked files: on
+one Mac about 25 parked or cancelled jobs held about 45 GB of byte-identical files. On APFS the target replaces each duplicate data file
+with a clone of one copy, so the space is shared until a file is written. Nothing is deleted, and every path keeps its exact bytes, mode
+and times. It never touches executables or Mach-O files, `.git`, symlinks, hard links, files changed in the last six hours, or a running
+job's folder. Each swap is verified and atomic: a file that changed since the scan is left as it was. Off macOS it reports why it skipped.
+
 ## 0.9.1 (2026-10-29)
 
 Fixes a dependency folder being removed while a live job still used it. A job's worktree outside the repository can symlink its
