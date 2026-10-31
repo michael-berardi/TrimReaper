@@ -8,7 +8,7 @@ from pathlib import Path
 
 from trimreaper import clean, cli, core, host
 
-STDLIB = {"errno", "fcntl", "hashlib", "json", "os", "plistlib", "pwd", "re", "shutil", "sqlite3", "stat", "subprocess", "tarfile",
+STDLIB = {"ctypes", "struct", "errno", "fcntl", "hashlib", "json", "os", "plistlib", "pwd", "re", "shutil", "sqlite3", "stat", "subprocess", "tarfile",
           "tempfile", "threading", "time", "unicodedata", "uuid", "ExitStack", "contextmanager", "Path"}
 
 

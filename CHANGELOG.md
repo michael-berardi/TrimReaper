@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.10.2 (2026-10-30)
+
+Fixes `dedupe-clones` overstating what it saved and redoing finished work. It counted every byte-identical pair as freed, even pairs
+that already shared their storage from an earlier pass, and cloned them again. On one Mac a pass reported 30 GB while the disk gained
+3.8 GB. It now reads each file's private size (APFS `ATTR_CMNEXT_PRIVATESIZE`): a file that already shares every block is skipped and
+counted as `alreadyShared`, and the reported bytes are only the bytes a clone actually frees.
+
 ## 0.10.1 (2026-10-30)
 
 Brings four fixes UltraTerm made in its embedded copy back into TrimReaper, so both run the same engine:
