@@ -5077,6 +5077,29 @@ REAP_CLEANUP_OWNER = threading.local()
 REAP_CLEANUP_JOURNAL_BYTES = 4 * 1024 * 1024
 
 
+def reap_run_has_receipts(run: str) -> bool:
+    """True when any reaper receipt names this cleanup run, or when the receipts cannot be read (fail closed)."""
+    try:
+        directory = reap_receipt_dir()
+        if not directory.is_dir():
+            return False  # no receipt directory: no plan receipt was ever durable, so nothing could have been removed
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if not (entry.name.startswith("receipts-") and entry.name.endswith(".jsonl")):
+                    continue
+                with open(entry.path, "rb") as handle:
+                    for line in handle:
+                        try:
+                            record = json.loads(line)
+                        except ValueError:
+                            continue  # a torn fragment cannot name a run; a complete record is checked below
+                        if isinstance(record, dict) and record.get("cleanupOwnerRun") == run:
+                            return True
+    except OSError:
+        return True  # cannot read the receipts: keep the human acknowledgment
+    return False
+
+
 def reap_dead_owner_note(previous: dict | None, phase: str) -> str | None:
     """Why an unfinished cleanup handoff may be recorded as reviewed without a person, else None: the note is a well-formed
     'started' record (the sweep was killed: timeout, crash, reboot) whose owner process no longer exists. An error
@@ -5094,6 +5117,10 @@ def reap_dead_owner_note(previous: dict | None, phase: str) -> str | None:
         pass
     except OSError:
         return None  # cannot tell: keep the human acknowledgment
+    # A failed final note leaves 'started' behind even when the sweep already removed work. Any receipt the dead run wrote
+    # (plan, archive, result) proves it may have touched paths, so only a person may review that run. Unreadable receipts fail closed.
+    if reap_run_has_receipts(previous.get("run")):
+        return None
     return (f"auto-acknowledged: owner pid {pid} of run {previous.get('run')} ({previous.get('scope')}) exited without a final note; "
             "every planned path passed its gates before its plan receipt and the next sweep re-runs every fresh gate")
 
