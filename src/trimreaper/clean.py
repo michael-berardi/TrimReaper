@@ -17,10 +17,12 @@ Everything between the `trimreaper clean` markers can be vendored byte for byte 
 """
 from __future__ import annotations
 
+import ctypes
 import json
 import re
 import os
 import shutil
+import struct
 import subprocess
 import time
 import uuid
@@ -1895,6 +1897,25 @@ def clean_dedupe_candidate(path: str, at: float):
     return info
 
 
+def clean_dedupe_private_bytes(path: str):
+    """Bytes of this file that no other file shares (APFS ATTR_CMNEXT_PRIVATESIZE), or None when it cannot be read. A file that is
+    already a clone of its twin has 0 private bytes: cloning it again frees nothing (2026-10-30: re-cloning shared files reported
+    30 GB saved while the disk gained 3.8 GB)."""
+    if os.uname().sysname != "Darwin":
+        return None
+    try:
+        libc = ctypes.CDLL("libc.dylib", use_errno=True)
+        # struct attrlist {u_short bitmapcount; u_int16_t reserved; attrgroup_t common, vol, dir, file, fork}: ATTR_BIT_MAP_COUNT 5,
+        # the extended common group (FSOPT_ATTR_CMN_EXTENDED) asks for ATTR_CMNEXT_PRIVATESIZE (0x8) in the fork slot.
+        attrs = ctypes.create_string_buffer(struct.pack("<HHIIIII", 5, 0, 0, 0, 0, 0, 0x00000008))
+        buf = ctypes.create_string_buffer(64)
+        if libc.getattrlist(path.encode(), attrs, buf, 64, 0x1 | 0x20) != 0:  # FSOPT_NOFOLLOW | FSOPT_ATTR_CMN_EXTENDED
+            return None
+        return struct.unpack_from("<Iq", buf.raw, 0)[1]
+    except (OSError, AttributeError, struct.error):
+        return None
+
+
 def clean_dedupe_walk(roots: list, at: float):
     """Candidate (path, lstat) pairs below the roots, same device as each root, never entering .git or a symlink."""
     for root in roots:
@@ -1968,9 +1989,14 @@ def clean_dedupe_run(roots: list, dry_run: bool, at: float | None = None, clone=
             same.sort(key=lambda pair: pair[0])  # deterministic: the first path by name is the source the others share
             source = same[0][0]
             for target, scanned in same[1:]:
+                private = clean_dedupe_private_bytes(target)
+                if private == 0:
+                    result["alreadyShared"] = result.get("alreadyShared", 0) + 1
+                    continue  # already shares every block: nothing to free, and nothing to redo
+                gain = size if private is None else private
                 if dry_run:
                     result["files"] += 1
-                    result["bytes"] += size
+                    result["bytes"] += gain
                     continue
                 temp = target + CLEAN_DEDUPE_TEMP
                 try:
@@ -1985,7 +2011,7 @@ def clean_dedupe_run(roots: list, dry_run: bool, at: float | None = None, clone=
                     os.utime(temp, ns=(current.st_atime_ns, current.st_mtime_ns))
                     os.rename(temp, target)
                     result["files"] += 1
-                    result["bytes"] += size
+                    result["bytes"] += gain
                 except OSError as error:
                     result["errors"].append({"path": clean_tilde(target), "error": str(error)})
                     try:

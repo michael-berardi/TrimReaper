@@ -78,6 +78,18 @@ class Clone(Base):
         self.assertEqual(a.read_bytes(), DATA)
         self.assertEqual(list(self.tmp.rglob("*" + clean.CLEAN_DEDUPE_TEMP)), [])
 
+    def test_files_that_already_share_their_blocks_are_neither_redone_nor_counted(self):
+        # 2026-10-30: every pass re-cloned the same pairs and reported 30 GB saved while the disk gained 3.8 GB.
+        write(self.tmp / "J-1" / "corpus.txt")
+        b = write(self.tmp / "J-2" / "corpus.txt")
+        first = clean.clean_dedupe_run([str(self.tmp)], dry_run=False, at=self.now)
+        self.assertEqual(first["files"], 1)
+        inode = os.lstat(b).st_ino
+        again = clean.clean_dedupe_run([str(self.tmp)], dry_run=False, at=self.now)
+        self.assertEqual((again["files"], again["bytes"], again.get("alreadyShared")), (0, 0, 1))
+        self.assertEqual(os.lstat(b).st_ino, inode)  # not replaced a second time
+        self.assertEqual(clean.clean_dedupe_private_bytes(str(b)), 0)
+
     def test_a_file_changed_after_the_scan_is_left_alone(self):
         write(self.tmp / "J-1" / "x.bin")
         b = write(self.tmp / "J-2" / "x.bin")
