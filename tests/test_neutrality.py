@@ -20,9 +20,12 @@ MODEL_CHOICE = re.compile(
     re.IGNORECASE,
 )
 # Names of people and organisations the tool was first built for: never in the shipped tool.
+# Case-insensitive: a lowercase handle (e.g. a GitHub owner in a URL) must not
+# slip past a capitalized pattern name.
 PERSONAL = re.compile(
     r"\b(?:Mike|Berardi|Dana|Felix|acme|acme|Mouseia|Liberty Design|"
     r"libertydesign|acme)\b|/Users/[a-z]",
+    re.IGNORECASE,
 )
 
 # Documented exceptions: legal attribution and package metadata are not shipped behaviour.
