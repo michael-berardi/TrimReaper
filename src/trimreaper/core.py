@@ -58,7 +58,7 @@ REAP_SETTLE_SECONDS = 900             # a job that just finished may still be co
 REAP_CLOSED_SETTLE_SECONDS = 30       # ... unless its worker is already closed through the guarded cleanup: nothing can resume it
 REAP_RETRY_SECONDS = (900, 3600, 6 * 3600)   # wait after a pass that preserved something, by attempt
 REAP_TICK_JOBS = 2                    # jobs with artifacts one tick may reap
-REAP_TICK_JOBS_PRESSURE = 8           # ... while the disk is at or above diskWarnPercent (Mike 2026-10-29: the disk filled in a day)
+REAP_TICK_JOBS_PRESSURE = 8           # ... while the disk is at or above diskWarnPercent (the disk filled in a day)
 REAP_SIZE_TTL = 6 * 3600              # a job folder's recorded size is re-measured after this long
 REAP_SIZE_MEASURE_SECONDS = 20        # wall-clock budget for measuring unmeasured job folders in one tick
 REAP_TICK_SECONDS = 60                # wall-clock budget of one tick's reaping
@@ -4598,7 +4598,7 @@ def reap_job_dir_bytes(conn, job_id: str, deadline: float) -> int:
 
 
 def reap_largest_first(conn, jobs: list[dict]) -> list[dict]:
-    """Finished jobs, largest job folder first (Mike 2026-10-29). Oldest-first ordering with a two-job budget never reached
+    """Finished jobs, largest job folder first. Oldest-first ordering with a two-job budget never reached
     the large recent folders, so a day of heavy jobs filled the disk while the reaper worked through old, small ones."""
     deadline = time.monotonic() + REAP_SIZE_MEASURE_SECONDS
     if conn is None:

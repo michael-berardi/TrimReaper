@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.11.0 (Unreleased)
+
+Removes operator-name annotations from shipped source comments. Adds a neutrality test that scans shipped source and documentation for model IDs, provider preferences, and personal names.
+
 ## 0.10.3 (2026-10-31)
 
 Fixes the dead-owner auto-acknowledgment acknowledging a cleanup run that had already written plan receipts. A sweep whose final note failed
