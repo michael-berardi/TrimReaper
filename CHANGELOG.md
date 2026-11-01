@@ -1,6 +1,10 @@
 # Changelog
 
-## 0.11.0 (Unreleased)
+## 0.11.1 (2026-11-01)
+
+Fixes two gaps the 0.11.0 neutrality pass missed. The README install command still named the operator's GitHub handle; it now uses the neutral `your-github-username` placeholder and points at the current release. The neutrality test's personal-name regex was case-sensitive, so a lowercase handle in a URL slipped past it; the regex now matches case-insensitively.
+
+## 0.11.0 (2026-11-01)
 
 Removes operator-name annotations from shipped source comments. Adds a neutrality test that scans shipped source and documentation for model IDs, provider preferences, and personal names.
 
