@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.10.3 (2026-10-31)
+
+Fixes the dead-owner auto-acknowledgment acknowledging a cleanup run that had already written plan receipts. A sweep whose final note failed
+left `started` as its last line, and the dead-owner path then acknowledged it even though receipts show it may already have removed work.
+Auto-acknowledgment now refuses when a receipt names the dead run, and fails closed when the receipts cannot be read.
+
 ## 0.10.2 (2026-10-30)
 
 Fixes `dedupe-clones` overstating what it saved and redoing finished work. It counted every byte-identical pair as freed, even pairs
