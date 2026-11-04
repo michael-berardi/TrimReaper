@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.13.0 (2026-11-04)
+
+- New `compress-logs` target (part of every pass, including the quiet steady pass): agent transcripts, receipts and logs that
+  have not changed for `compressLogsIdleDays` (2) under `compressLogsRoots` (`.claude/projects`, `.pi/agent/sessions`,
+  `.pi/agent/usap` by default) get transparent, lossless APFS compression through `afsctool`. Nothing is removed: every reader
+  sees the same bytes. Files a process holds open, links, hard-linked files, executables and files under 128 KiB are skipped.
+  On a real machine this saved 5.9 GB of 11 GB of history. macOS only; without `afsctool` the target says why it skipped.
+
 ## 0.12.0 (2026-11-04)
 
 Closes the gaps that let a disk reach 93% while tens of GB of provably regenerable agent debris sat on it.

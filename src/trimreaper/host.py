@@ -40,7 +40,11 @@ DEFAULT_POLICY = {
     "markedEvidenceExpiryDays": 5,
     # An archive goes this many days after it became the only copy of its clone.
     "archiveExpiryDays": 30,
-    "cleanWorktreeArchiveExpiryDays": 0,   # clean-pass archives of unsaved worktrees no job owned: 0 = kept indefinitely
+    "cleanWorktreeArchiveExpiryDays": 0,
+    # compress-logs: idle (this many days) transcripts, receipts and logs under compressLogsRoots get transparent, lossless
+    # APFS compression (afsctool); nothing is removed. 0 = off. Roots are relative to home unless absolute or ~-prefixed.
+    "compressLogsIdleDays": 2,
+    "compressLogsRoots": [".claude/projects", ".pi/agent/sessions", ".pi/agent/usap"],   # clean-pass archives of unsaved worktrees no job owned: 0 = kept indefinitely
     # "archive": save work no remote holds before an expired folder goes; anything else keeps such folders.
     "cloneArchive": "archive",
     # "remove": a whole clone's .env*/.dev.vars*/.wrangler/.vercel copies are archived owner-only and go with it.
@@ -201,7 +205,10 @@ def check_policy(policy: dict) -> None:
     merged = {**DEFAULT_POLICY, **policy}
     if not isinstance(merged["autoReap"], bool):
         raise HostError(f"policy autoReap must be true or false, not {json.dumps(merged['autoReap'])}")
-    for key in ("cloneExpiryDays", "evidenceExpiryDays", "markedEvidenceExpiryDays", "archiveExpiryDays", "cleanWorktreeArchiveExpiryDays"):
+    if not isinstance(merged["compressLogsRoots"], list) or not all(isinstance(r, str) and r for r in merged["compressLogsRoots"]):
+        raise HostError(f"policy compressLogsRoots must be a list of folder paths, not {json.dumps(merged['compressLogsRoots'])}")
+    for key in ("cloneExpiryDays", "evidenceExpiryDays", "markedEvidenceExpiryDays", "archiveExpiryDays", "cleanWorktreeArchiveExpiryDays",
+                "compressLogsIdleDays"):
         value = merged[key]
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             raise HostError(f"policy {key} must be a whole number of days (0 = never), not {json.dumps(value)}")

@@ -41,6 +41,8 @@ Paths are absolute or start with `~/`. Here `~` is the reap home (`home`), not t
 | `cleanToPercent` | `60` | Low watermark: try largest disposable candidates first, then climb the ladder, until measured occupancy reaches this goal. Must be positive and below the high watermark. Reaching this level or lower re-arms the high crossing. Unmet goals retry while pressure remains, or on a changed release event, after the cooldown. |
 | `cleanEscalate` | `true` | When the routine rules cannot reach `cleanToPercent`, climb the ladder (README, "the escalation ladder"). `false`: routine rules only. |
 | `cleanEscalateRepoHours` | `2` | Rung 1: regenerable output of a repository idle this many hours goes, whatever `projectIdleHours` says and even when the repository is dirty or has a stash. |
+| `compressLogsIdleDays` | `2` | History files (transcripts, receipts, logs) unchanged this many days get transparent APFS compression (`afsctool`); nothing is removed. `0`: off. |
+| `compressLogsRoots` | `[".claude/projects", ".pi/agent/sessions", ".pi/agent/usap"]` | Folders `compress-logs` walks; relative to home unless absolute or `~`-prefixed. |
 | `cleanEmergencyPercent` | `90` | At or above this measured occupancy, rungs 2 and up accept worktrees and finished jobs' folders idle `cleanEmergencyHours`. `0`: off. |
 | `cleanEmergencyHours` | `6` | The idle window the emergency uses; every other gate is unchanged. |
 | `cleanEscalateWorktreeHours` | `24` | Rung 2: a clean, pushed linked worktree idle this many hours goes (`worktreeIdleDays` is the routine window; `0` there keeps them all, on every rung). |
