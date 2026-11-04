@@ -703,7 +703,7 @@ def reap_git(repo: str, *args: str) -> tuple[int, str]:
     return reap_git_input(repo, None, *args)
 
 
-def reap_git_input(repo: str, data: str | None, *args: str) -> tuple[int, str]:
+def reap_git_input(repo: str, data: str | None, *args: str, timeout: float = 120) -> tuple[int, str]:
     """Run one Git probe. Outside a proof session the metadata is gated first; inside one the gated config is re-checked
     before the probe AND after it. That detects, and refuses on, a config rewritten before or during the probe; it cannot stop
     Git from having read a config rewritten inside that window, so it is not an immutability guarantee (see docs/SAFETY.md)."""
@@ -722,7 +722,7 @@ def reap_git_input(repo: str, data: str | None, *args: str) -> tuple[int, str]:
     # in the gate, never falling back to discovery of an enclosing repository.
     argv = ["git", "--git-dir=" + gated["roots"][0], "-c", "core.hooksPath=" + os.devnull, "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false", "-c", "submodule.recurse=false",
             "-c", "core.excludesFile=" + os.devnull, "-c", "core.attributesFile=" + os.devnull, "-c", "core.worktree=" + repo, "-C", repo, *args]
-    outcome = reap_probe(argv, 120, reap_git_env()) if data is None else reap_probe(argv, 120, reap_git_env(), data)
+    outcome = reap_probe(argv, timeout, reap_git_env()) if data is None else reap_probe(argv, timeout, reap_git_env(), data)
     if held is not None:  # fail closed per probe: a config rewritten while Git ran (a rewrite always moves ctime) discards this answer
         try:
             if reap_config_stamp(held["roots"]) != held["stamp"]:
@@ -942,10 +942,9 @@ def reap_git_ignored_known(root: str, protected_ok: bool = False) -> list[str]:
 def reap_git_whole_repo_checks(root: str, dirs: list[str]) -> list[str]:
     """Extra proofs when the WHOLE repository goes (a nested repository of a `job-cache-subdir`, `.git` included), so HEAD
     alone proves nothing: every local branch must be contained in a remote-tracking ref (HEAD and `refs/heads/*`, counted
-    together), no other ref may exist, and no linked worktree may depend on this repository. Offline Git cannot prove a tag
-    was pushed (a fetched tag and a local-only one look alike, and an annotated tag object carries its own message that a
-    pushed commit does not), and a commit reachable from a remote branch says nothing about it, so ANY tag, and any ref
-    that is not a local branch or a remote-tracking ref (notes, replace, stash, ...), keeps the repository. A repository
+    together), no extra ref may exist, and no linked worktree may depend on this repository. A tag is allowed only inside
+    scratch or the job cache, and only if origin advertises the exact same tag object; a local remote-tracking ref cannot
+    prove that an annotated tag object was pushed. Any other ref (notes, replace, stash, ...) keeps the repository. A repository
     that is a linked worktree, or has linked worktrees, is kept whole: removing it would break or strand the other side.
     Reflog-only commits and unreachable objects are local work too: they must be proved remote-reachable or the whole repository stays."""
     if reap_canon(dirs[0]) != reap_canon(dirs[1]):
@@ -965,7 +964,20 @@ def reap_git_whole_repo_checks(root: str, dirs: list[str]) -> list[str]:
     tags = [ref for ref in refs if ref.startswith("refs/tags/")]
     others = [ref for ref in refs if not ref.startswith(("refs/heads/", "refs/remotes/", "refs/tags/"))]
     if tags:
-        raise ReapRefused(f"unproved-tags:{len(tags)}")
+        scope = reap_canon(root)
+        allowed = any(reap_inside(scope, reap_canon(base)) and scope != reap_canon(base)
+                      for base in (reap_cache_root(), reap_agent_scratch_root()))
+        if not allowed:
+            raise ReapRefused(f"unproved-tags:{len(tags)}")
+        code, local = reap_git(root, "for-each-ref", "--format=%(objectname) %(refname)", "refs/tags/")
+        if code != 0:
+            raise ReapRefused(f"unproved-tags:{len(tags)}")
+        local_tags = dict(line.split(" ", 1)[::-1] for line in local.splitlines() if " " in line)
+        code, remote = reap_git_input(root, None, "ls-remote", "--tags", "origin", timeout=30)
+        remote_tags = dict(line.split("\t", 1)[::-1] for line in remote.splitlines() if "\t" in line)
+        if code != 0 or any(not re.fullmatch(r"[0-9a-f]{40,64}", local_tags.get(tag, ""))
+                            or remote_tags.get(tag) != local_tags[tag] for tag in tags):
+            raise ReapRefused(f"unproved-tags:{len(tags)}")
     if others:
         raise ReapRefused(f"unproved-refs:{len(others)}")
     code, out = reap_git(root, "rev-list", "--count", "HEAD", "--branches", "--reflog", "--not", "--remotes")
@@ -978,7 +990,7 @@ def reap_git_whole_repo_checks(root: str, dirs: list[str]) -> list[str]:
         raise ReapRefused(f"git-error:object-reachability:{code}")
     if out.strip():
         raise ReapRefused("unproved-git-objects")
-    return ["git-all-branches-and-reflogs-pushed", "git-no-tags-or-extra-refs", "git-no-linked-worktrees", "git-no-unproved-objects"]
+    return ["git-all-branches-and-reflogs-pushed", "git-tags-remote-and-no-extra-refs", "git-no-linked-worktrees", "git-no-unproved-objects"]
 
 
 def reap_git_proof(root: str, path: str, needs: tuple, cache: dict | None = None) -> list[str]:
