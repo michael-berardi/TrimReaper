@@ -2214,20 +2214,38 @@ def reap_clean_archive_expired(path: str) -> bool:
 
 
 def reap_clean_archive_start_clock(path: str) -> bool:
-    """Record, once, when expiry started counting for a clean-pass archive (only while the operator opted in)."""
+    """While the operator opts in, record once when expiry started counting for a clean-pass archive. While the key is 0 any
+    clock is removed, so turning it on again later restarts the count instead of expiring old archives at once."""
+    clock = os.path.join(path, REAP_ARCHIVE_SEEN)
     days = reap_policy().get("cleanWorktreeArchiveExpiryDays", 0)
-    if not isinstance(days, int) or isinstance(days, bool) or days <= 0 or os.path.lexists(os.path.join(path, REAP_ARCHIVE_SEEN)):
+    if not isinstance(days, int) or isinstance(days, bool) or days <= 0:
+        try:
+            os.unlink(clock)
+        except OSError:
+            pass
+        return False
+    if os.path.lexists(clock):
         return False
     data = json.dumps({"since": now(), "at": iso()}).encode()
     temporary = os.path.join(path, f".{REAP_ARCHIVE_SEEN}.tmp-{os.getpid()}")
     try:
+        os.unlink(temporary)
+    except OSError:
+        pass
+    try:
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
         try:
-            os.write(fd, data)
+            if os.write(fd, data) != len(data):
+                raise OSError(errno.EIO, "short write")
             reap_durable(fd)
         finally:
             os.close(fd)
-        os.rename(temporary, os.path.join(path, REAP_ARCHIVE_SEEN))
+        os.rename(temporary, clock)
+        dfd = os.open(path, REAP_DIR_FLAGS)
+        try:
+            reap_durable(dfd)
+        finally:
+            os.close(dfd)
         return True
     except OSError:
         try:
@@ -2243,7 +2261,7 @@ def reap_archive_owner_name(name: str) -> bool:
 
 def reap_archive_items() -> list[dict]:
     """Every archive the reaper wrote: <archive root>/<J-NNNN or clean-worktrees>/<name>. Names only; symlinks are not items.
-    The clean pass archives unsaved worktrees under `clean-worktrees`; they expire exactly like a job's archives."""
+    The clean pass archives unsaved worktrees under `clean-worktrees`; they expire only with cleanWorktreeArchiveExpiryDays."""
     root, items = reap_archive_root(), []
     try:
         jobs = sorted(os.scandir(root), key=lambda e: e.name)

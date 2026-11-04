@@ -237,6 +237,12 @@ class ProtectedCopiesAndArchives(Home):
         clock = archive / "expiry-clock.json"
         self.assertTrue(clock.exists())
         clock.write_text(json.dumps({"since": time.time() - 31 * DAY}))
+        self.cli("policy-set", "cleanWorktreeArchiveExpiryDays=0")
+        self.assertEqual(self.cli("reap", "--archives")["deleted"], 0)
+        self.assertFalse(clock.exists(), "turning the key off resets the clock")
+        self.cli("policy-set", "cleanWorktreeArchiveExpiryDays=30")
+        self.assertEqual(self.cli("reap", "--archives")["deleted"], 0, "turning it on again restarts the count")
+        clock.write_text(json.dumps({"since": time.time() - 31 * DAY}))
         out = self.cli("reap", "--archives")
         self.assertEqual(out["deleted"], 1, out)
         self.assertFalse(archive.exists())
