@@ -61,6 +61,10 @@ DEFAULT_POLICY = {
     "cleanEscalateWorktreeHours": 24,
     "cleanEscalateJobHours": 24,
     "cleanEscalatePinnedHours": 24,
+    # At or above cleanEmergencyPercent measured occupancy (0 = off), rungs 2 and up accept worktrees and finished jobs' folders
+    # idle cleanEmergencyHours; every other gate is unchanged.
+    "cleanEmergencyPercent": 90,
+    "cleanEmergencyHours": 6,
     # Below cleanAtPercent a quiet pass still runs every cleanSteadyHours (0 = off): regenerable output of repositories idle for
     # cleanSteadyRepoDays, and the artifacts of jobs finished cleanSteadyJobHours ago.
     "cleanSteadyHours": 6,
@@ -226,10 +230,13 @@ def check_policy(policy: dict) -> None:
         raise HostError(f"policy cleanEscalate must be true or false, not {json.dumps(merged['cleanEscalate'])}")
     for key, high in (("cleanEscalateRepoHours", 24 * 365), ("cleanEscalateWorktreeHours", 24 * 365), ("cleanEscalateJobHours", 24 * 365),
                       ("cleanEscalatePinnedHours", 24 * 365), ("cleanSteadyHours", 24 * 365), ("cleanSteadyRepoDays", 365),
-                      ("cleanSteadyJobHours", 24 * 365)):
+                      ("cleanSteadyJobHours", 24 * 365), ("cleanEmergencyHours", 24 * 365)):
         value = merged[key]
         if not isinstance(value, int) or isinstance(value, bool) or not (0 if key == "cleanSteadyHours" else 1) <= value <= high:
             raise HostError(f"policy {key} must be a whole number from {0 if key == 'cleanSteadyHours' else 1} to {high}, not {json.dumps(value)}")
+    if not isinstance(merged["cleanEmergencyPercent"], int) or isinstance(merged["cleanEmergencyPercent"], bool) \
+            or not 0 <= merged["cleanEmergencyPercent"] <= 100:
+        raise HostError(f"policy cleanEmergencyPercent must be a whole number from 0 to 100, not {json.dumps(merged['cleanEmergencyPercent'])}")
     for key, high in (("cleanGrowthGB", 1000), ("cleanFloorGB", 1000), ("parkedReapHours", 24 * 365), ("projectIdleHours", 24 * 365)):
         value = merged[key]
         if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= high:

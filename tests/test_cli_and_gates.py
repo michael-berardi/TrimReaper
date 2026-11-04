@@ -210,7 +210,29 @@ class ProtectedCopiesAndArchives(Home):
         data["soleCopySince"] = time.time() - 31 * DAY
         record.write_text(json.dumps(data))
 
-        self.assertEqual(self.cli("reap", "--archives")["deleted"], 1)
+        out = self.cli("reap", "--archives")
+        self.assertEqual(out["deleted"], 1, out)
+        self.assertFalse(archive.exists())
+
+    def test_a_clean_pass_archive_expires_like_a_job_archive(self):
+        # The clean pass archives unsaved worktrees under clean-worktrees/; they used to be kept forever (12.9 GB seen).
+        repo = self.clone("app-j0172")
+        (repo / "notes.txt").write_text("unsaved\n")
+        self.add_job("J-0172", repo, finished_ago=4 * DAY)
+        self.cli("reap", "--job", "J-0172")
+        job_archive = next((self.home / ".cache/trimreaper/archive/J-0172").iterdir())
+        owner = self.home / ".cache/trimreaper/archive/clean-worktrees"
+        owner.mkdir(parents=True, exist_ok=True)
+        archive = owner / ("app-20261030T000000-" + job_archive.name[-12:])
+        job_archive.rename(archive)
+        self.assertEqual(self.cli("reap", "--archives")["deleted"], 0, "a fresh archive stays")
+        record = archive / "sole-copy-since.json"
+        data = json.loads(record.read_text())
+        data["soleCopySince"] = time.time() - 31 * DAY
+        record.write_text(json.dumps(data))
+
+        out = self.cli("reap", "--archives")
+        self.assertEqual(out["deleted"], 1, out)
         self.assertFalse(archive.exists())
 
 

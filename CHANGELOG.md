@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.12.0 (2026-11-04)
+
+Closes the gaps that let a disk reach 93% while tens of GB of provably regenerable agent debris sat on it.
+
+- Git-ignored, untracked build output (Rust `target/debug`, `incremental`, project dependencies) is no longer kept because the
+  repository has a stash: a stash lives in the git dir and is untouched by removing ignored output. The dirty-tree proof stays.
+- Agent-scratch idle walks get a larger default budget (3,000,000 entries, 60 seconds), so a large idle task folder is proved
+  instead of being kept for `idle-budget-exceeded` forever.
+- Node's compile cache in the user temp folder is pruned per version folder after 24 idle hours, and `ultrabot-runtime.*` temp
+  copies count as agent leftovers.
+- A standalone clone in scratch or the job cache may go with tags when `origin` advertises each tag with the same object id;
+  any network error keeps it.
+- The clean pass's own `clean-worktrees` archives now expire after `archiveExpiryDays` from their sole-copy time, like job
+  archives (they were kept forever).
+- New `cleanEmergencyPercent` (90) and `cleanEmergencyHours` (6): at that occupancy the worktree and finished-job rungs accept
+  six idle hours; every other gate is unchanged.
+
 ## 0.11.2 (2026-11-04)
 
 Stops the clean pass from removing dependencies and build output a project is actively using. The idle walk skips
