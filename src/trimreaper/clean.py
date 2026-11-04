@@ -182,7 +182,8 @@ CLEAN_STEADY = "steady"
 CLEAN_STEADY_NAMES = ("rust-build-output", "project-dependencies", "finished-jobs", "dedupe-clones")   # the quiet pass takes nothing else
 CLEAN_POLICY = {"cleanEscalate": True, "cleanEscalateRepoHours": 2, "cleanEscalateWorktreeHours": 24, "cleanEscalateJobHours": 24,
                 "cleanEscalatePinnedHours": 24, "cleanSteadyHours": 6, "cleanSteadyRepoDays": 3, "cleanSteadyJobHours": 48,
-                "worktreeIdleDays": 7, "projectIdleHours": 48}   # the fallbacks of a host whose policy predates a key
+                "worktreeIdleDays": 7, "projectIdleHours": 48,
+                "cleanEmergencyPercent": 90, "cleanEmergencyHours": 6}   # the fallbacks of a host whose policy predates a key
 CLEAN_OUTPUT_PROOF = ("clean", "pushed", "ignored", "untracked")
 CLEAN_IGNORED_PROOF = ("ignored", "untracked")      # regenerable output needs git to ignore it and track none of it, not a clean tree
 CLEAN_REFUSED_SECONDS = 86400    # a removal the filesystem refused is not retried for this long, unless the folder changed
@@ -227,6 +228,24 @@ def clean_profile(policy: dict, rung: int | str) -> dict:
     if rung >= 5:
         profile["job"]["keepUnsaved"] = False
         profile["archive"] = True
+    return profile
+
+
+def clean_emergency(profile: dict, policy: dict, occupancy: dict) -> dict:
+    """At or above cleanEmergencyPercent measured occupancy, the worktree and finished-job rungs (2 and up) accept folders idle
+    cleanEmergencyHours instead of their normal windows. Every other gate (protected leaves, git proofs, processes, retention
+    markers, unsaved work) is unchanged. An unmeasured disk is never an emergency."""
+    used = occupancy.get("usedPercent") if occupancy else None
+    limit, hours = clean_setting(policy, "cleanEmergencyPercent"), clean_setting(policy, "cleanEmergencyHours")
+    if not isinstance(profile.get("rung"), int) or profile["rung"] < 2 or used is None or not limit or not hours or used < limit:
+        return profile
+    profile = dict(profile, emergency=True)
+    if profile.get("worktreeHours"):
+        profile["worktreeHours"] = min(profile["worktreeHours"], hours)
+    if profile.get("job"):
+        profile["job"] = dict(profile["job"], hours=min(profile["job"]["hours"], hours))
+        if profile["job"].get("pinned"):
+            profile["job"]["pinned"] = min(profile["job"]["pinned"], hours)
     return profile
 
 
@@ -1554,7 +1573,7 @@ def clean_act(entry: dict, run_id: str, days: int) -> None:
 
 # ---- archive, then remove (the ladder's last rung) ------------------------------------------------------------------------------------
 
-CLEAN_ARCHIVE_OWNER = "clean-worktrees"   # <archiveRoot>/clean-worktrees/<folder>-<time>-<run>/ ; these archives never expire by themselves
+CLEAN_ARCHIVE_OWNER = "clean-worktrees"   # <archiveRoot>/clean-worktrees/<folder>-<time>-<run>/ ; expire like job archives (archiveExpiryDays after sole-copy-since)
 
 
 def clean_worktree_last_look(entry: dict, idle: float, archive: bool) -> None:
@@ -1816,7 +1835,7 @@ def clean_pass_run(dry_run: bool, deep: bool, only: list | None, report: bool, p
     for position, rung_id in enumerate(rungs):
         if position and not steady and (current["goalMet"] is not False or stopped):
             break  # the goal is reached (or cannot be measured: then nothing is escalated on a guess): the rest of the ladder is not planned
-        rung = clean_profile(policy, rung_id)
+        rung = clean_emergency(clean_profile(policy, rung_id), policy, current)
         names = chosen if rung["tools"] else {n for n in chosen if n not in tools}
         if steady:
             names &= set(CLEAN_STEADY_NAMES)

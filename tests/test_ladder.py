@@ -670,3 +670,31 @@ class Plumbing(Ladder):
         self.assertEqual(out["summary"]["freedBytes"], 0)
         self.assertIn("other writers", out["summary"]["freedNote"])
         self.assertIs(out["goalMet"], False)
+
+
+class Emergency(Home):
+    """At cleanEmergencyPercent the worktree and finished-job rungs accept six idle hours instead of a day or a week."""
+
+    def test_emergency_shortens_only_the_worktree_and_job_rungs(self):
+        policy = dict(clean.CLEAN_POLICY)
+        hot = {"usedPercent": 93.0}
+        for rung in (0, 1):
+            self.assertEqual(clean.clean_emergency(clean.clean_profile(policy, rung), policy, hot), clean.clean_profile(policy, rung))
+        two = clean.clean_emergency(clean.clean_profile(policy, 2), policy, hot)
+        self.assertTrue(two["emergency"])
+        self.assertEqual(two["worktreeHours"], 6)
+        self.assertEqual(two["job"]["hours"], 6)
+        three = clean.clean_emergency(clean.clean_profile(policy, 3), policy, hot)
+        self.assertEqual(three["job"]["pinned"], 6)
+
+    def test_below_the_line_or_unmeasured_nothing_changes(self):
+        policy = dict(clean.CLEAN_POLICY)
+        normal = clean.clean_profile(policy, 2)
+        self.assertEqual(clean.clean_emergency(normal, policy, {"usedPercent": 89.9}), normal)
+        self.assertEqual(clean.clean_emergency(normal, policy, {"usedPercent": None}), normal)
+        self.assertEqual(clean.clean_emergency(normal, dict(policy, cleanEmergencyPercent=0), {"usedPercent": 99.0}), normal)
+
+    def test_the_steady_pass_is_never_an_emergency(self):
+        policy = dict(clean.CLEAN_POLICY)
+        steady = clean.clean_profile(policy, clean.CLEAN_STEADY)
+        self.assertEqual(clean.clean_emergency(steady, policy, {"usedPercent": 99.0}), steady)

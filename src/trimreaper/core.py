@@ -2195,15 +2195,23 @@ def reap_archive_expired(path: str) -> bool:
         return False
 
 
+REAP_ARCHIVE_CLEAN_OWNER = "clean-worktrees"   # the clean pass's archive owner folder (clean.CLEAN_ARCHIVE_OWNER)
+
+
+def reap_archive_owner_name(name: str) -> bool:
+    return bool(re.fullmatch(r"J-\d{4,5}", name)) or name == REAP_ARCHIVE_CLEAN_OWNER
+
+
 def reap_archive_items() -> list[dict]:
-    """Every archive the reaper wrote: <archive root>/<J-NNNN>/<name>. Names only; symlinks are not items."""
+    """Every archive the reaper wrote: <archive root>/<J-NNNN or clean-worktrees>/<name>. Names only; symlinks are not items.
+    The clean pass archives unsaved worktrees under `clean-worktrees`; they expire exactly like a job's archives."""
     root, items = reap_archive_root(), []
     try:
         jobs = sorted(os.scandir(root), key=lambda e: e.name)
     except FileNotFoundError:
         return []
     for job in jobs:
-        if not re.fullmatch(r"J-\d{4,5}", job.name) or job.is_symlink() or not job.is_dir(follow_symlinks=False):
+        if not reap_archive_owner_name(job.name) or job.is_symlink() or not job.is_dir(follow_symlinks=False):
             continue
         try:
             entries = sorted(os.scandir(job.path), key=lambda e: e.name)
@@ -2225,7 +2233,7 @@ def reap_archive_job_dirs() -> list:
     root = reap_archive_root()
     try:
         return [e for e in sorted(os.scandir(root), key=lambda e: e.name)
-                if re.fullmatch(r"J-\d{4,5}", e.name) and not e.is_symlink() and e.is_dir(follow_symlinks=False)]
+                if reap_archive_owner_name(e.name) and not e.is_symlink() and e.is_dir(follow_symlinks=False)]
     except OSError:
         return []
 
@@ -4798,11 +4806,14 @@ def reap_authority(item: dict) -> dict:
             if reap_release_keep_lapsed(conn, source, r["value"]):
                 released[source] = {**released[source], "keep": []}
     ids = list(dict.fromkeys(item.get("jobs") or []))
+    if item["class"] == "job-archive" and item["owner"] == REAP_ARCHIVE_CLEAN_OWNER:
+        ids = []  # the clean pass's own archive of an idle worktree no job owned: its expiry window is the only claim on it
     # Scratch tasks and release versions are independent siblings, not claims on their collection root.
     # Repository output still uses its source root so a source consumer preserves its build output.
     independent = item["class"] in ("agent-scratch", "release-evidence", "job-cache-subdir")
     scope = item["path"] if independent or item["class"] == "job-clone-root" else item["root"]
-    if item["class"] not in ("release-target", "agent-scratch", "release-evidence") and item["owner"] not in ids:
+    clean_archive = item["class"] == "job-archive" and item["owner"] == REAP_ARCHIVE_CLEAN_OWNER
+    if item["class"] not in ("release-target", "agent-scratch", "release-evidence") and not clean_archive and item["owner"] not in ids:
         raise ReapRefused("owner-not-recorded")
     for job_id in ids:
         job = jobs.get(job_id)
