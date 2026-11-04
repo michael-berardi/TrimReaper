@@ -1040,7 +1040,9 @@ def clean_repository_output_gates(entry: dict, table: dict | None) -> float:
             found = clean_release_like(path)
             if found:
                 raise ReapRefused("release-artifact:" + found)
-        reap_git_proof(repo, path, proof)
+        # The exception is only for output whose ignored and untracked proofs both run.
+        git_proof = proof + ("output-stash-ok",) if {"ignored", "untracked"}.issubset(proof) else proof
+        reap_git_proof(repo, path, git_proof)
     clean_once(("output", path, proof), static, table is None)
     # A copy made for a job (site-j0042, .worktrees/J-0042): kept while that job is unfinished, and once it is finished its output
     # needs only CLEAN_PROJECT_JOB_IDLE_HOURS of quiet. Every other project needs the operator's idleHours.
@@ -1227,7 +1229,7 @@ def clean_extra_entries(only: set, errors: list, idle_hours: int = 48, rung: dic
                 errors.append({"clean": "agent-leftovers", "path": clean_tilde(root), "error": clean_os_refusal(error)})
                 continue
             for child in clean_scan(root, "agent-leftovers", errors):
-                matches = sessions or bool(re.fullmatch(r"(?:.+-verify-.+|ultraterm-release\..+|ultraterm-publish-check\..+|.*-rust-target.*)", child.name))
+                matches = sessions or bool(re.fullmatch(r"(?:.+-verify-.+|ultraterm-release\..+|ultraterm-publish-check\..+|ultrabot-runtime\..+|.*-rust-target.*)", child.name))
                 if matches and clean_directory(child, "agent-leftovers", errors) and not reap_protected(child.name):
                     add("agent-leftovers", child.path, root)
         seen = {e["path"] for e in entries}
@@ -1237,6 +1239,17 @@ def clean_extra_entries(only: set, errors: list, idle_hours: int = 48, rung: dic
             for child in clean_scan(root, "agent-leftovers", errors):
                 if child.path in seen or os.path.realpath(child.path) == sessions_root or CLEAN_TEMP_SYSTEM.match(child.name) \
                         or reap_protected(child.name) or not clean_directory(child, "agent-leftovers", errors):
+                    continue
+                if child.name == "node-compile-cache":
+                    try:
+                        if child.stat(follow_symlinks=False).st_uid != os.getuid():
+                            continue
+                    except OSError as error:
+                        errors.append({"clean": "agent-leftovers", "path": clean_tilde(child.path), "error": clean_os_refusal(error)})
+                        continue
+                    for version in clean_scan(child.path, "agent-leftovers", errors):
+                        if not reap_protected(version.name) and clean_directory(version, "agent-leftovers", errors):
+                            add("agent-leftovers", version.path, child.path, idleHours=24)
                     continue
                 try:
                     if child.stat(follow_symlinks=False).st_uid != os.getuid():

@@ -31,6 +31,11 @@ class ScratchIdle(ScratchHome):
             lines.extend(json.loads(line) for line in path.read_text().splitlines() if line.strip())
         return lines
 
+    def test_default_idle_budgets_cover_large_scratch_trees(self):
+        budget = core.reap_scratch_idle_budget({})
+        self.assertEqual(budget["entries"], 3000000)
+        self.assertEqual(budget["seconds"], 60)
+
     # ---- the rule ----------------------------------------------------------------------------------------------------
 
     def test_a_scratch_folder_with_more_than_twenty_thousand_entries_ages_out(self):

@@ -76,11 +76,28 @@ class ProjectSafety(Home):
         self.age(self.repo, 5)
         self.refused("unpushed")
 
-    def test_stash_refused(self):
+    def test_stash_does_not_preserve_ignored_output(self):
         self.put(self.repo, "src/main.rs", b"stashed work\n")
         self.git(self.repo, "stash", "push", "-qm", "unfinished")
         self.age(self.repo, 5)
-        self.refused("stash-present")
+        for entry in self.entries():
+            clean.clean_extra_gates(entry)
+        self.assertTrue(self.git(self.repo, "stash", "list").strip())
+
+    def test_linked_worktree_shared_stash_keeps_dirty_tree_gate(self):
+        worktree = self.dev / "linked"
+        self.git(self.repo, "worktree", "add", "--detach", str(worktree))
+        self.put(self.repo, "src/main.rs", b"stashed work\n")
+        self.git(self.repo, "stash", "push", "-qm", "unfinished")
+        self.put(worktree, "target/debug/app")
+        self.age(worktree, 5)
+        entry = {"name": "rust-build-output", "path": str(worktree / "target/debug"),
+                 "target": str(worktree / "target"), "repo": str(worktree), "idleHours": 48}
+        clean.clean_extra_gates(entry)
+        self.put(worktree, "src/main.rs", b"dirty source\n")
+        with self.assertRaisesRegex(clean.ReapRefused, "dirty"):
+            clean.clean_extra_gates(entry)
+        self.assertTrue(self.git(self.repo, "stash", "list").strip())
 
     def test_missing_head_refused(self):
         (self.repo / ".git/refs/heads/main").unlink()

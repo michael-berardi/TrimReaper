@@ -125,9 +125,9 @@ match the exact archived identity and bytes; newly appeared or changed protected
 failed, oversized or stale archive keeps the task. Scratch protected-copy archives never expire automatically, so removal
 cannot destroy the only copy of protected material. A dry run only plans the archive and does not create it.
 
-The walk is bounded per folder, and the bound is on the record. `agentScratchIdleMaxEntries` (200000) limits how many entries
+The walk is bounded per folder, and the bound is on the record. `agentScratchIdleMaxEntries` (3000000) limits how many entries
 one folder's walk may list, `agentScratchIdleMaxBytes` (0: no byte bound) how many bytes it may see, and
-`agentScratchIdleMaxSeconds` (10) how long one walk may take; the walk also stops at the reaper's own depth cap (128
+`agentScratchIdleMaxSeconds` (60) how long one walk may take; the walk also stops at the reaper's own depth cap (128
 levels). A walk that runs out of its budget is not idle: the folder is kept, and the receipt records the reason, the
 entries and bytes the walk spent, the seconds it took and the budget it had. A budget stop can hide a protected name or
 a recent change further on, so raising the budget can turn `idle-budget-exceeded` into `idle-protected-leaf`. A budget
@@ -217,7 +217,7 @@ These also remove files, each with its own checks:
   - A worktree whose folder is gone is forgotten only when the folder is still gone, its entry is 30 days old and
     unlocked, the folder's parent exists (an empty mount point passes this, as in the engine's archive rule) and the
     commit check passes.
-  - Repository dependencies and Rust debug/incremental output must be ignored and untracked, in a repository whose Git state is clean (including hidden index changes) and whose HEAD is already held by a remote. An enclosing retention marker other than `disposable`, or a running job that owns the project, keeps the output. Collection-root working directories such as the home or code folder do not name a project. Actual removal holds the canonical build-queue project lock, creating it if needed, plus existing Cargo locks for Rust, through the fresh Git, retention, process and boundary checks and result receipt. Release artifacts stay.
+  - Repository dependencies and Rust debug/incremental output must be ignored and untracked, in a repository whose Git state is clean (including hidden index changes) and whose HEAD is already held by a remote. A stash does not preserve this ignored, untracked output; it remains in Git metadata. An enclosing retention marker other than `disposable`, or a running job that owns the project, keeps the output. Collection-root working directories such as the home or code folder do not name a project. Actual removal holds the canonical build-queue project lock, creating it if needed, plus existing Cargo locks for Rust, through the fresh Git, retention, process and boundary checks and result receipt. Release artifacts stay.
   - Older Playwright builds may be removed when a newer build of that same browser exists and no process uses the old one. Models, Docker's disk image and local snapshots are only measured.
 
 - **Evidence expiry** (`reap --job ... --expire-evidence`, and `tick`) unlinks old screenshots, recordings, traces and
