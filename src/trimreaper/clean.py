@@ -237,15 +237,14 @@ def clean_emergency(profile: dict, policy: dict, occupancy: dict) -> dict:
     markers, unsaved work) is unchanged. An unmeasured disk is never an emergency."""
     used = occupancy.get("usedPercent") if occupancy else None
     limit, hours = clean_setting(policy, "cleanEmergencyPercent"), clean_setting(policy, "cleanEmergencyHours")
-    if not isinstance(profile.get("rung"), int) or profile["rung"] < 2 or used is None or not limit or not hours or used < limit:
-        return profile
+    if not isinstance(profile.get("rung"), int) or profile["rung"] < 2 or profile.get("archive") or used is None or not limit \
+            or not hours or used < limit:
+        return profile  # archive-then-remove (unsaved work) keeps its own windows, even in an emergency
     profile = dict(profile, emergency=True)
     if profile.get("worktreeHours"):
         profile["worktreeHours"] = min(profile["worktreeHours"], hours)
     if profile.get("job"):
-        profile["job"] = dict(profile["job"], hours=min(profile["job"]["hours"], hours))
-        if profile["job"].get("pinned"):
-            profile["job"]["pinned"] = min(profile["job"]["pinned"], hours)
+        profile["job"] = dict(profile["job"], hours=min(profile["job"]["hours"], hours))  # pinned inputs keep their window
     return profile
 
 
@@ -1248,7 +1247,7 @@ def clean_extra_entries(only: set, errors: list, idle_hours: int = 48, rung: dic
                 errors.append({"clean": "agent-leftovers", "path": clean_tilde(root), "error": clean_os_refusal(error)})
                 continue
             for child in clean_scan(root, "agent-leftovers", errors):
-                matches = sessions or bool(re.fullmatch(r"(?:.+-verify-.+|ultraterm-release\..+|ultraterm-publish-check\..+|ultrabot-runtime\..+|.*-rust-target.*)", child.name))
+                matches = sessions or bool(re.fullmatch(r"(?:.+-verify-.+|ultraterm-release\..+|ultraterm-publish-check\..+|.*-rust-target.*)", child.name))
                 if matches and clean_directory(child, "agent-leftovers", errors) and not reap_protected(child.name):
                     add("agent-leftovers", child.path, root)
         seen = {e["path"] for e in entries}

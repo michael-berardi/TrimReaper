@@ -231,6 +231,12 @@ class ProtectedCopiesAndArchives(Home):
         data["soleCopySince"] = time.time() - 31 * DAY
         record.write_text(json.dumps(data))
 
+        self.assertEqual(self.cli("reap", "--archives")["deleted"], 0, "kept by default: cleanWorktreeArchiveExpiryDays is 0")
+        self.cli("policy-set", "cleanWorktreeArchiveExpiryDays=30")
+        self.assertEqual(self.cli("reap", "--archives")["deleted"], 0, "an old archive is never expired the pass the key turns on")
+        clock = archive / "expiry-clock.json"
+        self.assertTrue(clock.exists())
+        clock.write_text(json.dumps({"since": time.time() - 31 * DAY}))
         out = self.cli("reap", "--archives")
         self.assertEqual(out["deleted"], 1, out)
         self.assertFalse(archive.exists())

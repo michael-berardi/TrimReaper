@@ -40,6 +40,7 @@ DEFAULT_POLICY = {
     "markedEvidenceExpiryDays": 5,
     # An archive goes this many days after it became the only copy of its clone.
     "archiveExpiryDays": 30,
+    "cleanWorktreeArchiveExpiryDays": 0,   # clean-pass archives of unsaved worktrees no job owned: 0 = kept indefinitely
     # "archive": save work no remote holds before an expired folder goes; anything else keeps such folders.
     "cloneArchive": "archive",
     # "remove": a whole clone's .env*/.dev.vars*/.wrangler/.vercel copies are archived owner-only and go with it.
@@ -200,7 +201,7 @@ def check_policy(policy: dict) -> None:
     merged = {**DEFAULT_POLICY, **policy}
     if not isinstance(merged["autoReap"], bool):
         raise HostError(f"policy autoReap must be true or false, not {json.dumps(merged['autoReap'])}")
-    for key in ("cloneExpiryDays", "evidenceExpiryDays", "markedEvidenceExpiryDays", "archiveExpiryDays"):
+    for key in ("cloneExpiryDays", "evidenceExpiryDays", "markedEvidenceExpiryDays", "archiveExpiryDays", "cleanWorktreeArchiveExpiryDays"):
         value = merged[key]
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             raise HostError(f"policy {key} must be a whole number of days (0 = never), not {json.dumps(value)}")
@@ -236,7 +237,7 @@ def check_policy(policy: dict) -> None:
             raise HostError(f"policy {key} must be a whole number from {0 if key == 'cleanSteadyHours' else 1} to {high}, not {json.dumps(value)}")
     if not isinstance(merged["cleanEmergencyPercent"], int) or isinstance(merged["cleanEmergencyPercent"], bool) \
             or not 0 <= merged["cleanEmergencyPercent"] <= 100:
-        raise HostError(f"policy cleanEmergencyPercent must be a whole number from 0 to 100, not {json.dumps(merged['cleanEmergencyPercent'])}")
+        raise HostError(f"policy cleanEmergencyPercent must be a whole number from 0 (off) to 100, not {json.dumps(merged['cleanEmergencyPercent'])}")
     for key, high in (("cleanGrowthGB", 1000), ("cleanFloorGB", 1000), ("parkedReapHours", 24 * 365), ("projectIdleHours", 24 * 365)):
         value = merged[key]
         if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= high:

@@ -2168,6 +2168,8 @@ def reap_archive_expired(path: str) -> bool:
     not expire. Only an archive with no readable manifest to ask falls back to its own folder's mtime."""
     if reap_archive_scratch(path):
         return False  # protected scratch copies have no automatic expiry, including when they are the sole copy
+    if os.path.basename(os.path.dirname(path)) == REAP_ARCHIVE_CLEAN_OWNER:
+        return reap_clean_archive_expired(path)
     days = reap_policy().get("archiveExpiryDays", 30)
     if not isinstance(days, int) or isinstance(days, bool) or days <= 0:
         return False
@@ -2184,6 +2186,55 @@ def reap_archive_expired(path: str) -> bool:
 
 
 REAP_ARCHIVE_CLEAN_OWNER = "clean-worktrees"   # the clean pass's archive owner folder (clean.CLEAN_ARCHIVE_OWNER)
+
+
+REAP_ARCHIVE_SEEN = "expiry-clock.json"   # when the reaper first counted a clean-worktrees archive toward cleanWorktreeArchiveExpiryDays
+
+
+def reap_clean_archive_expired(path: str) -> bool:
+    """A clean-pass archive (an unsaved worktree no job owned) expires only when the operator opted in with
+    cleanWorktreeArchiveExpiryDays (0 = never, the default), counted from the LATER of its sole-copy time and the first pass
+    that counted it, so turning the key on never expires an old archive at once. The clock is written by
+    reap_archive_stamp_legacy (deleting passes only); an archive whose clone still exists never expires."""
+    days = reap_policy().get("cleanWorktreeArchiveExpiryDays", 0)
+    if not isinstance(days, int) or isinstance(days, bool) or days <= 0:
+        return False
+    try:
+        since = reap_archive_sole_since(path)
+        clone = reap_archive_clone_of(path)
+        if since is None or clone is None or os.path.lexists(clone):
+            return False
+        data = reap_archive_read_small(os.path.join(path, REAP_ARCHIVE_SEEN), 4096)
+        seen = json.loads(data).get("since") if data else None
+        if not isinstance(seen, (int, float)) or isinstance(seen, bool):
+            return False
+        return now() - max(since, float(seen)) >= days * 86400
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def reap_clean_archive_start_clock(path: str) -> bool:
+    """Record, once, when expiry started counting for a clean-pass archive (only while the operator opted in)."""
+    days = reap_policy().get("cleanWorktreeArchiveExpiryDays", 0)
+    if not isinstance(days, int) or isinstance(days, bool) or days <= 0 or os.path.lexists(os.path.join(path, REAP_ARCHIVE_SEEN)):
+        return False
+    data = json.dumps({"since": now(), "at": iso()}).encode()
+    temporary = os.path.join(path, f".{REAP_ARCHIVE_SEEN}.tmp-{os.getpid()}")
+    try:
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            os.write(fd, data)
+            reap_durable(fd)
+        finally:
+            os.close(fd)
+        os.rename(temporary, os.path.join(path, REAP_ARCHIVE_SEEN))
+        return True
+    except OSError:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        return False
 
 
 def reap_archive_owner_name(name: str) -> bool:
@@ -6837,6 +6888,9 @@ def reap_archive_stamp_legacy() -> int:
     recorded now (marked `observed`) and the archive expires archiveExpiryDays after this pass, never earlier."""
     stamped = 0
     for item in reap_archive_items():
+        if item["owner"] == REAP_ARCHIVE_CLEAN_OWNER:
+            stamped += reap_clean_archive_start_clock(item["path"])
+            continue
         if reap_archive_sole_since(item["path"]) is None:
             clone = reap_archive_clone_of(item["path"])
             if clone is not None and not os.path.lexists(clone) and reap_archive_mark_sole(item["path"], clone, None, observed=True):
