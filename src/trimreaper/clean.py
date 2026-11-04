@@ -1572,7 +1572,7 @@ def clean_act(entry: dict, run_id: str, days: int) -> None:
 
 # ---- archive, then remove (the ladder's last rung) ------------------------------------------------------------------------------------
 
-CLEAN_ARCHIVE_OWNER = "clean-worktrees"   # <archiveRoot>/clean-worktrees/<folder>-<time>-<run>/ ; expire like job archives (archiveExpiryDays after sole-copy-since)
+CLEAN_ARCHIVE_OWNER = "clean-worktrees"   # <archiveRoot>/clean-worktrees/<folder>-<time>-<run>/ ; kept unless cleanWorktreeArchiveExpiryDays is set
 
 
 def clean_worktree_last_look(entry: dict, idle: float, archive: bool) -> None:
