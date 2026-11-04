@@ -685,7 +685,9 @@ class Emergency(Home):
         self.assertEqual(two["worktreeHours"], 6)
         self.assertEqual(two["job"]["hours"], 6)
         three = clean.clean_emergency(clean.clean_profile(policy, 3), policy, hot)
-        self.assertEqual(three["job"]["pinned"], 6)
+        self.assertEqual(three["job"]["pinned"], clean.clean_profile(policy, 3)["job"]["pinned"], "pinned inputs keep their window")
+        five = clean.clean_profile(policy, 5)
+        self.assertEqual(clean.clean_emergency(five, policy, hot), five, "unsaved work keeps its window")
 
     def test_below_the_line_or_unmeasured_nothing_changes(self):
         policy = dict(clean.CLEAN_POLICY)

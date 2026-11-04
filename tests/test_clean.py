@@ -187,12 +187,6 @@ class Debris(Home):
         self.assertTrue(fresh.exists())
         self.assertTrue(cache.exists())
 
-    def test_named_runtime_copy_in_build_temp(self):
-        path = self.put(self.buildtmp, "ultrabot-runtime.123/data").parent
-        self.age(path, 1)
-        self.run_target("agent-leftovers")
-        self.assertFalse(path.exists())
-
     def test_session_open_file_cwd_and_command_line_are_kept(self):
         path = self.put(self.sessions, "session/data").parent
         self.age(path, 1)

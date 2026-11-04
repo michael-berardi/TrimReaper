@@ -77,7 +77,10 @@ Only rung 5 removes work no remote holds, and only after the engine's archive: c
 repository, files in a tar read back against a SHA-256 manifest, the archive stamped as the only copy before the first byte goes, the
 worktree compared with the archive again, and a second look at every gate. A failed or stale archive, a protected name or a
 nested repository keeps the worktree. Archives of non-job worktrees live in `<archiveRoot>/clean-worktrees/` and do not expire by
-themselves; a job clone's archive follows `archiveExpiryDays` as before.
+themselves unless the operator sets `cleanWorktreeArchiveExpiryDays` (default `0`, never). Then one expires that many days after
+the LATER of its sole-copy time and the first deleting pass that counted it (`expiry-clock.json`), so turning the key on never
+removes an old archive at once, and never while its worktree exists. A job clone's archive follows `archiveExpiryDays` as before.
+The emergency window (`cleanEmergencyPercent`) never applies to the archive-then-remove rung or to pinned inputs.
 
 The job rungs call the job reaper's own removal (`reap_sweep`: every gate in the list above) with shorter windows through
 `reap_escalated`; they only differ from a tick in not stopping after two jobs. `reap_pin_released` is the one place a
