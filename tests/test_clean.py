@@ -1022,3 +1022,58 @@ class ReflogMaintenance(Worktrees):
         log.write_text("\n".join(rewritten) + "\n")  # the rewrite itself is what gc does: the file's mtime is now
         item = self.items(self.cli("clean", "--dry-run", "--only", "worktrees"))["app-old"]
         self.assertNotIn("keep", item, item)
+
+
+class CompressLogs(Home):
+    """Idle history files get transparent APFS compression; nothing is removed and the bytes read back the same."""
+
+    def history(self, name, days=5, size=300_000):
+        path = self.home / ".pi" / "agent" / "sessions" / "s" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(("transcript line\n" * (size // 16 + 1))[:size])
+        old = time.time() - days * 86400
+        os.utime(path, (old, old))
+        return path
+
+    def test_only_idle_unheld_text_files_are_planned(self):
+        idle = self.history("a.jsonl")
+        self.history("fresh.jsonl", days=0)
+        self.history("small.jsonl", size=1000)
+        self.history("binary.bin")
+        out = clean.clean_compress({clean.CLEAN_COMPRESS_NAME}, True, {"compressLogsIdleDays": 2, "compressLogsRoots": [".pi/agent/sessions"]})
+        if out.get("skipped"):
+            self.skipTest(out["skipped"])
+        # ctime cannot be backdated, so a just-written fixture is never idle: the plan must be empty, not include it
+        self.assertEqual(out["files"], 0, out)
+        self.assertTrue(idle.exists())
+
+    def test_planned_files_compress_and_read_back_identically(self):
+        path = self.history("b.jsonl")
+        data = path.read_bytes()
+        policy = {"compressLogsIdleDays": 2, "compressLogsRoots": [".pi/agent/sessions"]}
+        with mock.patch.object(clean, "now", return_value=time.time() + 10 * 86400):
+            out = clean.clean_compress({clean.CLEAN_COMPRESS_NAME}, False, policy)
+        if out.get("skipped"):
+            self.skipTest(out["skipped"])
+        self.assertEqual(out["files"], 1, out)
+        self.assertEqual(out["errors"], [])
+        self.assertEqual(path.read_bytes(), data)
+        self.assertTrue(os.lstat(path).st_flags & clean.CLEAN_UF_COMPRESSED)
+
+    def test_off_and_missing_tool_say_why(self):
+        out = clean.clean_compress({clean.CLEAN_COMPRESS_NAME}, True, {"compressLogsIdleDays": 0})
+        self.assertIn("off", out["skipped"])
+        with mock.patch.object(clean, "clean_compress_tool", return_value=None):
+            out = clean.clean_compress({clean.CLEAN_COMPRESS_NAME}, True, {"compressLogsIdleDays": 2})
+        self.assertIn("afsctool", out["skipped"])
+
+    def test_a_file_a_process_holds_is_left_alone(self):
+        path = self.history("c.jsonl")
+        policy = {"compressLogsIdleDays": 2, "compressLogsRoots": [".pi/agent/sessions"]}
+        table = {"files": [("1", "agent", "3w", str(path))], "commands": []}
+        with mock.patch.object(clean, "now", return_value=time.time() + 10 * 86400), \
+                mock.patch.object(clean, "reap_process_table", return_value=table):
+            out = clean.clean_compress({clean.CLEAN_COMPRESS_NAME}, True, policy)
+        if out.get("skipped"):
+            self.skipTest(out["skipped"])
+        self.assertEqual(out["files"], 0, out)
