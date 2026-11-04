@@ -485,13 +485,27 @@ def clean_newest_change(path: str, gitdir: str | None, fresh: bool = False) -> f
     return newest
 
 
+# Signs of work the tree walk cannot see because it skips node_modules and .git: an install writes node_modules/.package-lock.json
+# (and the lockfile), a fetch, merge or rebase writes these git files. 2026-11-03: node_modules of a main project checkout and of an
+# active scratch worktree were deleted about two hours after `npm ci`, mid-deploy, because the walk saw only old source files.
+CLEAN_INSTALL_MARKERS = ("node_modules/.package-lock.json", "node_modules/.modules.yaml", "node_modules/.yarn-state.yml",
+                         "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lockb", "bun.lock")
+CLEAN_GIT_ACTIVITY = ("ORIG_HEAD", "FETCH_HEAD", "MERGE_HEAD", "REBASE_HEAD", "COMMIT_EDITMSG")
+
+
 def clean_newest_change_walk(path: str, gitdir: str | None) -> float:
     stamps = []
-    if gitdir:
+    for marker in CLEAN_INSTALL_MARKERS:
         try:
-            stamps.append(os.lstat(os.path.join(gitdir, "HEAD")).st_mtime)
+            stamps.append(reap_scratch_changed(os.lstat(os.path.join(path, marker))))
         except OSError:
             pass
+    if gitdir:
+        for name in ("HEAD", *CLEAN_GIT_ACTIVITY):
+            try:
+                stamps.append(os.lstat(os.path.join(gitdir, name)).st_mtime)
+            except OSError:
+                pass
         last = clean_reflog_last(os.path.join(gitdir, "logs", "HEAD"))
         if last is not None:
             stamps.append(last)
@@ -1083,8 +1097,74 @@ def clean_project_gates(entry: dict, table: dict | None) -> None:
         raise ReapRefused(f"recent:{idle:.0f}h-of-{limit}h")
 
 
+def clean_scratch_debris_gates(entry: dict, table: dict | None) -> None:
+    """Debris in a job inherits the enclosing job's full evidence-window idle proof."""
+    path = reap_canon(entry["path"])
+    scope = None
+    for root, jobs_only in ((reap_agent_scratch_root(), False), (reap_cache_root(), True)):
+        root = reap_canon(root)
+        if not reap_inside(path, root) or path == root:
+            continue
+        parts = os.path.relpath(path, root).split(os.sep)
+        if jobs_only and not re.fullmatch(r"J-\d{4,}", parts[0]):
+            continue
+        scope = os.path.join(root, parts[0])
+        break
+    if scope is None:
+        return
+    repo = entry.get("repo")
+    try:
+        reap_holders(repo or scope, repo or scope, table)
+    except ReapRefused as refusal:
+        if str(refusal).startswith("in-use:"):
+            raise ReapRefused("in-use:worktree-process")
+        raise
+    proof = reap_scratch_idle_proof(scope)
+    if not proof["idle"]:
+        raise ReapRefused("idle-" + proof["reason"])
+    if not repo:
+        return
+    # Linked worktrees keep their Git metadata outside the job folder; the idle walk cannot see it.
+    dot_git = os.path.join(repo, ".git")
+    gitdir = clean_pointer_target(dot_git) if os.path.isfile(dot_git) else dot_git
+    if not gitdir or not os.path.isdir(gitdir):
+        raise ReapRefused("idle-unreadable")
+    cutoff = now() - evidence_expiry_days(reap_policy()) * 86400
+    pending = [os.path.join(gitdir, name) for name in ("index", "HEAD", "ORIG_HEAD", "logs")]
+    count = 0
+    budget = reap_scratch_idle_budget()
+    deadline = time.monotonic() + budget["seconds"]
+    try:
+        while pending:
+            if time.monotonic() >= deadline:
+                raise ReapRefused("idle-budget-time-exceeded")
+            current = pending.pop()
+            try:
+                info = os.lstat(current)
+            except FileNotFoundError:
+                continue
+            count += 1
+            if count > budget["entries"]:
+                raise ReapRefused("idle-budget-exceeded")
+            if stat.S_ISLNK(info.st_mode):
+                raise ReapRefused("idle-unreadable")
+            if info.st_mtime > cutoff:
+                raise ReapRefused("idle-recent-change")
+            if stat.S_ISDIR(info.st_mode):
+                with os.scandir(current) as entries:
+                    for child in entries:
+                        if count + len(pending) >= budget["entries"]:
+                            raise ReapRefused("idle-budget-exceeded")
+                        if time.monotonic() >= deadline:
+                            raise ReapRefused("idle-budget-time-exceeded")
+                        pending.append(child.path)
+    except OSError:
+        raise ReapRefused("idle-unreadable")
+
+
 def clean_extra_gates(entry: dict, table: dict | None = None) -> None:
     path, kind = entry["path"], entry["name"]
+    clean_scratch_debris_gates(entry, table)
     if kind == "project-dependencies":
         clean_project_gates(entry, table)
     elif kind != "rust-build-output":

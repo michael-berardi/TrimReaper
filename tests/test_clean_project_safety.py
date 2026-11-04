@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import time
 from pathlib import Path
 from unittest import mock
 
@@ -43,6 +44,21 @@ class ProjectSafety(Home):
             with self.subTest(category=entry["name"]), self.assertRaisesRegex(clean.ReapRefused, reason):
                 clean.clean_extra_gates(entry)
             self.assertTrue(Path(entry["path"]).exists())
+
+    def test_a_fresh_install_or_git_activity_is_recent_even_with_old_sources(self):
+        """A dependency install or a fetch/merge is activity: the tree walk skips node_modules and .git, so an install two hours
+        ago with month-old sources read as idle, and node_modules was deleted mid-deploy."""
+        stamp = time.time() - 3600
+        marker = self.put(self.repo, "node_modules/.package-lock.json", b"{}")
+        os.utime(marker, (stamp, stamp))
+        self.assertLess(clean.clean_repo_idle_hours(str(self.repo), True), 2)
+        marker.unlink()
+        fetch = self.repo / ".git" / "FETCH_HEAD"
+        fetch.write_text("x")
+        os.utime(fetch, (stamp, stamp))
+        self.assertLess(clean.clean_repo_idle_hours(str(self.repo), True), 2)
+        fetch.unlink()
+        self.assertGreater(clean.clean_repo_idle_hours(str(self.repo), True), 24 * 4)
 
     def test_dirty_tracked_source_refused(self):
         self.put(self.repo, "src/main.rs", b"unfinished source\n")

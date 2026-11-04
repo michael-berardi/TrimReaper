@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.11.2 (2026-11-04)
+
+Stops the clean pass from removing dependencies and build output a project is actively using. The idle walk skips
+`node_modules` and `.git`, so a project whose sources were old read as idle even right after `npm ci`, a fetch or a merge, and
+its `node_modules` was deleted mid-deploy. An install marker (`node_modules/.package-lock.json`, the lockfile) and git's
+`ORIG_HEAD`, `FETCH_HEAD`, `MERGE_HEAD`, `REBASE_HEAD` and `COMMIT_EDITMSG` now count as activity. Debris inside an
+agent-scratch task or a job folder also needs that folder's full idle proof, its linked worktree's git metadata to be quiet,
+and no process working in it (new reason `in-use:worktree-process`).
+
 ## 0.11.1 (2026-11-01)
 
 Fixes two gaps the 0.11.0 neutrality pass missed. The README install command still named the operator's GitHub handle; it now uses the neutral `your-github-username` placeholder and points at the current release. The neutrality test's personal-name regex was case-sensitive, so a lowercase handle in a URL slipped past it; the regex now matches case-insensitively.
