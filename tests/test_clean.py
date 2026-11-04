@@ -173,6 +173,26 @@ class Debris(Home):
         self.assertTrue(unrelated.exists())
         self.assertTrue(all(not path.exists() for path in paths))
 
+    def test_node_compile_cache_versions_use_own_age_and_process_proof(self):
+        cache = self.buildtmp / "node-compile-cache"
+        old = self.put(cache, "v1/data").parent
+        fresh = self.put(cache, "v2/data").parent
+        self.age(old, 2)
+        os.utime(cache, None)
+        with mock.patch.object(clean, "reap_process_table", return_value={"files": [("123", "node", "7r", str(old / "data"))], "commands": []}):
+            self.run_target("agent-leftovers")
+        self.assertTrue(old.exists())
+        self.run_target("agent-leftovers")
+        self.assertFalse(old.exists())
+        self.assertTrue(fresh.exists())
+        self.assertTrue(cache.exists())
+
+    def test_named_runtime_copy_in_build_temp(self):
+        path = self.put(self.buildtmp, "ultrabot-runtime.123/data").parent
+        self.age(path, 1)
+        self.run_target("agent-leftovers")
+        self.assertFalse(path.exists())
+
     def test_session_open_file_cwd_and_command_line_are_kept(self):
         path = self.put(self.sessions, "session/data").parent
         self.age(path, 1)

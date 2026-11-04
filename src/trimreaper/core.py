@@ -287,9 +287,9 @@ AGENT_SCRATCH_OWNER = "agent-scratch"
 RELEASE_EVIDENCE_OWNER = "release-evidence"
 RELEASE_EVIDENCE_KEEP = 2
 RELEASE_EVIDENCE_NAME = re.compile(r"^(?:(?P<product>[a-z][a-z-]*?)-)?(?P<version>\d+\.\d+\.\d+)(?P<suffix>-[A-Za-z0-9.-]+)?$")
-AGENT_SCRATCH_IDLE_MAX_ENTRIES = 200000   # entries one folder's idle walk may list; past it the walk stops and says so
+AGENT_SCRATCH_IDLE_MAX_ENTRIES = 3000000  # entries one folder's idle walk may list; past it the walk stops and says so
 AGENT_SCRATCH_IDLE_MAX_BYTES = 0          # bytes one folder's idle walk may see; 0 = no byte bound (bytes bound no work)
-AGENT_SCRATCH_IDLE_SECONDS = 10           # wall-clock budget of one folder's idle walk; past it the walk stops and says so
+AGENT_SCRATCH_IDLE_SECONDS = 60           # wall-clock budget of one folder's idle walk; past it the walk stops and says so
 AGENT_SCRATCH_LIST_SECONDS = 20           # the whole listing of the agent-scratch root may spend this long proving folders
 AGENT_SCRATCH_TICK_SECONDS = 3600     # the tick sweeps agent scratch at most hourly
 
@@ -881,11 +881,12 @@ def reap_git_repo_checks(root: str, needs: tuple) -> list[str]:
             raise ReapRefused(f"git-error:status:{code}")
         if out.strip():
             raise ReapRefused("dirty:" + ",".join(sorted({line[:2].strip() or "?" for line in out.splitlines()})))
-        code, _ = reap_git(root, "rev-parse", "--verify", "-q", "refs/stash")
-        if code == 0:
-            raise ReapRefused("stash-present")
-        if code != 1:
-            raise ReapRefused(f"git-error:stash:{code}")
+        if "output-stash-ok" not in needs:
+            code, _ = reap_git(root, "rev-parse", "--verify", "-q", "refs/stash")
+            if code == 0:
+                raise ReapRefused("stash-present")
+            if code != 1:
+                raise ReapRefused(f"git-error:stash:{code}")
         passed.append("git-clean")
     if "pushed" in needs:
         code, out = reap_git(root, "rev-list", "--count", "HEAD", "--not", "--remotes")
