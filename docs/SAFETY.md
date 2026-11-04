@@ -36,8 +36,10 @@ finishes, in case it is resumed. A **build queue** is any tool that takes a per-
    rebuilds from the source that stays, and the folder is still proved free of tracked files, matched case-insensitively against the index (a tracked file inside is refused even
    when `--assume-unchanged` or `--skip-worktree` hides it from `git status`). The clean, stash-free and pushed proofs still gate
    `dist` and every whole-clone removal.
-   For a whole clone: every branch, reflog entry and unreachable commit is on a remote, there are no tags or other refs,
-   no linked worktree depends on it, and every ignored file is known build output. Git runs with hooks, fsmonitor,
+   For a whole clone: every branch and reflog entry is on a remote, no unreachable object or other ref remains,
+   no linked worktree depends on it, and every ignored file is known build output. Tags normally keep a clone; for a
+   standalone repository under the job cache or agent-scratch root, every tag must instead match the exact object ID
+   advertised by `origin` within 30 seconds. An unavailable remote keeps it. Git runs with hooks, fsmonitor,
    includes, filters and global config disabled. Repository config that could run a program is refused before git reads it.
    Probes bind the exact gated Git directory, resolving linked worktree and submodule `.git` files, rather than discovering
    an enclosing repository. Checkout paths are made absolute before Git changes directory. The `.git` entry, its resolved
