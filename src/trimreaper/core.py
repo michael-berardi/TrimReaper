@@ -7084,6 +7084,7 @@ REAP_REASON_ACTIONS = {
     "kept-by-release": "the installed release or its rollback was built from this folder: kept",
     "retention-preserved": "carries a retention class (evidence/customer/release-runtime-rollback) or an unknown marker: kept",
     "idle-recent-change": "something in the folder changed inside the evidence window: kept until it is quiet for that long",
+    "in-use:worktree-process": "a process is using the enclosing worktree: kept until it exits or leaves",
     "idle-budget-exceeded": "the folder holds more entries than the idle walk may list: kept; the receipt names what the walk spent, and the policy key agentScratchIdleMaxEntries raises the limit",
     "idle-budget-time-exceeded": "the idle walk ran out of its time budget on this folder: kept; the receipt names the seconds it spent, and the policy key agentScratchIdleMaxSeconds raises the limit",
     "idle-budget-bytes-exceeded": "the folder is bigger than the byte budget the idle walk may see: kept; the receipt names what the walk spent, and the policy key agentScratchIdleMaxBytes raises the limit",
