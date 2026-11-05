@@ -2068,6 +2068,8 @@ def reap_item_retention(item: dict, prove: bool = True) -> str:
     return found
 
 
+REAP_ARCHIVE_KIND = "trimreaper-archive"   # the manifest kind this engine writes
+REAP_ARCHIVE_KINDS = (REAP_ARCHIVE_KIND, "ut-overseer-reap-archive")  # and every kind it reads: archives written before 0.14.0 keep working
 REAP_ARCHIVE_SOLE = "sole-copy-since.json"   # written into an archive the moment its clone starts to be removed (never before)
 REAP_ARCHIVE_SCRATCH = "scratch-protected-copy.json"  # permanent retention even if the large manifest becomes unreadable
 
@@ -2327,7 +2329,7 @@ def reap_archive_supersede(job_dir: str, final: str, clone: str, job: str) -> in
         current = json.loads(manifest) if manifest else None
     except (OSError, ValueError):
         return 0
-    if not isinstance(current, dict) or current.get("kind") != "ut-overseer-reap-archive" or current.get("path") != clone or current.get("job") != job:
+    if not isinstance(current, dict) or current.get("kind") not in REAP_ARCHIVE_KINDS or current.get("path") != clone or current.get("job") != job:
         return 0  # the successor must itself be a readable archive of this clone, or nothing is superseded
     removed = 0
     try:
@@ -2342,7 +2344,7 @@ def reap_archive_supersede(job_dir: str, final: str, clone: str, job: str) -> in
             data = reap_archive_read_small(os.path.join(entry.path, "manifest.json"), 64 * 2 ** 20)
             older = json.loads(data) if data else None
             if info.st_uid != os.getuid() or info.st_mtime >= newest or not isinstance(older, dict) \
-                    or older.get("kind") != "ut-overseer-reap-archive" or older.get("path") != clone or older.get("job") != job \
+                    or older.get("kind") not in REAP_ARCHIVE_KINDS or older.get("path") != clone or older.get("job") != job \
                     or older.get("class") == "agent-scratch" or reap_archive_scratch(entry.path) or reap_archive_sole_since(entry.path) is not None:
                 continue
             shutil.rmtree(entry.path, ignore_errors=True)
@@ -3288,7 +3290,7 @@ def reap_archive_create_owned(item: dict, plan: dict, repos: list, git_dirs: lis
         sealed = reap_archive_tar(item["path"], secrets, os.path.join(stage, "protected.tar.gz")) if secrets or item["class"] == "agent-scratch" else None
         if sealed:
             reap_archive_verify_tar(os.path.join(stage, "protected.tar.gz"), secrets)
-        manifest = {"schema": 2, "kind": "ut-overseer-reap-archive", "reaperVersion": VERSION, "createdAt": iso(), "run": run,
+        manifest = {"schema": 2, "kind": REAP_ARCHIVE_KIND, "reaperVersion": VERSION, "createdAt": iso(), "run": run,
                     "job": item["owner"], "jobs": item.get("jobs"), "class": item["class"], "path": item["path"], "reason": plan["reason"],
                     "fingerprint": fingerprint, "repositories": repositories, "soleCopySince": None,
                     "files": {**tar, "entries": [{k: f[k] for k in ("path", "kind", "bytes", "sha256", "mode")} for f in files]} if tar else None,

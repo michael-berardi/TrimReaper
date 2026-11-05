@@ -24,7 +24,7 @@ MODEL_CHOICE = re.compile(
 # slip past a capitalized pattern name.
 PERSONAL = re.compile(
     r"\b(?:Mike|Berardi|Dana|Felix|acme|acme|Mouseia|Liberty Design|"
-    r"libertydesign|acme)\b|/Users/[a-z]",
+    r"libertydesign|acme)\b|/Users/[a-z]|overseer(?!-reap-archive\")",
     re.IGNORECASE,
 )
 
