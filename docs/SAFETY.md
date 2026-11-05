@@ -331,3 +331,14 @@ Next safe step: <what happens next>
 
 The journal grows by a few lines per run. Past 4 MiB it is archived and shrunk automatically; `trimreaper owner compact
 --run <expectedRun>` does it by hand for a settled journal.
+
+## Tagged caches and nested job output (0.15.0)
+
+The clean pass removes a folder that declares itself a cache with a valid `CACHEDIR.TAG` (the exact signature line of the Cache
+Directory Tagging specification) only when: it is a real directory this user owns; it neither contains nor sits inside a
+protected name; it is not inside a release root and holds no release-like artifact within eight levels; git tracks nothing in
+it; no running or starting job names or declares it; no Rust build tool is running; no process has its cwd or an open file
+inside (checked again right before removal); and an idle walk that reads the later of mtime and ctime finds nothing changed
+within `taggedCacheIdleHours`. A walk that runs out of budget keeps the folder and says why. Removal holds the folder's own
+Cargo locks when present and goes through the guarded removal with receipts. Dependency output nested inside a job folder
+follows the same git proofs as a repository's own output, after six idle hours, for jobs that are no longer live.
