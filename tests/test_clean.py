@@ -1067,7 +1067,8 @@ class CompressLogs(Home):
             self.skipTest("needs macOS and afsctool")
         path = self.history("b.jsonl")
         data, mtime = path.read_bytes(), os.lstat(path).st_mtime_ns
-        out = self.run_compress(False)
+        with mock.patch.object(clean, "clean_compress_held", return_value=False):
+            out = self.run_compress(False)
         self.assertEqual((out["files"], out["errors"]), (1, []), out)
         self.assertEqual(path.read_bytes(), data)
         self.assertTrue(os.lstat(path).st_flags & clean.CLEAN_UF_COMPRESSED)
@@ -1083,7 +1084,8 @@ class CompressLogs(Home):
             with open(path, "a") as handle:
                 handle.write("late line\n")
             return real(a, b)
-        with mock.patch.object(clean, "clean_compress_same_bytes", side_effect=append_then_compare):
+        with mock.patch.object(clean, "clean_compress_same_bytes", side_effect=append_then_compare), \
+                mock.patch.object(clean, "clean_compress_held", return_value=False):
             out = self.run_compress(False)
         self.assertEqual(out["files"], 0, out)
         self.assertTrue(path.read_text().endswith("late line\n"))
@@ -1114,3 +1116,29 @@ class CompressLogs(Home):
                                     actions, errors)
         self.assertEqual(actions[0]["did"], "compressed-history")
         self.assertEqual(errors[0]["error"], "x")
+
+    def test_a_file_opened_after_the_snapshot_is_left_alone(self):
+        if not clean.clean_compress_tool():
+            self.skipTest("needs macOS and afsctool")
+        path = self.history("g.jsonl")
+        with mock.patch.object(clean, "clean_compress_held", return_value=True):
+            out = self.run_compress(False)
+        self.assertEqual((out["files"], out["kept"].get("held")), (0, 1), out)
+        self.assertFalse(os.lstat(path).st_flags & clean.CLEAN_UF_COMPRESSED)
+        self.assertEqual([p.name for p in path.parent.iterdir() if clean.CLEAN_COMPRESS_TEMP in p.name], [])
+
+    def test_a_stale_temp_of_a_dead_run_is_removed_and_the_original_kept(self):
+        path = self.history("h.jsonl")
+        stale = path.with_name(path.name + "." + clean.CLEAN_COMPRESS_TEMP + "-999999")
+        stale.write_text("leftover")
+        self.run_compress(True)
+        self.assertFalse(stale.exists())
+        self.assertTrue(path.exists())
+
+    def test_a_busy_owner_during_dedupe_does_not_raise(self):
+        def busy(*_):
+            raise clean.ReapRefused("cleanup-owner-busy:x")
+        with mock.patch.object(clean, "reap_cleanup_owner", side_effect=busy), \
+                mock.patch.object(clean, "clean_dedupe_roots", return_value=[]):
+            out = clean.clean_dedupe({clean.CLEAN_DEDUPE_NAME}, False)
+        self.assertIn("cleanup-owner-busy", out["skipped"])

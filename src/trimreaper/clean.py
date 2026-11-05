@@ -2153,8 +2153,11 @@ def clean_dedupe(chosen: set, dry_run: bool) -> dict:
     before = clean_free()
     if dry_run:
         return clean_dedupe_run(roots, True)
-    with reap_cleanup_owner("clean"):
-        result = clean_dedupe_run(roots, False)
+    try:
+        with reap_cleanup_owner("clean"):
+            result = clean_dedupe_run(roots, False)
+    except ReapRefused as error:  # a busy or stopped owner defers dedupe; it never takes the whole pass down
+        return {"name": CLEAN_DEDUPE_NAME, "dryRun": dry_run, "skipped": str(error), "files": 0, "bytes": 0, "errors": []}
     after = clean_free()
     result["freedBytes"] = None if None in (before, after) else after - before
     return result
@@ -2179,6 +2182,7 @@ CLEAN_COMPRESS_BATCH = 25
 CLEAN_COMPRESS_SECONDS = 300
 CLEAN_COMPRESS_TEMP = ".trimreaper-compress"
 CLEAN_UF_COMPRESSED = 0x20
+CLEAN_LOCKED_FLAGS = 0x02 | 0x04 | 0x20000 | 0x40000   # UF_IMMUTABLE, UF_APPEND, SF_IMMUTABLE, SF_APPEND
 
 
 def clean_compress_tool() -> str | None:
@@ -2223,18 +2227,50 @@ def clean_compress_candidates(roots: list[str], idle_days: float, at: float):
                     kept.append(d)
             dirs[:] = kept
             for name in files:
-                if not name.endswith(CLEAN_COMPRESS_SUFFIXES) or reap_protected(name) or CLEAN_COMPRESS_TEMP in name:
+                if CLEAN_COMPRESS_TEMP in name:
+                    clean_compress_stale_temp(os.path.join(folder, name))
+                    continue
+                if not name.endswith(CLEAN_COMPRESS_SUFFIXES) or reap_protected(name):
                     continue
                 full = os.path.join(folder, name)
                 try:
                     info = os.lstat(full)
                 except OSError:
                     continue
+                flags = getattr(info, "st_flags", 0)
                 if (not stat.S_ISREG(info.st_mode) or info.st_dev != device or info.st_nlink != 1 or info.st_mode & 0o111
-                        or info.st_size < CLEAN_COMPRESS_MIN_BYTES or getattr(info, "st_flags", 0) & CLEAN_UF_COMPRESSED
-                        or max(info.st_mtime, info.st_ctime) > cutoff):
+                        or info.st_uid != os.getuid() or info.st_size < CLEAN_COMPRESS_MIN_BYTES
+                        or flags & (CLEAN_UF_COMPRESSED | CLEAN_LOCKED_FLAGS) or max(info.st_mtime, info.st_ctime) > cutoff):
                     continue
                 yield full, info
+
+
+def clean_compress_stale_temp(path: str) -> None:
+    """A temporary clone left by a compress-logs run that was killed: its writer's pid is in its name; once that process is gone the
+    clone (never the original) goes."""
+    pid = path.rpartition(f".{CLEAN_COMPRESS_TEMP}-")[2]
+    if not pid.isdigit() or int(pid) == os.getpid():
+        return
+    try:
+        os.kill(int(pid), 0)
+        return  # still running: its own finally removes it
+    except ProcessLookupError:
+        pass
+    except OSError:
+        return
+    try:
+        info = os.lstat(path)
+        if stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid():
+            os.unlink(path)
+    except OSError:
+        pass
+
+
+def clean_compress_held(path: str) -> bool:
+    """A fresh per-file open-handle probe right before the rename: a process that opened the file after the pass's snapshot would
+    otherwise keep writing to the replaced inode. A probe that fails counts as held."""
+    code, out = reap_probe(["lsof", "-n", "-P", "-Fp", "--", path], 30)
+    return code not in (0, 1) or bool(out.strip())
 
 
 def clean_compress_identity(info) -> tuple:
@@ -2257,7 +2293,10 @@ def clean_compress_one(tool: str, path: str, info, deadline: float) -> str | Non
     try:
         if clean_compress_identity(os.lstat(path)) != clean_compress_identity(info):
             return "changed-before-compression"
-        clean_dedupe_clone(path, temp)
+        try:
+            clean_dedupe_clone(path, temp)
+        except subprocess.TimeoutExpired:
+            return "timeout"
         left = max(5.0, deadline - time.monotonic())
         try:
             done = subprocess.run([tool, "-c", "-T", "LZFSE", temp], stdin=subprocess.DEVNULL, capture_output=True, text=True,
@@ -2270,10 +2309,14 @@ def clean_compress_one(tool: str, path: str, info, deadline: float) -> str | Non
             return "not-compressible"
         if not clean_compress_same_bytes(path, temp):
             return "bytes-differ"
+        os.utime(temp, ns=(info.st_atime_ns, info.st_mtime_ns), follow_symlinks=False)  # after the compare: reading resets atime
+        os.chmod(temp, stat.S_IMODE(info.st_mode))
+        if clean_compress_held(path):
+            return "held"
         if clean_compress_identity(os.lstat(path)) != clean_compress_identity(info):
             return "changed-during-compression"
-        os.utime(temp, ns=(info.st_atime_ns, info.st_mtime_ns), follow_symlinks=False)
-        os.chmod(temp, stat.S_IMODE(info.st_mode))
+        # Nothing runs between this check and the rename. A writer that atomically replaces the file in those microseconds would
+        # lose its version (only a swap-and-recheck closes that); accepted for history files idle for days.
         os.rename(temp, path)
         return None
     except OSError as error:
@@ -2452,6 +2495,8 @@ def clean_compress_report(out: dict, actions: list, errors: list) -> None:
     """compress-logs results reach the automatic passes' receipts: what it compressed and saved, and every error it named."""
     compressed = out.get("compress") or {}
     errors.extend(compressed.get("errors") or [])
+    if compressed.get("skipped") and compressed.get("planned"):
+        errors.append({"clean": CLEAN_COMPRESS_NAME, "error": "deferred:" + compressed["skipped"], "deferred": compressed.get("deferred", 0)})
     if compressed.get("files"):
         actions.append({"did": "compressed-history", "files": compressed["files"], "bytes": compressed["bytes"],
                         "freedBytes": compressed.get("freedBytes"), "deferred": compressed.get("deferred", 0)})
