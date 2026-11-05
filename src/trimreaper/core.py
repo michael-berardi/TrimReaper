@@ -6259,6 +6259,12 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
                     gitdir, _, common = dirs.strip().partition("\n")
                     result["gitCommonDir"] = common.strip() if code == 0 and common.strip() and common.strip() != os.path.join(item["path"], ".git") else None
                     result["gitWorktreeDir"] = gitdir.strip() if result["gitCommonDir"] else None
+                    if result["gitCommonDir"]:
+                        # Checked before removal: a linked worktree removed while its main repository is busy would leave a
+                        # dangling worktree entry there, because the entry is only forgotten when the main repository is idle.
+                        busy = reap_worktree_main_busy(result["gitCommonDir"])
+                        if busy:
+                            raise ReapRefused(f"worktree-main-busy:{busy}")
                     held = [name for name in secrets if not any(part in REAP_ARCHIVE_SKIP for part in Path(name).parts[:-1])]  # not a package's .env.example in node_modules
                     if held and reap_archive_on() and reap_archive_eligible(item):
                         # secret copies and local state go with the clone under cloneProtectedCopies=remove: archived first (owner-only)

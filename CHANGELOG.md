@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.15.0 (2026-11-05)
+
+Finds the debris agents leave where earlier versions never looked, without loosening any proof.
+
+- New `tagged-caches` clean target: folders that declare themselves caches with a valid `CACHEDIR.TAG`, found at any depth in
+  the job cache, agent scratch, worktree homes, code homes and the user temp folder. Idle `taggedCacheIdleHours` (6), nothing
+  open, no build tool running, no release artifact, no retained or protected names, not a job or task root. Cargo targets stay
+  with `rust-build-output`; code homes are not swept by the steady pass.
+- Dependency and framework output nested anywhere inside a job folder of a job that is no longer live goes after 6 idle hours,
+  with the usual git proofs.
+- Agent scratch and finished jobs whose only blocker is unsaved git work are archived (unpushed commits as a verified bundle,
+  dirty and untracked files, files outside every repository, stray git directories whole) and then removed after
+  `unsavedArchiveDays` (7), in the routine pass. Linked worktree entries are forgotten in the main repository; nothing is
+  removed while that repository is busy.
+- `interruptedExpiryDays` (7): an interrupted job with no continuation or successor ages like a failed one.
+- The agent-scratch listing resumes where the last pass stopped and reuses idle proofs only while a folder is unchanged, so
+  every folder is proved within a few passes; removal always proves afresh.
+- `archiveBundleMode: "thin-local"` stores only what a persistent main repository lacks, pins that history there with
+  `refs/trimreaper/thin/<archive-id>` until the archive expires, and falls back to a self-contained bundle whenever it cannot.
+
 ## 0.14.1 (2026-11-05)
 
 An archive whose git bundle step fails (`bundle-init`, `bundle-refs`, `bundle-create`, `bundle-verify`) is remembered for a day like
