@@ -40,11 +40,13 @@ DEFAULT_POLICY = {
     "markedEvidenceExpiryDays": 5,
     # An archive goes this many days after it became the only copy of its clone.
     "archiveExpiryDays": 30,
+    # clean-pass archives of unsaved worktrees no job owned: 0 = kept indefinitely
     "cleanWorktreeArchiveExpiryDays": 0,
-    # compress-logs: idle (this many days) transcripts, receipts and logs under compressLogsRoots get transparent, lossless
-    # APFS compression (afsctool); nothing is removed. 0 = off. Roots are relative to home unless absolute or ~-prefixed.
+    # compress-logs: idle (this many days) history files under compressLogsRoots get transparent, lossless APFS compression
+    # (afsctool, verified clone renamed over the original); nothing is removed. 0 = off. Roots are folders inside home (relative
+    # to home unless absolute or ~-prefixed); none by default: the operator names their own agent history folders.
     "compressLogsIdleDays": 2,
-    "compressLogsRoots": [".claude/projects", ".pi/agent/sessions", ".pi/agent/usap"],   # clean-pass archives of unsaved worktrees no job owned: 0 = kept indefinitely
+    "compressLogsRoots": [],
     # "archive": save work no remote holds before an expired folder goes; anything else keeps such folders.
     "cloneArchive": "archive",
     # "remove": a whole clone's .env*/.dev.vars*/.wrangler/.vercel copies are archived owner-only and go with it.
