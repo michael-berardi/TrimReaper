@@ -2388,7 +2388,9 @@ def reap_archive_supersede(job_dir: str, final: str, clone: str, job: str) -> in
                     or older.get("class") == "agent-scratch" or reap_archive_scratch(entry.path) or reap_archive_sole_since(entry.path) is not None:
                 continue
             shutil.rmtree(entry.path, ignore_errors=True)
-            removed += 0 if os.path.lexists(entry.path) else 1
+            if not os.path.lexists(entry.path):
+                removed += 1
+                reap_archive_pins_release(older)  # superseded: its thin pins end with it (the successor holds its own)
         except (OSError, ValueError):
             continue
     return removed
@@ -2750,16 +2752,18 @@ def reap_scratch_archive_collect(item: dict) -> dict:
             "scratchEntries": identities}
 
 
-def reap_archive_collect(item: dict, units: list, evidence_cutoff: float | None, protected: bool = False) -> dict:
+def reap_archive_collect(item: dict, units: list, evidence_cutoff: float | None, protected: bool = False, loose: bool = False) -> dict:
     """The files the archive copies, from one names-and-lstat walk of the item (descriptor-relative, never following a symlink,
     never entering another device). Each file belongs to the innermost unit holding it; content of a job cache folder outside
     every repository is disposable and is not copied. `protected` (a whole clone under cloneProtectedCopies=remove) also
-    collects the protected names (.env*, .dev.vars*, .wrangler, .vercel) into their own list. `stamp` hashes the name, type,
+    collects the protected names (.env*, .dev.vars*, .wrangler, .vercel) into their own list. `loose` (the unsaved-work route,
+    which removes the folder at unsavedArchiveDays instead of the evidence window) also copies the files that belong to no
+    repository, notes and non-git copies beside a dirty repository, outside regenerable output. `stamp` hashes the name, type,
     size and mtime of EVERY entry the walk saw, left-out folders and clean files included (never inside a repository's own .git:
     the tips cover it), so the last look before removal sees any change anywhere in the tree."""
     path, by_root = item["path"], {u["root"]: u for u in units}
     forced = [u["root"] for u in units if u.get("forced")]
-    files, secrets, skipped, expired, listed = [], [], [], [], 0
+    files, secrets, skipped, expired, listed, loose_count = [], [], [], [], 0, 0
     stamp = hashlib.sha256()
     top = os.lstat(path)
     device = top.st_dev
@@ -2811,7 +2815,7 @@ def reap_archive_collect(item: dict, units: list, evidence_cutoff: float | None,
             elif held:
                 left_out(sub, "special-file")
     def walk(fd, rel, level, unit, raw, narrow=False, secret=False):
-        nonlocal listed
+        nonlocal listed, loose_count
         with os.scandir(fd) as entries:
             names = sorted(entry.name for entry in entries)
         for name in names:
@@ -2875,11 +2879,13 @@ def reap_archive_collect(item: dict, units: list, evidence_cutoff: float | None,
                 if narrow and protected and (secret or reap_protected(name)) and not reap_env_template(sub):
                     secrets.append(secret_entry(sub, info))  # a protected file on the way to a nested repository goes with the clone: kept
                     continue
-                if unit is None or own_git or narrow:
-                    continue  # cache content outside every repository; a linked worktree's own `.git` pointer; the way to a nested repository
+                if own_git or narrow or (unit is None and not loose):
+                    continue  # cache content outside every repository (unless `loose`); a linked worktree's own `.git` pointer; the way to a nested repository
                 held = secret or reap_protected(name)
-                if unit["kind"] == "git" and (in_unit in unit["clean"] or (in_unit in unit["ignoredKnown"] and not held)):
+                if unit is not None and unit["kind"] == "git" and (in_unit in unit["clean"] or (in_unit in unit["ignoredKnown"] and not held)):
                     continue  # git holds it unchanged, or it is ignored build output
+                if unit is None:
+                    loose_count += 1  # a file of no repository, saved because the folder goes before its evidence window ends
                 if not raw and not held and evidence_cutoff and stat.S_ISREG(info.st_mode) and evidence_name(name) and info.st_mtime <= evidence_cutoff:
                     why = reap_archive_evidence_why(unit, in_unit, sub)
                     if why:
@@ -2903,7 +2909,8 @@ def reap_archive_collect(item: dict, units: list, evidence_cutoff: float | None,
         raise ReapRefused("archive-scan-unreadable:" + reap_named(error))
     finally:
         os.close(fd)
-    return {"files": files, "protected": secrets, "skipped": skipped, "skippedCount": None, "expired": expired, "stamp": stamp.hexdigest()}
+    return {"files": files, "protected": secrets, "skipped": skipped, "skippedCount": None, "expired": expired, "stamp": stamp.hexdigest(),
+            "looseFiles": loose_count}
 
 
 class _ReapHashingReader:
@@ -3145,12 +3152,142 @@ def reap_archive_bundle_header(path: str) -> list[str]:
     return prerequisites
 
 
-def reap_archive_bundle_thin(unit: dict, stage: str, number: int, reserve: int, item_path: str) -> dict:
+REAP_THIN_PIN = "refs/trimreaper/thin/"   # a thin archive's prerequisites are pinned in its main repository by refs/trimreaper/thin/<archive-id>
+REAP_THIN_PIN_MAX = 2000                  # prerequisite commits one pin may name (more: self-contained)
+
+
+def reap_archive_never_expires(item: dict, owner: str) -> str | None:
+    """Why the archive about to be written will never expire (thin mode is then refused), else None. The protected-copy archive of
+    agent scratch never expires; a clean-pass archive expires only with cleanWorktreeArchiveExpiryDays, every other with
+    archiveExpiryDays. The same reading as reap_archive_expired: 0, a negative or an unreadable value never expires."""
+    if item.get("class") == "agent-scratch" and not item.get("archiveUnsaved"):
+        return "thin-forbidden:never-expires:protected-copies"
+    clean = owner == REAP_ARCHIVE_CLEAN_OWNER
+    key = "cleanWorktreeArchiveExpiryDays" if clean else "archiveExpiryDays"
+    days = reap_policy().get(key, 0 if clean else 30)
+    if not isinstance(days, int) or isinstance(days, bool) or days <= 0:
+        return f"thin-forbidden:never-expires:{key}"
+    return None
+
+
+def reap_archive_pin_repository(main: str) -> str:
+    """The main repository a pin lives in: an absolute real directory of this user with HEAD and an object store, never a link."""
+    if not isinstance(main, str) or not os.path.isabs(main):
+        raise ReapRefused("thin-pin-main-invalid")
+    info = os.lstat(main)
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() \
+            or not os.path.isfile(os.path.join(main, "HEAD")) or not os.path.isdir(os.path.join(main, "objects")):
+        raise ReapRefused("thin-pin-main-invalid")
+    return main
+
+
+def reap_archive_pin_ref(ref) -> str:
+    if not isinstance(ref, str) or not re.fullmatch(re.escape(REAP_THIN_PIN) + r"[A-Za-z0-9_-]{1,160}", ref):
+        raise ReapRefused("thin-pin-ref-invalid")
+    return ref
+
+
+def reap_archive_pin_write(main: str, pin_id: str, prerequisites: list[str]) -> dict:
+    """Pin the prerequisite commits of a thin bundle in its main repository: ONE ref, refs/trimreaper/thin/<archive-id>, naming a
+    commit (empty tree) whose parents are exactly the prerequisites, so every one of them and all their history stay reachable
+    when upstream force-pushes and the main repository prunes and collects garbage. Written, then read back (the ref exists, names
+    that commit, and every prerequisite is reachable from it) before the archive may be accepted. Raises ReapRefused, leaving no ref."""
+    ref = reap_archive_pin_ref(REAP_THIN_PIN + pin_id)
+    main = reap_archive_pin_repository(main)
+    if not prerequisites or len(prerequisites) > REAP_THIN_PIN_MAX or not all(re.fullmatch(r"[0-9a-f]{40,64}", p) for p in prerequisites):
+        raise ReapRefused("thin-pin-prerequisites")
+    env = {**reap_git_env(), "GIT_AUTHOR_NAME": "TrimReaper", "GIT_AUTHOR_EMAIL": "trimreaper@localhost",
+           "GIT_COMMITTER_NAME": "TrimReaper", "GIT_COMMITTER_EMAIL": "trimreaper@localhost"}
+    base = ["git", "-c", "core.hooksPath=" + os.devnull, "-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false", "--git-dir", main]
+    code, tree = reap_probe(base + ["hash-object", "-t", "tree", "-w", "--stdin"], reap_archive_remaining(60), env, "")
+    tree = tree.strip()
+    if code != 0 or not re.fullmatch(r"[0-9a-f]{40,64}", tree):
+        raise ReapRefused(f"thin-pin-write:tree:{code}")
+    argv = base + ["commit-tree", tree, "-m", f"TrimReaper thin archive pin {pin_id}"]
+    for sha in prerequisites:
+        argv += ["-p", sha]
+    code, commit = reap_probe(argv, reap_archive_remaining(60), env)
+    commit = commit.strip()
+    if code != 0 or not re.fullmatch(r"[0-9a-f]{40,64}", commit):
+        raise ReapRefused(f"thin-pin-write:commit:{code}")
+    code, _ = reap_probe(base + ["update-ref", "--stdin"], reap_archive_remaining(60), env, f"create {ref} {commit}\n")
+    try:
+        if code != 0:
+            raise ReapRefused(f"thin-pin-write:ref:{code}")
+        code, shown = reap_probe(base + ["rev-parse", "--verify", "-q", ref + "^{commit}"], reap_archive_remaining(60), env)
+        if code != 0 or shown.strip() != commit:
+            raise ReapRefused("thin-pin-verify:ref-missing")
+        code, out = reap_probe(base + ["rev-list", "--count", "--stdin"], reap_archive_remaining(120), env,
+                               "".join(f"{sha}\n" for sha in prerequisites) + f"^{ref}\n")
+        if code != 0 or out.strip() != "0":
+            raise ReapRefused("thin-pin-verify:prerequisite-unreachable")
+    except BaseException:
+        reap_archive_pin_release(main, ref)
+        raise
+    return {"pinRef": ref, "pinCommit": commit}
+
+
+def reap_archive_pin_release(main, ref) -> str:
+    """Remove one pin. Never raises: returns "released" (also when it was already gone) or a short reason it was kept. A kept pin only
+    keeps history alive longer, which is the safe direction."""
+    try:
+        ref, main = reap_archive_pin_ref(ref), reap_archive_pin_repository(main)
+        env = reap_git_env()
+        base = ["git", "-c", "core.hooksPath=" + os.devnull, "-c", "core.fsmonitor=false", "--git-dir", main]
+        code, _ = reap_probe(base + ["update-ref", "-d", ref], 60, env)
+        if code != 0:
+            return f"thin-pin-kept:update-ref:{code}"
+        code, _ = reap_probe(base + ["rev-parse", "--verify", "-q", ref], 60, env)
+        return "released" if code != 0 else "thin-pin-kept:still-present"
+    except (ReapRefused, OSError, ValueError) as error:
+        return "thin-pin-kept:" + str(error)[:80]
+
+
+def reap_archive_pin_present(thin) -> bool:
+    """Whether a thin bundle's pin still stands in its main repository and names the commit the manifest recorded."""
+    try:
+        ref, main = reap_archive_pin_ref(thin.get("pinRef")), reap_archive_pin_repository(thin.get("mainRepository"))
+        code, shown = reap_probe(["git", "-c", "core.hooksPath=" + os.devnull, "--git-dir", main, "rev-parse", "--verify", "-q", ref + "^{commit}"],
+                                 60, reap_git_env())
+        return code == 0 and shown.strip() == thin.get("pinCommit")
+    except (ReapRefused, AttributeError, OSError):
+        return False
+
+
+def reap_archive_pins_of(manifest) -> list[dict]:
+    """The thin pins a readable manifest names: [{mainRepository, pinRef, pinCommit}]."""
+    pins = []
+    for entry in (manifest.get("repositories") if isinstance(manifest, dict) else None) or []:
+        thin = (entry.get("bundle") or {}).get("thin") if isinstance(entry, dict) and isinstance(entry.get("bundle"), dict) else None
+        if isinstance(thin, dict) and thin.get("pinRef"):
+            pins.append(thin)
+    return pins
+
+
+def reap_archive_pins_release(manifest) -> list[str]:
+    return [reap_archive_pin_release(thin.get("mainRepository"), thin.get("pinRef")) for thin in reap_archive_pins_of(manifest)]
+
+
+def reap_archive_pins_read(path: str):
+    """The manifest of the archive at `path`, or None when it cannot be read (then no pin is touched)."""
+    data = reap_archive_read_small(os.path.join(path, "manifest.json"), 64 * 2 ** 20)
+    try:
+        manifest = json.loads(data) if data else None
+    except (ValueError, TypeError):
+        return None
+    return manifest if isinstance(manifest, dict) and manifest.get("kind") in REAP_ARCHIVE_KINDS else None
+
+
+def reap_archive_bundle_thin(unit: dict, stage: str, number: int, reserve: int, item_path: str, pin_id: str | None = None) -> dict:
     """repo-<n>.bundle, THIN: the saved tips of a LINKED worktree minus everything the default remote branch holds, which the
     main repository (the worktree's common git directory, outside every reaped root) also holds. Prerequisites are those
     commits; restoring needs that main repository. Verified by `git bundle verify` INSIDE the main repository (a missing
     prerequisite fails there) and by the coverage check that every saved tip is reachable from the bundle heads.
+    The prerequisites are PINNED in the main repository (refs/trimreaper/thin/<pin_id>, written and read back last): without it an
+    upstream force-push followed by a prune and gc there would leave the bundle unrestorable. No pin id, no thin bundle.
     Raises ReapRefused on anything unproven; reap_archive_bundle then writes a self-contained bundle instead."""
+    if not pin_id:
+        raise ReapRefused("thin-pin-unavailable")
     if not unit.get("linked"):
         raise ReapRefused("thin-not-a-linked-worktree")
     main = reap_archive_main_repository(unit["commonDir"], item_path)
@@ -3166,7 +3303,7 @@ def reap_archive_bundle_thin(unit: dict, stage: str, number: int, reserve: int, 
     tips = {sha: tip for sha, tip in sorted(unit["tips"].items()) if sha in unsaved}
     if not tips:
         raise ReapRefused("thin-nothing-beyond-base")
-    work, empty = os.path.join(stage, f".bundle-work-{number}"), None
+    work, pin = os.path.join(stage, f".bundle-work-{number}"), None
     target = os.path.join(stage, f"repo-{number}.bundle")
     try:
         code, _ = reap_probe(["git", "init", "--bare", "-q", "--template=", work], 60, reap_git_env())
@@ -3207,30 +3344,39 @@ def reap_archive_bundle_thin(unit: dict, stage: str, number: int, reserve: int, 
         if code != 0 or out.strip() != "0":
             raise ReapRefused(f"archive-verify-failed:bundle-coverage:{out.strip() or code}")
         shutil.rmtree(work)
-        return {"file": os.path.basename(target), "sha256": reap_file_sha256(target), "bytes": os.lstat(target).st_size,
+        pin = reap_archive_pin_write(main, pin_id, prerequisites)  # last: a ref only exists for a bundle that verified
+        digest = reap_file_sha256(target)
+        return {"file": os.path.basename(target), "sha256": digest, "bytes": os.lstat(target).st_size,
                 "heads": len(heads), "refs": names, "selfContained": False, "remoteTrackingRefs": 0,
                 "thin": {"mode": "thin-local", "mainRepository": main, "baseRef": base_ref, "baseCommit": base,
-                         "prerequisites": prerequisites,
-                         "restore": f"git -C {main} fetch <repo-n.bundle> 'refs/*:refs/ut-archive/*' (needs that repository: the bundle holds only the commits it lacks)"}}
+                         "prerequisites": prerequisites, **pin,
+                         "restore": f"git -C {main} fetch <repo-n.bundle> 'refs/*:refs/ut-archive/*' (needs that repository: the bundle holds only the commits it lacks; "
+                                    f"{pin['pinRef']} pins them there until the archive expires)"}}
     except BaseException:
         shutil.rmtree(work, ignore_errors=True)
         try:
             os.unlink(target)
         except OSError:
             pass
+        if pin:
+            reap_archive_pin_release(main, pin["pinRef"])
         raise
 
 
-def reap_archive_bundle(unit: dict, stage: str, number: int, reserve: int = 0, item_path: str | None = None) -> dict | None:
+def reap_archive_bundle(unit: dict, stage: str, number: int, reserve: int = 0, item_path: str | None = None,
+                        pin_id: str | None = None, thin_barred: str | None = None) -> dict | None:
     """The unit's bundle under `archiveBundleMode`: "thin-local" tries the thin bundle of reap_archive_bundle_thin for a linked
     worktree and, when its main repository is missing, inside a reaped root or anything does not verify, writes the self-contained
-    one (the manifest says why: `thinFallback`)."""
+    one (the manifest says why: `thinFallback`). `thin_barred` (an archive that never expires) forbids the thin bundle: its pin could
+    never be released."""
     if not unit["unpushed"]:
         return None
     note = None
     if reap_archive_bundle_mode() == "thin-local" and item_path:
         try:
-            return reap_archive_bundle_thin(unit, stage, number, reserve, item_path)
+            if thin_barred:
+                raise ReapRefused(thin_barred)
+            return reap_archive_bundle_thin(unit, stage, number, reserve, item_path, pin_id)
         except ReapRefused as refusal:
             note = str(refusal)
     made = reap_archive_bundle_self_contained(unit, stage, number, reserve)
@@ -3318,6 +3464,8 @@ def reap_archive_gitdir_gate(root: str) -> None:
             raise ReapRefused("git-error:unsafe-metadata:symlink")
     if os.path.lexists(os.path.join(root, "objects", "info", "alternates")) or os.path.lexists(os.path.join(root, "info", "grafts")):
         raise ReapRefused("git-error:unsafe-metadata:object-alternates")
+    if os.path.lexists(os.path.join(root, "commondir")):
+        raise ReapRefused("git-error:unsafe-metadata:commondir")  # a linked worktree's folder: git would read ANOTHER repository's refs and objects
     config = os.path.join(root, "config")
     if os.path.lexists(config):
         fd = os.open(config, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
@@ -3333,8 +3481,10 @@ def reap_archive_gitdir_gate(root: str) -> None:
 def reap_archive_gitdir_bundle(unit: dict, stage: str, number: int) -> dict | None:
     """repo-<n>.bundle of a stray Git directory: `git bundle create --all` (every ref, so the stash too), read back in an empty
     repository with no remote and checked (every ref's commit is a bundle head). None when git cannot read it safely, it holds no
-    ref, or anything does not verify: its files are then archived as they are, byte for byte. A bundle holds refs and their
-    history, not the directory's config, hooks, reflogs or unreachable objects."""
+    ref, or anything does not verify (a `commondir` file is refused: git would bundle the repository it points to). The bundle is
+    an EXTRA verified copy: the directory's raw files always stay in files.tar.gz, because a bundle holds refs and their history
+    only, not older stash entries (the refs/stash reflog), submodule repositories (modules/), LFS objects, worktrees/, config and
+    remotes, hooks, info/exclude or dangling commits."""
     root, target = unit["root"], os.path.join(stage, f"repo-{number}.bundle")
     empty = os.path.join(stage, f".bundle-empty-{number}")
     try:
@@ -3441,8 +3591,8 @@ def reap_archive_lfs_scan(unit: dict) -> list[dict]:
 
 def reap_archive_fingerprint(units: list, collected: dict) -> str:
     """What the archive would hold: the tips each repository saves and every collected file's name, size and mtime (protected
-    copies and LFS objects too). Format 2: self-contained bundles, so an archive of an older format is never reused."""
-    shape = [["archive-format", 2]] + [[u["root"], u["kind"], sorted(u.get("tips") or {})] for u in units if u.get("visited")]
+    copies and LFS objects too). Format 3: a stray Git directory keeps its raw files beside its bundle, so an archive of an older format is never reused."""
+    shape = [["archive-format", 3]] + [[u["root"], u["kind"], sorted(u.get("tips") or {})] for u in units if u.get("visited")]
     shape.append([[f["path"], f["bytes"], f["mtimeNs"]] for f in collected["files"]])
     if collected.get("protected"):
         shape.append(["protected", [[f["path"], f["bytes"], f["mtimeNs"]] for f in collected["protected"]]])
@@ -3473,6 +3623,9 @@ def reap_archive_reuse(job_dir: str, path: str, fingerprint: str) -> dict | None
             continue
         if reap_archive_bundle_mode() != "thin-local" and any((r.get("bundle") or {}).get("thin") for r in manifest.get("repositories") or []):
             continue  # a thin archive needs its main repository: self-contained mode writes its own
+        thin_entries = [(r.get("bundle") or {}).get("thin") for r in manifest.get("repositories") or [] if (r.get("bundle") or {}).get("thin")]
+        if any(not reap_archive_pin_present(t) for t in thin_entries):
+            continue  # a thin archive is reused only while its pin still holds the prerequisites in the main repository
         stored = [r["bundle"] for r in manifest.get("repositories") or [] if r.get("bundle")] \
             + [r["lfs"] for r in manifest.get("repositories") or [] if r.get("lfs")] \
             + [manifest[key] for key in ("files", "protectedFiles") if manifest.get(key)]
@@ -3494,7 +3647,7 @@ def reap_archive_state(item: dict, repos: list, git_dirs: list) -> tuple[list, d
     units = reap_archive_units(item, repos, git_dirs)
     days = evidence_expiry_days(reap_policy())
     cutoff = now() - days * 86400 if days and reap_jobs_finished_before(item.get("jobs") or [item.get("owner")], days * 86400) else None
-    collected = reap_archive_collect(item, units, cutoff, reap_archive_protected(item))
+    collected = reap_archive_collect(item, units, cutoff, reap_archive_protected(item), loose=bool(item.get("unsavedWindow")))
     for unit in units:
         if unit["kind"] == "git" and unit.get("visited"):
             unit["lfsFiles"] = reap_archive_lfs_scan(unit)
@@ -3522,11 +3675,17 @@ def reap_archive_create(item: dict, plan: dict, repos: list, git_dirs: list, run
 
 def reap_archive_create_owned(item: dict, plan: dict, repos: list, git_dirs: list, run: str | None) -> dict:
     units, collected = reap_archive_state(item, repos, git_dirs)
+    for unit in units:  # a worktree's removal makes its main repository forget the entry: not while that repository is being written to
+        if unit["kind"] == "git" and unit.get("linked") and not reap_inside(unit["commonDir"], item["path"]):
+            busy = reap_worktree_main_busy(unit["commonDir"])
+            if busy:
+                raise ReapRefused(f"worktree-main-busy:{busy}")
     files, secrets = collected["files"], collected["protected"]
     lfs_files = [f for u in units for f in u.get("lfsFiles") or []]
     total = sum(f["bytes"] for f in files) + sum(f["bytes"] for f in secrets) + sum(f["bytes"] for f in lfs_files)
     if len(files) + len(secrets) + len(lfs_files) > REAP_ARCHIVE_MAX_FILES or total > REAP_ARCHIVE_MAX_BYTES:
-        raise ReapRefused(f"archive-too-large:{len(files) + len(secrets) + len(lfs_files)}files:{total}B")
+        raise ReapRefused(f"archive-too-large:{len(files) + len(secrets) + len(lfs_files)}files:{total}B"
+                          + (f":with-{collected['looseFiles']}-files-outside-every-repository" if collected.get("looseFiles") else ""))
     for unit in units:  # every repository that holds work no remote has is reachable by the walk, or the clone stays
         if unit["kind"] == "git" and unit["unpushed"] and not unit.get("visited"):
             raise ReapRefused("archive-failed:bundle-missing:" + os.path.relpath(unit["root"], item["path"])[:80])
@@ -3562,7 +3721,10 @@ def reap_archive_create_owned(item: dict, plan: dict, repos: list, git_dirs: lis
     name = re.sub(r"[^A-Za-z0-9._-]+", "-", os.path.basename(item["path"])).lstrip(".-")[:80] or "folder"
     tag = (run or uuid.uuid4().hex)[:12]
     stage = str(job_dir / f".partial-{name}-{tag}")
+    pin_base = re.sub(r"[^A-Za-z0-9_-]+", "-", f"{name}-{tag}")[:60] + "-" + uuid.uuid4().hex[:10]  # <archive-id> of the thin pins (one per bundle)
     os.mkdir(stage, 0o700)
+    pins = []   # thin pins written for this archive: released again if the archive is not accepted
+    barred = reap_archive_never_expires(item, REAP_ARCHIVE_UNSAVED_OWNER if unsaved else item["owner"])
     try:
         repositories = []
         for number, unit in enumerate(units):
@@ -3573,7 +3735,9 @@ def reap_archive_create_owned(item: dict, plan: dict, repos: list, git_dirs: lis
                 entry.update(tips=len(unit["tips"]), refs=unit["refs"][:500], unbundled=unit["unbundled"][:100],
                              statusLines=unit["statusLines"][:2000], untracked=unit["untracked"],
                              lfsStore=bool(unit["lfs"] and unit["lfs"]["objects"]))
-                entry["bundle"] = reap_archive_bundle(unit, stage, number, total, item["path"]) if unit.get("visited") else None
+                entry["bundle"] = reap_archive_bundle(unit, stage, number, total, item["path"], f"{pin_base}-{number}", barred) if unit.get("visited") else None
+                if (entry["bundle"] or {}).get("thin"):
+                    pins.append(entry["bundle"]["thin"])
                 if entry["bundle"] is None and unit["unpushed"]:
                     raise ReapRefused("archive-failed:bundle-missing:" + entry["relative"][:80])
                 entry["stagedPatch"] = reap_archive_staged_patch(unit, stage, number) if unit.get("visited") else None
@@ -3587,10 +3751,9 @@ def reap_archive_create_owned(item: dict, plan: dict, repos: list, git_dirs: lis
             elif unit.get("gitError"):
                 entry["gitError"] = unit["gitError"]
             repositories.append(entry)
-        # A stray Git directory that bundled and verified is saved as the bundle alone (a restore needs nothing else).
-        whole = [r["relative"] for r in repositories if r["mode"] == "git-dir" and r.get("bundle") and r["relative"] not in (".", "")]
-        if whole:
-            files = [f for f in files if not any(f["path"] == w or f["path"].startswith(w + "/") for w in whole)]
+        # A stray Git directory's raw files ALWAYS stay in files.tar.gz: its bundle (`git bundle --all`) is an extra, verified copy of
+        # the refs and their history, and leaves out older stash entries, submodule repositories, LFS objects, worktrees, config,
+        # hooks, info/exclude and dangling commits.
         tar = reap_archive_tar(item["path"], files, os.path.join(stage, "files.tar.gz")) if files else None
         if tar:
             reap_archive_verify_tar(os.path.join(stage, "files.tar.gz"), files)
@@ -3600,7 +3763,7 @@ def reap_archive_create_owned(item: dict, plan: dict, repos: list, git_dirs: lis
         thin = any((r.get("bundle") or {}).get("thin") for r in repositories)
         manifest = {"schema": 2, "kind": REAP_ARCHIVE_KIND, "reaperVersion": VERSION, "createdAt": iso(), "run": run,
                     "job": item["owner"], "jobs": item.get("jobs"), "class": item["class"], "path": item["path"], "reason": plan["reason"],
-                    **({"scratchUnsaved": True} if unsaved else {}),
+                    **({"scratchUnsaved": True} if unsaved else {}), **({"looseFiles": collected["looseFiles"]} if collected.get("looseFiles") else {}),
                     "fingerprint": fingerprint, "repositories": repositories, "soleCopySince": None,
                     "files": {**tar, "entries": [{k: f[k] for k in ("path", "kind", "bytes", "sha256", "mode")} for f in files]} if tar else None,
                     "protectedFiles": {**sealed, "entries": [{k: f[k] for k in ("path", "kind", "bytes", "sha256", "mode")} for f in secrets]} if sealed else None,
@@ -3610,7 +3773,7 @@ def reap_archive_create_owned(item: dict, plan: dict, repos: list, git_dirs: lis
                                                 + ("; a thin bundle (`thin` in its entry) is verified by git bundle verify inside its recorded main repository instead" if thin else ""),
                                      "files": "tar read back: every member and only those, each sha256 equal to this manifest"},
                     "restore": "git init; git fetch <repo-n.bundle> 'refs/*:refs/ut-archive/*' (the bundle holds the whole history, no remote needed); "
-                               "tar -xzf files.tar.gz -C <folder>; protected.tar.gz holds the .env*/.dev.vars*/.wrangler/.vercel copies (owner-only, extract with the same care)"
+                               "tar -xzf files.tar.gz -C <folder> (also a stray Git directory's raw files and files outside every repository; a stray Git directory's bundle is an extra copy); protected.tar.gz holds the .env*/.dev.vars*/.wrangler/.vercel copies (owner-only, extract with the same care)"
                                + ("; a THIN bundle (archiveBundleMode thin-local) lacks the commits its `thin.mainRepository` holds: fetch it inside that repository" if thin else "")}
         data = json.dumps(manifest, indent=1, sort_keys=True).encode("utf-8", "surrogateescape")
         fd = os.open(os.path.join(stage, "manifest.json"), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
@@ -3638,6 +3801,8 @@ def reap_archive_create_owned(item: dict, plan: dict, repos: list, git_dirs: lis
             os.close(dfd)
     except BaseException:
         shutil.rmtree(stage, ignore_errors=True)  # this function's own staging folder: no partial archive is ever left as saved
+        for thin in pins:  # the archive was not accepted: its pins go too
+            reap_archive_pin_release(thin.get("mainRepository"), thin.get("pinRef"))
         raise
     superseded = reap_archive_supersede(str(job_dir), final, item["path"], item["owner"])  # the new one verified: its older siblings are redundant
     return {"path": final, "superseded": superseded, "manifestSha256": hashlib.sha256(data).hexdigest(), "bytes": sum(os.lstat(os.path.join(final, n)).st_size for n in os.listdir(final)),
@@ -4282,7 +4447,7 @@ def reap_chain_clock(conn, job: dict, depth: int = 0, seen: set | None = None) -
         if not successors:
             # No continuation, no accepted successor and no job resumed from it: nothing carries its work on. It never
             # finished, so it keeps everything for `interruptedExpiryDays` after its verified interruption (0: for good);
-            # then it is a failed job for every window (its folders age from that clock, and a pin on it ends).
+            # then it is a failed job for every window (its folders age from that clock). Pins on it are unchanged: see reap_pin_released.
             expiry = reap_policy_days("interruptedExpiryDays", INTERRUPTED_EXPIRY_DAYS)
             if not expiry or now() - base < expiry * 86400:
                 return None
@@ -5916,6 +6081,18 @@ def reap_size_note(path: str, sizing: dict) -> None:
         pass
 
 
+REAP_MAIN_BUSY = ("index.lock", "rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG", "sequencer")
+
+
+def reap_worktree_main_busy(common: str) -> str | None:
+    """Why the main repository must not have a worktree entry forgotten (or its worktree removed) right now: an `index.lock` (a git
+    command is writing there) or an operation in progress (rebase, merge, cherry-pick, revert, bisect). None when idle."""
+    for name in REAP_MAIN_BUSY:
+        if os.path.lexists(os.path.join(common, name)):
+            return "index-lock" if name == "index.lock" else f"mid-operation:{name}"
+    return None
+
+
 def reap_worktree_forget(common: str, gitdir: str | None, removed: str) -> str:
     """After a linked worktree's folder is gone, the main repository forgets exactly that worktree: its entry
     <common>/worktrees/<name>, and only when the entry's gitdir pointer names the folder just removed and it is not locked.
@@ -5932,6 +6109,9 @@ def reap_worktree_forget(common: str, gitdir: str | None, removed: str) -> str:
             return "worktree-entry-kept:points-elsewhere"
         if os.path.lexists(os.path.join(entry, "locked")):
             return "worktree-entry-kept:locked"
+        busy = reap_worktree_main_busy(common)
+        if busy:
+            return f"worktree-entry-kept:main-busy:{busy}"
         shutil.rmtree(entry)
         return "worktree-entry-forgotten"
     except FileNotFoundError:
@@ -6184,6 +6364,10 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
                 if collected["stamp"] != made["stamp"]:
                     raise ReapRefused("archive-stale:tree-changed-after-archive")
                 checks.append("archive-still-current")
+                for gitdir, common, root in made.get("gitLinked") or []:  # the main repository may have started a rebase or taken a lock meanwhile
+                    busy = None if reap_inside(common, item["path"]) else reap_worktree_main_busy(common)
+                    if busy:
+                        raise ReapRefused(f"worktree-main-busy:{busy}")
             checks.append("no-protected-leaf")
             if item.get("class") == "agent-scratch":
                 # The last look gets the whole per-folder budget, never what an earlier proof of this visit left of it: a
@@ -6219,6 +6403,7 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
                     checks.append("archive-sole-copy-recorded" if since else "archive-sole-copy-unrecorded")
                     if not since:
                         raise ReapRefused("archive-sole-copy-unrecorded")  # no stamp, no removal: the archive must be protected first
+                expiring_pins = reap_archive_pins_read(item["path"]) if item.get("class") == "job-archive" else None  # read before the folder goes
                 try:
                     removal_templates = dict.fromkeys(templates)
                     removal_templates.update(reap_vendored_templates(item["path"]))
@@ -6242,6 +6427,9 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
                         except OSError:
                             pass
                         result["archive"].pop("soleCopySince", None)
+                if expiring_pins is not None and result["outcome"] == "deleted":
+                    # an expired archive no longer needs its thin bundles' prerequisites kept alive in the main repository
+                    checks.extend(f"thin-pin-{state}" if state == "released" else state for state in reap_archive_pins_release(expiring_pins))
                 if whole_clone and result["outcome"] == "deleted" and result.get("gitCommonDir"):
                     # the main repository forgets this removed linked worktree and no other entry (its branch, tags and stash stay)
                     checks.append(reap_worktree_forget(result["gitCommonDir"], result.get("gitWorktreeDir"), item["path"]))
