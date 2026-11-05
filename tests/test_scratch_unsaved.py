@@ -527,3 +527,29 @@ class JobFolderUnsaved(UnsavedFixtures):
         with self.assertRaises(AssertionError):
             self.cli("reap", "--job", "J-0403")  # a running job is not reapable at all
         self.assertTrue(folder.exists())
+
+
+class CleanLinkedCloneBusyMain(Home):
+    """A clean, pushed job clone that is a linked worktree is removed without an archive; while its main repository is busy
+    the removal waits, so the main repository never keeps a dangling entry for a folder that is gone."""
+
+    def test_a_busy_main_repository_keeps_a_clean_linked_clone(self):
+        main = self.clone("app")
+        clone = self.dev / "app-j0301"
+        self.git(main, "worktree", "add", "-q", "-b", "j0301", str(clone))
+        self.git(clone, "push", "-q", "-u", "origin", "j0301")
+        self.add_job("J-0301", clone, finished_ago=10 * DAY)
+        lock = main / ".git" / "index.lock"
+        lock.write_text("")
+
+        out = self.cli("reap", "--job", "J-0301")
+
+        self.assertTrue(clone.exists(), out)
+        self.assertTrue((main / ".git" / "worktrees" / "app-j0301").exists())
+        self.assertIn("worktree-main-busy", json.dumps(out))
+        lock.unlink()
+
+        again = self.cli("reap", "--job", "J-0301")
+
+        self.assertFalse(clone.exists(), again)
+        self.assertFalse((main / ".git" / "worktrees" / "app-j0301").exists())

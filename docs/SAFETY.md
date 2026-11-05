@@ -365,3 +365,9 @@ inside (checked again right before removal); and an idle walk that reads the lat
 within `taggedCacheIdleHours`. A walk that runs out of budget keeps the folder and says why. Removal holds the folder's own
 Cargo locks when present and goes through the guarded removal with receipts. Dependency output nested inside a job folder
 follows the same git proofs as a repository's own output, after six idle hours, for jobs that are no longer live.
+
+Thin-bundle pins are kept on the safe side: a pin written for an archive that a crash then left unaccepted, or for an archive
+deleted by hand, is not released automatically, so that history stays in the main repository until the pin
+(`refs/trimreaper/thin/<archive-id>`) is removed by hand. A mirror push publishes these refs; exclude `refs/trimreaper/*` from
+mirrors. A clean, pushed linked worktree is removed only while its main repository is idle (no index lock, rebase, merge,
+cherry-pick, revert, bisect or sequencer state), so its worktree entry is always forgotten with it.
