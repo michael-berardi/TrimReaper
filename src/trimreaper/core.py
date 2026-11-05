@@ -122,6 +122,24 @@ def reap_policy() -> dict:
     return policy
 
 
+def reap_policy_days(key: str, default: int, policy: dict | None = None) -> int:
+    """A whole-number day count from the policy: the default when the key is absent, 0 (off) when the value cannot be read."""
+    policy = policy if policy is not None else reap_policy()
+    if key not in policy:
+        return default
+    value = policy[key]
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+
+def reap_unsaved_days(policy: dict | None = None) -> int:
+    """`unsavedArchiveDays`: idle days after which a scratch or job folder whose only blocker is unsaved git work is archived, then
+    removed. 0 (and cloneArchive other than "archive") turns it off: such a folder is kept, exactly as before."""
+    policy = policy if policy is not None else reap_policy()
+    if policy.get("cloneArchive", "archive") != "archive":
+        return 0
+    return reap_policy_days("unsavedArchiveDays", UNSAVED_ARCHIVE_DAYS, policy)
+
+
 def reap_pin_released(conn, other: dict) -> bool:
     """A job that waits on, or names as an input, another job's folders no longer pins them: it finished (done, failed,
     cancelled), or, while an escalation rung runs, it was interrupted longer than the rung's `pinnedHours` ago on a verified
@@ -278,7 +296,7 @@ REAP_LFS_DIR = os.path.join("lfs", "objects")   # below the git dir: Git LFS con
 # Refusals that mean "work no remote holds, or git cannot say": with cloneArchive=archive an expired folder is archived, then removed.
 REAP_ARCHIVABLE = ("dirty", "unpushed", "stash-present", "unproved-tags", "unproved-refs", "unproved-git-objects", "ignored-unknown",
                    "unproved-git-dir", "nested-git-in-clone", "nested-git-boundary", "git-error", "git-unsafe-index", "git-untracked",
-                   "protected-copies")
+                   "protected-copies", "linked-worktree")   # linked-worktree: a worktree INSIDE the folder (its HEAD is bundled, its entry forgotten)
 # ...of which these say git itself cannot be trusted or read here: retried, then archived as plain files (non-git).
 REAP_NONGIT = ("git-error", "git-unsafe-index", "git-untracked")
 AGENT_SCRATCH_OWNER = "agent-scratch"
@@ -292,6 +310,17 @@ AGENT_SCRATCH_IDLE_MAX_BYTES = 0          # bytes one folder's idle walk may see
 AGENT_SCRATCH_IDLE_SECONDS = 60           # wall-clock budget of one folder's idle walk; past it the walk stops and says so
 AGENT_SCRATCH_LIST_SECONDS = 20           # the whole listing of the agent-scratch root may spend this long proving folders
 AGENT_SCRATCH_TICK_SECONDS = 3600     # the tick sweeps agent scratch at most hourly
+AGENT_SCRATCH_CURSOR = "reaper:agent-scratch-cursor"   # meta: the last folder the listing proved; the next pass starts after it and wraps
+AGENT_SCRATCH_PROOFS = "reaper:agent-scratch-proofs"   # meta: per-folder idle proofs keyed by (device, inode, ctime) of the folder
+AGENT_SCRATCH_PROOF_SECONDS = 3 * 86400                # a remembered proof older than this is taken again, whatever the folder's ctime says
+AGENT_SCRATCH_PROOF_KEPT = 5000                        # folders whose proofs one listing remembers
+# Proofs worth remembering: a walk that finished or stopped on a property of the folder itself. A walk that ran out of TIME or
+# could not read an entry says nothing lasting about the folder, so it is taken again at the folder's next turn.
+AGENT_SCRATCH_PROOF_FINAL = ("idle", "recent-change", "protected-leaf", "budget-exceeded", "budget-bytes-exceeded", "too-deep", "mountpoint")
+UNSAVED_ARCHIVE_DAYS = 7              # default `unsavedArchiveDays`: idle scratch holding only unsaved git work is archived, then removed
+INTERRUPTED_EXPIRY_DAYS = 7           # default `interruptedExpiryDays`: an interrupted job with no continuation ages like a failed one
+ARCHIVE_BUNDLE_MODES = ("self-contained", "thin-local")   # `archiveBundleMode`
+REAP_ARCHIVE_UNSAVED_OWNER = "scratch-unsaved"            # <archive root>/<this>/<folder-stamp>: unsaved work of agent scratch; follows archiveExpiryDays
 
 
 class ReapRefused(Exception):
@@ -1984,6 +2013,7 @@ def reap_item_retention(item: dict, prove: bool = True) -> str:
 
     `prove` is the caller's own budget in one flag: a listing whose budget is spent asks for the retention without the
     idle proof, so an agent-scratch folder is kept unproven (a marker still decides) instead of being walked again."""
+    item.pop("unsavedWindow", None)  # re-derived below, every time: set only while the shorter unsavedArchiveDays window alone allows it
     if item.get("class") == "job-cache-subdir" and marked_evidence_keep(os.path.basename(item["path"])):
         return "evidence"
     if reap_marked_evidence_item(item):
@@ -2039,19 +2069,29 @@ def reap_item_retention(item: dict, prove: bool = True) -> str:
             return REAP_DISPOSABLE
         if reap_scratch_expired(item["owner"]) and reap_no_secret_material(item["path"]):
             return REAP_DISPOSABLE
+        if reap_job_unsaved_window(item["owner"]) and reap_no_retained_names(item["path"]):
+            item["unsavedWindow"] = True  # reap_item_strict keeps the folder unless unsaved git work is what is left (archived first)
+            return REAP_DISPOSABLE
     if cls == "agent-scratch":
         # A marker decides; only an unmarked folder is judged by its own idle proof, and the proof (its reason, its counts
         # and the budget it spent) rides on the item, so the receipt says why the folder stayed instead of naming an
         # unmarked folder and nothing else.
         if found == "unmarked":
-            if not prove:
+            hint = item.pop("idleProofHint", None)  # a remembered proof of the listing, used once: every later look walks afresh
+            if isinstance(hint, dict):
+                item["idleProof"], proof = hint, hint
+            elif not prove:
                 item["idleProof"] = {"idle": False, "reason": "budget-time-exceeded", "detail": "listing-budget-exhausted",
                                      "entries": 0, "bytes": 0, "newest": None, "elapsed": 0.0,
                                      "budget": {**reap_scratch_idle_budget(), "seconds": 0.0}}
                 return found
-            proof = reap_scratch_idle_proof(item["path"], seconds=reap_scratch_proof_seconds(item))
-            item["idleProof"] = proof
+            else:
+                proof = reap_scratch_idle_proof(item["path"], seconds=reap_scratch_proof_seconds(item))
+                item["idleProof"] = proof
             if proof["idle"]:
+                return REAP_DISPOSABLE
+            if proof.get("unsavedIdle") and reap_unsaved_days():
+                item["unsavedWindow"] = True  # quiet for unsavedArchiveDays only: removable solely after its unsaved git work is archived
                 return REAP_DISPOSABLE
         else:
             item.pop("idleProof", None)  # a marker decides: the listing's idle proof says nothing about this folder
@@ -2158,7 +2198,7 @@ def reap_archive_scratch(path: str) -> bool:
     data = reap_archive_read_small(os.path.join(path, "manifest.json"), 64 * 2 ** 20)
     try:
         manifest = json.loads(data) if data else None
-        return isinstance(manifest, dict) and manifest.get("class") == "agent-scratch"
+        return isinstance(manifest, dict) and manifest.get("class") == "agent-scratch" and manifest.get("scratchUnsaved") is not True
     except (ValueError, TypeError):
         return False
 
@@ -2258,7 +2298,7 @@ def reap_clean_archive_start_clock(path: str) -> bool:
 
 
 def reap_archive_owner_name(name: str) -> bool:
-    return bool(re.fullmatch(r"J-\d{4,5}", name)) or name == REAP_ARCHIVE_CLEAN_OWNER
+    return bool(re.fullmatch(r"J-\d{4,5}", name)) or name in (REAP_ARCHIVE_CLEAN_OWNER, REAP_ARCHIVE_UNSAVED_OWNER)
 
 
 def reap_archive_items() -> list[dict]:
@@ -2390,8 +2430,25 @@ def reap_jobs_finished_before(ids: list, seconds: float) -> bool:
     return True
 
 
+def reap_scratch_unsaved_ready(item: dict) -> bool:
+    """A scratch folder quiet for at least `unsavedArchiveDays` (newest change of its whole tree, from the idle proof, taken afresh
+    when none rode along: a folder marked disposable has none) may have its unsaved git work archived. Off with the scratch
+    protected-copy route (agentScratchProtectedCopies "archive" keeps its own, protected-only archive), and off while any part
+    of the proof is unknown."""
+    days = reap_unsaved_days()
+    if not days or reap_scratch_protected(item["path"]):
+        return False
+    proof = item.get("idleProof")
+    if not isinstance(proof, dict) or proof.get("newest") is None or not (proof.get("idle") or proof.get("unsavedIdle")):
+        proof = reap_scratch_idle_proof(item["path"], seconds=reap_scratch_proof_seconds(item))
+    newest = proof.get("newest")
+    return bool(proof.get("idle") or proof.get("unsavedIdle")) and isinstance(newest, (int, float)) and now() - newest >= days * 86400
+
+
 def reap_archive_eligible(item: dict) -> bool:
     """cloneArchive=archive, a whole clone or a job cache folder, and every job it is named for finished cloneExpiryDays ago."""
+    if item.get("class") == "agent-scratch":
+        return reap_scratch_unsaved_ready(item)
     days = reap_policy().get("cloneExpiryDays", 3)
     if not reap_archive_on() or item.get("class") not in ("job-clone-root", "job-cache-subdir") \
             or not isinstance(days, int) or isinstance(days, bool) or days <= 0:
@@ -3014,7 +3071,175 @@ def reap_archive_bundle_estimate(unit: dict, work: str, revisions: str, cap: int
     return estimate
 
 
-def reap_archive_bundle(unit: dict, stage: str, number: int, reserve: int = 0) -> dict | None:
+def reap_archive_bundle_mode(policy: dict | None = None) -> str:
+    """`archiveBundleMode`: "self-contained" (default) or "thin-local". Anything else reads as the default, the safer one."""
+    policy = policy if policy is not None else reap_policy()
+    return "thin-local" if policy.get("archiveBundleMode", "self-contained") == "thin-local" else "self-contained"
+
+
+def reap_archive_reaped_root(path: str) -> bool:
+    """Whether the reaper may remove `path` (or something around it): inside the job-cache, agent-scratch or archive root, or a
+    job-named clone below a clone base. A repository that lives there cannot be the persistent half of a thin bundle."""
+    roots = []
+    for getter in (reap_cache_root, reap_agent_scratch_root, reap_archive_root):
+        try:
+            roots.append(reap_canon(str(getter())))
+        except (HostError, OSError, TypeError, ValueError):
+            continue
+    if any(reap_inside_folded(path, root) or reap_inside_folded(root, path) for root in roots):
+        return True
+    for base in reap_clone_base_paths():
+        if reap_inside_folded(path, base) and path != base and reap_job_ids(Path(path).relative_to(base).parts[0]):
+            return True
+    return False
+
+
+def reap_archive_main_repository(common: str, item_path: str) -> str:
+    """The persistent main repository a thin bundle is verified in: the linked worktree's common git directory. It must be a real
+    repository of this user (HEAD and an object store, never a link) outside the folder being archived and outside every root
+    the reaper removes from. Raises ReapRefused naming why not (the caller then writes a self-contained bundle)."""
+    common = reap_canon(common)
+    try:
+        info = os.lstat(common)
+    except OSError:
+        raise ReapRefused("thin-main-missing")
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise ReapRefused("thin-main-not-a-repository")
+    if not os.path.isfile(os.path.join(common, "HEAD")) or not os.path.isdir(os.path.join(common, "objects")):
+        raise ReapRefused("thin-main-not-a-repository")
+    repository = os.path.dirname(common) if os.path.basename(common) == ".git" else common
+    if reap_inside_folded(repository, item_path) or reap_inside_folded(common, item_path) or reap_archive_reaped_root(repository):
+        raise ReapRefused("thin-main-in-reaped-root")
+    return common
+
+
+def reap_archive_default_branch(unit: dict, main: str) -> tuple[str, str]:
+    """The remote-tracking ref of the default branch of the source repository, with its commit: refs/remotes/<remote>/HEAD's
+    target, else <remote>/main, else <remote>/master, remotes in the order the repository names them (origin first). Raises
+    ReapRefused when it has none."""
+    known = dict(unit["remoteRefs"])
+    names = sorted(unit.get("remotes") or {}, key=lambda n: (n != "origin", n))
+    for remote in names:
+        code, out = reap_archive_git(main, "symbolic-ref", "-q", f"refs/remotes/{remote}/HEAD", timeout=reap_archive_remaining(60))
+        target = out.strip() if code == 0 else ""
+        for ref in ([target] if target.startswith(f"refs/remotes/{remote}/") else []) + [f"refs/remotes/{remote}/main", f"refs/remotes/{remote}/master"]:
+            if ref in known:
+                return ref, known[ref]
+    raise ReapRefused("thin-no-default-branch")
+
+
+def reap_archive_bundle_header(path: str) -> list[str]:
+    """The prerequisite commits a bundle file names (the `-<sha>` lines of its header), read from the file itself."""
+    prerequisites = []
+    with open(path, "rb") as handle:
+        for index, raw in enumerate(handle):
+            line = raw.decode("utf-8", "replace").rstrip("\n")
+            if index == 0 and not line.startswith("# v"):
+                raise ReapRefused("archive-verify-failed:bundle-header")
+            if not line:
+                break
+            if line.startswith("-"):
+                prerequisites.append(line[1:].split(" ", 1)[0])
+            if index > 100000:
+                raise ReapRefused("archive-verify-failed:bundle-header")
+    return prerequisites
+
+
+def reap_archive_bundle_thin(unit: dict, stage: str, number: int, reserve: int, item_path: str) -> dict:
+    """repo-<n>.bundle, THIN: the saved tips of a LINKED worktree minus everything the default remote branch holds, which the
+    main repository (the worktree's common git directory, outside every reaped root) also holds. Prerequisites are those
+    commits; restoring needs that main repository. Verified by `git bundle verify` INSIDE the main repository (a missing
+    prerequisite fails there) and by the coverage check that every saved tip is reachable from the bundle heads.
+    Raises ReapRefused on anything unproven; reap_archive_bundle then writes a self-contained bundle instead."""
+    if not unit.get("linked"):
+        raise ReapRefused("thin-not-a-linked-worktree")
+    main = reap_archive_main_repository(unit["commonDir"], item_path)
+    base_ref, base = reap_archive_default_branch(unit, main)
+    code, _ = reap_archive_git(main, "cat-file", "-e", base + "^{commit}", timeout=reap_archive_remaining(60))
+    if code != 0:
+        raise ReapRefused("thin-base-missing-in-main")
+    code, out = reap_archive_git(main, "rev-list", "--stdin", data="".join(f"{sha}\n" for sha in unit["tips"]) + f"^{base}\n",
+                                 timeout=reap_archive_remaining(300))
+    if code != 0:
+        raise ReapRefused(f"thin-rev-list:{code}")
+    unsaved = set(out.split())
+    tips = {sha: tip for sha, tip in sorted(unit["tips"].items()) if sha in unsaved}
+    if not tips:
+        raise ReapRefused("thin-nothing-beyond-base")
+    work, empty = os.path.join(stage, f".bundle-work-{number}"), None
+    target = os.path.join(stage, f"repo-{number}.bundle")
+    try:
+        code, _ = reap_probe(["git", "init", "--bare", "-q", "--template=", work], 60, reap_git_env())
+        if code != 0:
+            raise ReapRefused(f"archive-failed:bundle-init:{code}")
+        with open(os.path.join(work, "objects", "info", "alternates"), "w") as handle:
+            handle.write(os.path.join(unit["commonDir"], "objects") + "\n")
+        names = {}
+        for index, (sha, tip) in enumerate(tips.items()):
+            names[f"refs/heads/ut-archive/{index}"] = {"sha": sha, "from": tip["from"]}
+        code, _ = reap_archive_git(work, "update-ref", "--stdin", data="".join(f"create {ref} {v['sha']}\n" for ref, v in names.items()))
+        if code != 0:
+            raise ReapRefused(f"archive-failed:bundle-refs:{code}")
+        revisions = "".join(f"{ref}\n" for ref in names) + f"^{base}\n"
+        free = reap_free_bytes()
+        room = REAP_ARCHIVE_MAX_BYTES if free is None else min(REAP_ARCHIVE_MAX_BYTES, free - REAP_ARCHIVE_SPACE_MARGIN - reserve)
+        estimate = reap_archive_bundle_estimate(unit, work, revisions, max(room, 0))
+        if estimate * REAP_ARCHIVE_BUNDLE_FACTOR > REAP_ARCHIVE_MAX_BYTES:
+            raise ReapRefused(f"archive-too-large:bundle:~{estimate}B")
+        if free is None or estimate * REAP_ARCHIVE_BUNDLE_FACTOR > free - REAP_ARCHIVE_SPACE_MARGIN - reserve:
+            raise ReapRefused(f"archive-no-space:{free}B-free:bundle-~{estimate}B")
+        code, _ = reap_archive_git(work, "bundle", "create", target, "--stdin", data=revisions, timeout=reap_archive_remaining())
+        if code != 0 or not os.path.isfile(target):
+            raise ReapRefused(f"archive-failed:bundle-create:{code}")
+        os.chmod(target, 0o600)
+        prerequisites = reap_archive_bundle_header(target)
+        if not prerequisites:
+            raise ReapRefused("archive-verify-failed:bundle-no-prerequisite")
+        code, _ = reap_archive_git(main, "bundle", "verify", target, timeout=reap_archive_remaining())  # the main repository holds every prerequisite
+        if code != 0:
+            raise ReapRefused(f"archive-verify-failed:bundle-verify-main:{code}")
+        code, out = reap_archive_git(work, "bundle", "list-heads", target)
+        heads = [line.split()[0] for line in out.splitlines() if line.split() and re.fullmatch(r"[0-9a-f]{40,64}", line.split()[0])]
+        if code != 0 or not heads:
+            raise ReapRefused(f"archive-verify-failed:bundle-heads:{code}")
+        probe = "".join(f"{sha}\n" for sha in unit["tips"]) + "".join(f"^{sha}\n" for sha in heads) + f"^{base}\n"
+        code, out = reap_archive_git(work, "rev-list", "--count", "--stdin", data=probe)  # every saved tip: a bundle head, or on the base
+        if code != 0 or out.strip() != "0":
+            raise ReapRefused(f"archive-verify-failed:bundle-coverage:{out.strip() or code}")
+        shutil.rmtree(work)
+        return {"file": os.path.basename(target), "sha256": reap_file_sha256(target), "bytes": os.lstat(target).st_size,
+                "heads": len(heads), "refs": names, "selfContained": False, "remoteTrackingRefs": 0,
+                "thin": {"mode": "thin-local", "mainRepository": main, "baseRef": base_ref, "baseCommit": base,
+                         "prerequisites": prerequisites,
+                         "restore": f"git -C {main} fetch <repo-n.bundle> 'refs/*:refs/ut-archive/*' (needs that repository: the bundle holds only the commits it lacks)"}}
+    except BaseException:
+        shutil.rmtree(work, ignore_errors=True)
+        try:
+            os.unlink(target)
+        except OSError:
+            pass
+        raise
+
+
+def reap_archive_bundle(unit: dict, stage: str, number: int, reserve: int = 0, item_path: str | None = None) -> dict | None:
+    """The unit's bundle under `archiveBundleMode`: "thin-local" tries the thin bundle of reap_archive_bundle_thin for a linked
+    worktree and, when its main repository is missing, inside a reaped root or anything does not verify, writes the self-contained
+    one (the manifest says why: `thinFallback`)."""
+    if not unit["unpushed"]:
+        return None
+    note = None
+    if reap_archive_bundle_mode() == "thin-local" and item_path:
+        try:
+            return reap_archive_bundle_thin(unit, stage, number, reserve, item_path)
+        except ReapRefused as refusal:
+            note = str(refusal)
+    made = reap_archive_bundle_self_contained(unit, stage, number, reserve)
+    if made is not None and note:
+        made["thinFallback"] = note[:200]
+    return made
+
+
+def reap_archive_bundle_self_contained(unit: dict, stage: str, number: int, reserve: int = 0) -> dict | None:
     """repo-<n>.bundle, SELF-CONTAINED: every saved tip and every remote-tracking ref of the repository, no prerequisite commits. A
     thin bundle (tips minus what a remote-tracking ref holds) cannot restore once that remote branch is deleted (squash-merge) or
     force-pushed, and nothing here can prove it still exists upstream. Built in a scratch bare repository that borrows the
@@ -3080,6 +3305,72 @@ def reap_archive_bundle(unit: dict, stage: str, number: int, reserve: int = 0) -
     shutil.rmtree(empty)
     return {"file": os.path.basename(target), "sha256": reap_file_sha256(target), "bytes": os.lstat(target).st_size,
             "heads": len(heads), "refs": names, "selfContained": True, "remoteTrackingRefs": len(unit["remoteRefs"])}
+
+
+def reap_archive_gitdir_gate(root: str) -> None:
+    """A stray Git directory (a bare repository, a `.git-backup`) is read by git only when it is this user's, links nothing, borrows
+    no object store, hides no history (grafts) and its config includes, filters and runs nothing (the same rule as a checkout's)."""
+    info = os.lstat(root)
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise ReapRefused("git-error:unsafe-metadata:foreign-owner")
+    for name in ("HEAD", "objects", "refs"):
+        if stat.S_ISLNK(os.lstat(os.path.join(root, name)).st_mode):
+            raise ReapRefused("git-error:unsafe-metadata:symlink")
+    if os.path.lexists(os.path.join(root, "objects", "info", "alternates")) or os.path.lexists(os.path.join(root, "info", "grafts")):
+        raise ReapRefused("git-error:unsafe-metadata:object-alternates")
+    config = os.path.join(root, "config")
+    if os.path.lexists(config):
+        fd = os.open(config, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            data = os.read(fd, 65537)
+        finally:
+            os.close(fd)
+        if len(data) > 65536:
+            raise ReapRefused("git-error:unsafe-metadata:oversized")
+        reap_config_gate(config, data.decode("utf-8", "strict"))
+
+
+def reap_archive_gitdir_bundle(unit: dict, stage: str, number: int) -> dict | None:
+    """repo-<n>.bundle of a stray Git directory: `git bundle create --all` (every ref, so the stash too), read back in an empty
+    repository with no remote and checked (every ref's commit is a bundle head). None when git cannot read it safely, it holds no
+    ref, or anything does not verify: its files are then archived as they are, byte for byte. A bundle holds refs and their
+    history, not the directory's config, hooks, reflogs or unreachable objects."""
+    root, target = unit["root"], os.path.join(stage, f"repo-{number}.bundle")
+    empty = os.path.join(stage, f".bundle-empty-{number}")
+    try:
+        reap_archive_gitdir_gate(root)
+        code, out = reap_archive_git(root, "for-each-ref", "--format=%(objectname)", timeout=reap_archive_remaining(120))
+        shas = {line.strip() for line in out.splitlines() if re.fullmatch(r"[0-9a-f]{40,64}", line.strip())}
+        if code != 0 or not shas:
+            return None
+        code, _ = reap_archive_git(root, "bundle", "create", target, "--all", timeout=reap_archive_remaining())
+        if code != 0 or not os.path.isfile(target):
+            raise ReapRefused("bundle-create")
+        os.chmod(target, 0o600)
+        free = reap_free_bytes()
+        size = os.lstat(target).st_size
+        if size > REAP_ARCHIVE_MAX_BYTES or free is None or free < REAP_ARCHIVE_SPACE_MARGIN:
+            raise ReapRefused("bundle-size")
+        code, _ = reap_probe(["git", "init", "--bare", "-q", "--template=", empty], 60, reap_git_env())
+        if code != 0:
+            raise ReapRefused("bundle-init")
+        code, _ = reap_archive_git(empty, "bundle", "verify", target, timeout=reap_archive_remaining())
+        if code != 0:
+            raise ReapRefused("bundle-verify")
+        code, out = reap_archive_git(empty, "bundle", "list-heads", target)
+        heads = {line.split()[0] for line in out.splitlines() if line.split()}
+        if code != 0 or not shas <= heads:
+            raise ReapRefused("bundle-coverage")
+        return {"file": os.path.basename(target), "sha256": reap_file_sha256(target), "bytes": size, "heads": len(heads),
+                "refs": len(shas), "selfContained": True, "whole": True, "remoteTrackingRefs": 0}
+    except (ReapRefused, OSError, UnicodeError):
+        try:
+            os.unlink(target)
+        except OSError:
+            pass
+        return None
+    finally:
+        shutil.rmtree(empty, ignore_errors=True)
 
 
 def reap_archive_staged_patch(unit: dict, stage: str, number: int) -> dict | None:
@@ -3180,6 +3471,8 @@ def reap_archive_reuse(job_dir: str, path: str, fingerprint: str) -> dict | None
             continue
         if manifest.get("path") != path or manifest.get("fingerprint") != fingerprint:
             continue
+        if reap_archive_bundle_mode() != "thin-local" and any((r.get("bundle") or {}).get("thin") for r in manifest.get("repositories") or []):
+            continue  # a thin archive needs its main repository: self-contained mode writes its own
         stored = [r["bundle"] for r in manifest.get("repositories") or [] if r.get("bundle")] \
             + [r["lfs"] for r in manifest.get("repositories") or [] if r.get("lfs")] \
             + [manifest[key] for key in ("files", "protectedFiles") if manifest.get(key)]
@@ -3194,8 +3487,10 @@ def reap_archive_reuse(job_dir: str, path: str, fingerprint: str) -> dict | None
 def reap_archive_state(item: dict, repos: list, git_dirs: list) -> tuple[list, dict]:
     """The units and the collected files an archive of this item would hold right now (names, sizes and tips; nothing written)."""
     if item["class"] == "agent-scratch":
-        reap_scratch_scope(item["path"])
-        return [], reap_scratch_archive_collect(item)
+        reap_scratch_scope(item["path"], private=not item.get("archiveUnsaved"))  # the archive of unsaved work holds no protected copy
+        if not item.get("archiveUnsaved"):
+            return [], reap_scratch_archive_collect(item)
+        # unsaved git work of an idle scratch folder (not protected copies): archived exactly like a job folder's
     units = reap_archive_units(item, repos, git_dirs)
     days = evidence_expiry_days(reap_policy())
     cutoff = now() - days * 86400 if days and reap_jobs_finished_before(item.get("jobs") or [item.get("owner")], days * 86400) else None
@@ -3246,7 +3541,8 @@ def reap_archive_create_owned(item: dict, plan: dict, repos: list, git_dirs: lis
     info = os.lstat(root)
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
         raise ReapRefused("archive-failed:archive-root-not-private")
-    job_dir = root / item["owner"]
+    unsaved = item["class"] == "agent-scratch" and bool(item.get("archiveUnsaved"))  # not the protected-copy archive: it expires like any archive
+    job_dir = root / (REAP_ARCHIVE_UNSAVED_OWNER if unsaved else item["owner"])
     job_dir.mkdir(exist_ok=True, mode=0o700)
     if stat.S_ISLNK(os.lstat(job_dir).st_mode):
         raise ReapRefused("archive-failed:job-dir-symlink")
@@ -3257,7 +3553,8 @@ def reap_archive_create_owned(item: dict, plan: dict, repos: list, git_dirs: lis
     linked = next((u for u in units if u["root"] == item["path"] and u["kind"] == "git" and u.get("linked")), None)
     common = {"fingerprint": fingerprint, "stamp": collected["stamp"], "scratchEntries": collected.get("scratchEntries"),
               "gitCommonDir": linked["commonDir"] if linked else None,
-              "gitDir": linked["gitDir"] if linked else None, "files": len(files) + len(secrets) + len(lfs_files), "inputBytes": total}
+              "gitDir": linked["gitDir"] if linked else None, "files": len(files) + len(secrets) + len(lfs_files), "inputBytes": total,
+              "gitLinked": [(u["gitDir"], u["commonDir"], u["root"]) for u in units if u["kind"] == "git" and u.get("linked")]}
     reused = reap_archive_reuse(str(job_dir), item["path"], fingerprint) if item["class"] != "agent-scratch" else None
     if reused:
         return {**reused, **common}
@@ -3276,7 +3573,7 @@ def reap_archive_create_owned(item: dict, plan: dict, repos: list, git_dirs: lis
                 entry.update(tips=len(unit["tips"]), refs=unit["refs"][:500], unbundled=unit["unbundled"][:100],
                              statusLines=unit["statusLines"][:2000], untracked=unit["untracked"],
                              lfsStore=bool(unit["lfs"] and unit["lfs"]["objects"]))
-                entry["bundle"] = reap_archive_bundle(unit, stage, number, total) if unit.get("visited") else None
+                entry["bundle"] = reap_archive_bundle(unit, stage, number, total, item["path"]) if unit.get("visited") else None
                 if entry["bundle"] is None and unit["unpushed"]:
                     raise ReapRefused("archive-failed:bundle-missing:" + entry["relative"][:80])
                 entry["stagedPatch"] = reap_archive_staged_patch(unit, stage, number) if unit.get("visited") else None
@@ -3285,26 +3582,36 @@ def reap_archive_create_owned(item: dict, plan: dict, repos: list, git_dirs: lis
                     entry["lfs"] = {**reap_archive_tar(os.path.join(unit["commonDir"], REAP_LFS_DIR), unit["lfsFiles"], target, level=1),
                                     "restore": "tar -xzf repo-<n>.lfs.tar.gz -C <repository>/.git/lfs/objects"}
                     reap_archive_verify_tar(target, unit["lfsFiles"])
+            elif unit["kind"] == "git-dir" and unit.get("visited"):
+                entry["bundle"] = reap_archive_gitdir_bundle(unit, stage, number)  # None: its files go as they are
             elif unit.get("gitError"):
                 entry["gitError"] = unit["gitError"]
             repositories.append(entry)
+        # A stray Git directory that bundled and verified is saved as the bundle alone (a restore needs nothing else).
+        whole = [r["relative"] for r in repositories if r["mode"] == "git-dir" and r.get("bundle") and r["relative"] not in (".", "")]
+        if whole:
+            files = [f for f in files if not any(f["path"] == w or f["path"].startswith(w + "/") for w in whole)]
         tar = reap_archive_tar(item["path"], files, os.path.join(stage, "files.tar.gz")) if files else None
         if tar:
             reap_archive_verify_tar(os.path.join(stage, "files.tar.gz"), files)
-        sealed = reap_archive_tar(item["path"], secrets, os.path.join(stage, "protected.tar.gz")) if secrets or item["class"] == "agent-scratch" else None
+        sealed = reap_archive_tar(item["path"], secrets, os.path.join(stage, "protected.tar.gz")) if secrets or (item["class"] == "agent-scratch" and not unsaved) else None
         if sealed:
             reap_archive_verify_tar(os.path.join(stage, "protected.tar.gz"), secrets)
+        thin = any((r.get("bundle") or {}).get("thin") for r in repositories)
         manifest = {"schema": 2, "kind": REAP_ARCHIVE_KIND, "reaperVersion": VERSION, "createdAt": iso(), "run": run,
                     "job": item["owner"], "jobs": item.get("jobs"), "class": item["class"], "path": item["path"], "reason": plan["reason"],
+                    **({"scratchUnsaved": True} if unsaved else {}),
                     "fingerprint": fingerprint, "repositories": repositories, "soleCopySince": None,
                     "files": {**tar, "entries": [{k: f[k] for k in ("path", "kind", "bytes", "sha256", "mode")} for f in files]} if tar else None,
                     "protectedFiles": {**sealed, "entries": [{k: f[k] for k in ("path", "kind", "bytes", "sha256", "mode")} for f in secrets]} if sealed else None,
                     "leftOut": collected["skipped"], "expiredEvidence": {"count": len(collected["expired"]), "bytes": sum(e["bytes"] for e in collected["expired"]),
                                                                        "entries": collected["expired"][:REAP_ARCHIVE_LIST_MAX]},
-                    "verification": {"bundles": "git bundle verify here and in an empty repository with no remote (self-contained); every saved tip reachable from the bundle heads",
+                    "verification": {"bundles": "git bundle verify here and in an empty repository with no remote (self-contained); every saved tip reachable from the bundle heads"
+                                                + ("; a thin bundle (`thin` in its entry) is verified by git bundle verify inside its recorded main repository instead" if thin else ""),
                                      "files": "tar read back: every member and only those, each sha256 equal to this manifest"},
                     "restore": "git init; git fetch <repo-n.bundle> 'refs/*:refs/ut-archive/*' (the bundle holds the whole history, no remote needed); "
-                               "tar -xzf files.tar.gz -C <folder>; protected.tar.gz holds the .env*/.dev.vars*/.wrangler/.vercel copies (owner-only, extract with the same care)"}
+                               "tar -xzf files.tar.gz -C <folder>; protected.tar.gz holds the .env*/.dev.vars*/.wrangler/.vercel copies (owner-only, extract with the same care)"
+                               + ("; a THIN bundle (archiveBundleMode thin-local) lacks the commits its `thin.mainRepository` holds: fetch it inside that repository" if thin else "")}
         data = json.dumps(manifest, indent=1, sort_keys=True).encode("utf-8", "surrogateescape")
         fd = os.open(os.path.join(stage, "manifest.json"), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
         try:
@@ -3313,7 +3620,7 @@ def reap_archive_create_owned(item: dict, plan: dict, repos: list, git_dirs: lis
             reap_durable(fd)
         finally:
             os.close(fd)
-        if item["class"] == "agent-scratch":
+        if item["class"] == "agent-scratch" and not unsaved:
             permanent = os.open(os.path.join(stage, REAP_ARCHIVE_SCRATCH), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
             try:
                 record = b'{"class":"agent-scratch","automaticExpiry":false}\n'
@@ -3336,7 +3643,7 @@ def reap_archive_create_owned(item: dict, plan: dict, repos: list, git_dirs: lis
     return {"path": final, "superseded": superseded, "manifestSha256": hashlib.sha256(data).hexdigest(), "bytes": sum(os.lstat(os.path.join(final, n)).st_size for n in os.listdir(final)),
             "bundles": sum(1 for r in repositories if r.get("bundle")), "expiredEvidence": len(collected["expired"]),
             "protectedFiles": len(secrets), "lfsObjects": len(lfs_files), "reused": False,
-            "scratchHashes": {f["path"]: f["sha256"] for f in secrets} if item["class"] == "agent-scratch" else None, **common}
+            "scratchHashes": {f["path"]: f["sha256"] for f in secrets} if item["class"] == "agent-scratch" and not unsaved else None, **common}
 
 
 def reap_recent_users(scope: str, ids: list, seconds: float) -> list[str]:
@@ -3506,7 +3813,12 @@ def reap_scratch_idle_proof(path: str, policy: dict | None = None, seconds: floa
     if not days:
         proof["reason"] = "expiry-off"
         return proof
-    cutoff = now() - days * 86400
+    # With unsavedArchiveDays shorter than the idle window, the walk takes the shorter cutoff: a folder quiet for that long is
+    # only ever removed when its sole blocker is unsaved git work, which is archived first (reap_item_strict decides that
+    # and keeps the folder otherwise). Quiet for the longer window too, it is idle exactly as before.
+    unsaved = reap_unsaved_days(policy)
+    unsaved = unsaved if 0 < unsaved < days else 0
+    cutoff = now() - (unsaved or days) * 86400
     started = time.monotonic()
     deadline = started + budget["seconds"]
     newest, seen, completed = [0.0], set(), [False]
@@ -3569,6 +3881,8 @@ def reap_scratch_idle_proof(path: str, policy: dict | None = None, seconds: floa
     proof["newest"] = newest[0] or None
     if not proof["reason"] and not completed[0]:
         proof["reason"] = "unreadable"  # a walk that did not finish never proves anything
+    if not proof["reason"] and unsaved and newest[0] > now() - days * 86400:
+        proof["reason"], proof["unsavedIdle"] = "recent-change", True  # quiet for unsavedArchiveDays only: not idle for removal
     if not proof["reason"]:
         proof["idle"], proof["reason"] = True, "idle"
     return proof
@@ -3626,50 +3940,162 @@ def reap_release_evidence_items() -> list[dict]:
     return items
 
 
-def reap_agent_scratch_items(deadline: float | None = None, after: str | None = None) -> list[dict]:
+REAP_SCRATCH_STATE = threading.local()   # the remembered proofs of the listing in progress (a side channel: the listing keeps its call shape)
+
+
+@contextmanager
+def reap_scratch_proofs_in(proofs: dict):
+    previous = getattr(REAP_SCRATCH_STATE, "proofs", None)
+    REAP_SCRATCH_STATE.proofs = proofs
+    try:
+        yield
+    finally:
+        REAP_SCRATCH_STATE.proofs = previous
+
+
+class ReapScratchListing(list):
+    """The agent-scratch items of one listing, with `report`: where it started, the cursor the next pass starts after, how many
+    folders it proved this pass (`proved`), took from a remembered proof (`cached`) or could not reach (`unproved`)."""
+    report: dict = {}
+
+
+def reap_scratch_proof_window(policy: dict | None = None) -> list:
+    """The idle windows a proof was taken for (evidenceExpiryDays, the effective unsavedArchiveDays): a remembered proof is
+    reused only under the same ones."""
+    policy = policy if policy is not None else reap_policy()
+    days = evidence_expiry_days(policy)
+    unsaved = reap_unsaved_days(policy)
+    return [days, unsaved if 0 < unsaved < days else 0]
+
+
+def reap_scratch_proof_identity(info) -> dict:
+    return {"dev": info.st_dev, "ino": info.st_ino, "ctimeNs": info.st_ctime_ns}
+
+
+def reap_scratch_proof_reusable(entry, info, policy: dict | None = None) -> dict | None:
+    """A remembered idle proof of this very folder, or None. Reusable only while the folder is the same object (device, inode)
+    with the same ctime, the proof is younger than AGENT_SCRATCH_PROOF_SECONDS, was taken under the same windows, and says
+    something lasting (AGENT_SCRATCH_PROOF_FINAL). A `recent-change` proof is reused only while the change it named is still
+    inside the shortest window, so a folder that has since gone quiet is proved again. The proof is a discovery hint only:
+    removal walks the folder afresh (reap_item_retention takes the hint once, at listing time)."""
+    try:
+        proof = entry["proof"]
+        at = float(entry["at"])
+        if not isinstance(proof, dict) or proof.get("reason") not in AGENT_SCRATCH_PROOF_FINAL \
+                or bool(proof.get("idle")) != (proof.get("reason") == "idle"):
+            return None
+        if not 0 <= now() - at < AGENT_SCRATCH_PROOF_SECONDS or entry["window"] != reap_scratch_proof_window(policy):
+            return None
+        if any(entry[k] != v for k, v in reap_scratch_proof_identity(info).items()):
+            return None
+        newest = proof.get("newest")
+        if proof["reason"] in ("idle", "recent-change") and (isinstance(newest, bool) or not isinstance(newest, (int, float))):
+            return None
+        if proof["reason"] == "recent-change":
+            windows = [d for d in entry["window"] if d]
+            if not windows or newest <= now() - min(windows) * 86400:
+                return None
+        return {**proof, "cached": True}
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def reap_agent_scratch_items(deadline: float | None = None, after: str | None = None, proofs: dict | None = None) -> list[dict]:
     """Every top-level folder of the agent-scratch root as an item. Names only; symlinks and protected names are not items.
 
     `deadline` bounds the idle proof the listing takes: every folder's walk gets what is left of it, so one listing never
-    spends more than its caller's budget on the whole root. A folder the listing could not prove is kept, unproven (a
-    marker still decides), and the next pass proves it again."""
+    spends more than its caller's budget on the whole root. A folder the listing could not prove is kept, unproved (a
+    marker still decides), and the next pass starts at it: `after` is the cursor, the listing starts at the folder behind it
+    and wraps. `proofs` (name -> remembered proof, see reap_scratch_proof_reusable) is read for folders whose identity and ctime
+    are unchanged, so a folder proved lately costs no budget, and written with every proof of this listing that says something
+    lasting; the caller stores it. The result's `report` names the cursor for the next pass and how many folders stay unproved."""
     root = reap_agent_scratch_root()
+    proofs = proofs if proofs is not None else getattr(REAP_SCRATCH_STATE, "proofs", None)
     try:
         entries = sorted(os.scandir(root), key=lambda e: e.name)
     except FileNotFoundError:
-        return []
+        return ReapScratchListing()
     if after:
         entries = [e for e in entries if e.name > after] + [e for e in entries if e.name <= after]
-    items = []
+    items = ReapScratchListing()
+    policy = reap_policy()
+    proved, cached, unproved, cursor, gap = 0, 0, 0, None, False
     for entry in entries:
         if reap_protected(entry.name) or entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
             continue
         item = {"path": reap_canon(entry.path), "root": reap_canon(root), "owner": AGENT_SCRATCH_OWNER, "jobs": [],
                 "class": "agent-scratch", "kind": "agent-scratch", "ownership": "agent-scratch-dir", "idleListed": True}
+        try:
+            info = os.lstat(entry.path)
+        except OSError:
+            info = None
+        hint = reap_scratch_proof_reusable((proofs or {}).get(entry.name), info, policy) if proofs and info and (proofs or {}).get(entry.name) else None
         remaining = None if deadline is None else deadline - time.monotonic()
-        prove = remaining is None or remaining > 0
+        prove = hint is not None or remaining is None or remaining > 0
         item["idleAttempted"] = prove
-        if remaining is not None:
+        if hint is not None:
+            item["idleProofHint"] = hint
+            item["idleCached"] = True
+        elif remaining is not None:
             item["idleSeconds"] = max(0.0, remaining)
         # Retention mutates item with its proof. Copying item before this call would silently discard that proof.
         item["retention"] = reap_item_retention(item, prove=prove)
         items.append(item)
+        if not prove:
+            unproved += 1
+            gap = True
+            continue
+        if hint is not None:
+            cached += 1
+        else:
+            proved += 1
+            proof = item.get("idleProof")
+            if proofs is not None and info is not None and isinstance(proof, dict) and proof.get("reason") in AGENT_SCRATCH_PROOF_FINAL:
+                proofs[entry.name] = {**reap_scratch_proof_identity(info), "at": now(), "window": reap_scratch_proof_window(policy),
+                                      "proof": {k: proof[k] for k in ("idle", "reason", "detail", "entries", "bytes", "newest", "budget", "elapsed", "unsavedIdle")
+                                                if k in proof}}
+        if not gap:
+            cursor = entry.name  # the last folder before the first one this pass could not reach: the next pass starts right behind it
+    items.report = {"after": after, "cursor": cursor, "proved": proved, "cached": cached, "unproved": unproved,
+                    "folders": proved + cached + unproved}
     return items
 
 
+def reap_scratch_proofs_load(conn) -> dict:
+    stored = row(conn, "SELECT value FROM meta WHERE key=?", (AGENT_SCRATCH_PROOFS,))
+    try:
+        found = json.loads(stored["value"]) if stored else {}
+    except (ValueError, TypeError):
+        found = {}
+    return found if isinstance(found, dict) else {}
+
+
+def reap_scratch_proofs_store(conn, proofs: dict, names: set) -> None:
+    """Remember the proofs of the folders that still exist (newest first, at most AGENT_SCRATCH_PROOF_KEPT)."""
+    kept = {k: v for k, v in proofs.items() if k in names and isinstance(v, dict)}
+    for name in sorted(kept, key=lambda k: -float(kept[k].get("at") or 0))[AGENT_SCRATCH_PROOF_KEPT:]:
+        del kept[name]
+    conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (AGENT_SCRATCH_PROOFS, json.dumps(kept, sort_keys=True)))
+
+
 def reap_agent_scratch_listing(conn) -> list[dict]:
-    """One bounded discovery pass, resuming after the last folder it attempted. The cursor only chooses order, never authority.
+    """One bounded discovery pass, resuming where the last one stopped. The cursor only chooses order, never authority.
 
     The caller supplies its current transaction (the tick already has one). Explicit dry-run/audit callers do not advance
-    the cursor. Store one name, not a growing set of paths, so a folder the discovery could not reach gets its turn on
-    the next pass instead of being starved by the same first names every hour.
+    the cursor. The cursor is one name (the last folder before the first one the pass could not reach, so that one is next
+    and a folder the discovery could not reach is never starved by the same first names every hour), and the idle proofs of
+    the folders it did prove are remembered with the folder's identity and ctime (meta `reaper:agent-scratch-proofs`): a pass
+    spends its budget on folders without a current proof, and every folder is proved within a few passes. A remembered proof
+    only orders and informs; the removal proves the folder afresh.
     """
-    stored = row(conn, "SELECT value FROM meta WHERE key='reaper:agent-scratch-cursor'")
-    items = reap_agent_scratch_items(time.monotonic() + AGENT_SCRATCH_LIST_SECONDS,
-                                    after=stored["value"] if stored else None)
-    attempted = [i for i in items if i.get("idleAttempted")]
-    if attempted:
-        conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('reaper:agent-scratch-cursor',?)",
-                     (os.path.basename(attempted[-1]["path"]),))
+    stored = row(conn, "SELECT value FROM meta WHERE key=?", (AGENT_SCRATCH_CURSOR,))
+    proofs = reap_scratch_proofs_load(conn)
+    with reap_scratch_proofs_in(proofs):
+        items = reap_agent_scratch_items(time.monotonic() + AGENT_SCRATCH_LIST_SECONDS, after=stored["value"] if stored else None)
+    report = getattr(items, "report", None) or {}
+    if report.get("cursor"):
+        conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (AGENT_SCRATCH_CURSOR, report["cursor"]))
+    reap_scratch_proofs_store(conn, proofs, {os.path.basename(i["path"]) for i in items})
     return items
 
 
@@ -3851,8 +4277,15 @@ def reap_chain_clock(conn, job: dict, depth: int = 0, seen: set | None = None) -
         return None
     if job.get("status") == "interrupted":
         base = reap_interruption_clock(conn, job)
-        if base is None or not successors:
-            return None  # an interrupted job without a continuation never finished
+        if base is None:
+            return None
+        if not successors:
+            # No continuation, no accepted successor and no job resumed from it: nothing carries its work on. It never
+            # finished, so it keeps everything for `interruptedExpiryDays` after its verified interruption (0: for good);
+            # then it is a failed job for every window (its folders age from that clock, and a pin on it ends).
+            expiry = reap_policy_days("interruptedExpiryDays", INTERRUPTED_EXPIRY_DAYS)
+            if not expiry or now() - base < expiry * 86400:
+                return None
     elif job.get("status") in REAP_TERMINAL:
         base = job.get("finished_at")
         if not isinstance(base, (int, float)) or isinstance(base, bool) or base <= 0:
@@ -3909,6 +4342,21 @@ def reap_job_finished_clock(conn, job: dict) -> float | None:
     if job.get("status") in REAP_TERMINAL:
         return job.get("finished_at")
     return reap_continued_interrupted(conn, job)
+
+
+def reap_job_unsaved_window(job_id: str | None) -> bool:
+    """The job finished (done/failed/cancelled, or interrupted past its continuation or `interruptedExpiryDays`) at least
+    `unsavedArchiveDays` ago: its folders may go once the unsaved git work in them is archived (the shorter window of
+    reap_scratch_expired; a folder with nothing unsaved still waits for evidenceExpiryDays)."""
+    days = reap_unsaved_days()
+    if not job_id or not days or not evidence_expiry_days(reap_policy()):
+        return False
+    with db() as conn:
+        job = row(conn, "SELECT * FROM jobs WHERE id=?", (job_id,))
+        if not job:
+            return False
+        clock = reap_job_finished_clock(conn, job)
+    return bool(clock) and now() - clock >= days * 86400
 
 
 def reap_scratch_expired(job_id: str | None) -> bool:
@@ -4869,13 +5317,14 @@ def reap_authority(item: dict) -> dict:
             if reap_release_keep_lapsed(conn, source, r["value"]):
                 released[source] = {**released[source], "keep": []}
     ids = list(dict.fromkeys(item.get("jobs") or []))
-    if item["class"] == "job-archive" and item["owner"] == REAP_ARCHIVE_CLEAN_OWNER:
-        ids = []  # the clean pass's own archive of an idle worktree no job owned: its expiry window is the only claim on it
+    if item["class"] == "job-archive" and item["owner"] in (REAP_ARCHIVE_CLEAN_OWNER, REAP_ARCHIVE_UNSAVED_OWNER):
+        ids = []  # an archive of a folder no job owned (an idle worktree, a scratch task): its expiry window is the only claim on it
     # Scratch tasks and release versions are independent siblings, not claims on their collection root.
     # Repository output still uses its source root so a source consumer preserves its build output.
     independent = item["class"] in ("agent-scratch", "release-evidence", "job-cache-subdir")
     scope = item["path"] if independent or item["class"] == "job-clone-root" else item["root"]
     clean_archive = item["class"] == "job-archive" and item["owner"] == REAP_ARCHIVE_CLEAN_OWNER
+    clean_archive = clean_archive or (item["class"] == "job-archive" and item["owner"] == REAP_ARCHIVE_UNSAVED_OWNER)
     if item["class"] not in ("release-target", "agent-scratch", "release-evidence") and not clean_archive and item["owner"] not in ids:
         raise ReapRefused("owner-not-recorded")
     for job_id in ids:
@@ -5612,6 +6061,7 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
                 stack.enter_context(reap_locks(reap_cargo_locks(item["path"]), create=False))
                 checks.append("cache-tag-locks")
             repos, proved, git_dirs, archive, templates, secrets = [], set(), [], None, frozenset(), []
+            item.pop("archiveUnsaved", None)
             scratch = item["class"] == "agent-scratch" and reap_scratch_protected(item["path"])
             protected_ok = whole_clone and reap_policy().get("cloneProtectedCopies", "remove") == "remove"
             try:
@@ -5652,12 +6102,17 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
             except ReapRefused as refusal:
                 # cloneArchive=archive: work no remote holds (or a repository git cannot read) is saved first; otherwise the refusal stands
                 archive = reap_archive_settles(item, str(refusal), reap_archive_eligible(item))
+                if item["class"] == "agent-scratch":
+                    item["archiveUnsaved"] = True  # unsaved git work, not protected copies: the full archive (bundles, files), which expires
                 repos, git_dirs = [], []
                 reap_protected_scan(item["path"], allow_git=True, markers=True, repos=repos, git_dirs=git_dirs, nested_disposable=whole_clone,
                                     templates=templates, protected_ok=protected_ok, expiring_evidence=expiring_evidence)
                 proved = set(repos)
                 result["archive"] = {"reason": archive["reason"], "repositories": len(proved), "gitDirs": len(set(git_dirs))}
                 checks.append("archive-settles-refusal")
+            if item.get("unsavedWindow") and archive is None:
+                # Quiet for unsavedArchiveDays only, and git work no remote holds is not what is left: the longer window stands.
+                raise ReapRefused("idle-recent-change" if item["class"] == "agent-scratch" else "retention-preserved:unmarked")
             if scratch and secrets:
                 # Nested Git must already have passed its unchanged clean/pushed/all-refs proofs above.
                 # This exception saves protected material only; it never settles unsaved source refusals.
@@ -5790,6 +6245,12 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
                 if whole_clone and result["outcome"] == "deleted" and result.get("gitCommonDir"):
                     # the main repository forgets this removed linked worktree and no other entry (its branch, tags and stash stay)
                     checks.append(reap_worktree_forget(result["gitCommonDir"], result.get("gitWorktreeDir"), item["path"]))
+                elif not whole_clone and result["outcome"] == "deleted" and made is not None:
+                    # Linked worktrees INSIDE the removed folder (their HEAD is in the archive): each one's main repository, when it
+                    # lives outside the folder, forgets exactly that entry, so it is left with no dangling worktree.
+                    for gitdir, common, root in made.get("gitLinked") or []:
+                        if not reap_inside(common, item["path"]):
+                            checks.append(reap_worktree_forget(common, gitdir, root))
         except ReapRefused as refusal:
             result["reason"] = str(refusal)
         except (OSError, ValueError, sqlite3.Error) as error:
@@ -6890,6 +7351,8 @@ def reap_agent_scratch(dry_run: bool, items: list[dict] | None = None) -> dict:
             done, stopped = reap_sweep(items, mode, ctx)
     out = {"items": done, **({"stopped": stopped} if stopped else {})}
     out.update(reap_summarize(done))
+    if getattr(items, "report", None):
+        out["listing"] = dict(items.report)  # the cursor the next pass starts after, and how many folders remain unproved
     return out
 
 
@@ -7107,6 +7570,15 @@ def tool_reap_owned(params: dict) -> dict:
         return reap_job(conn, job, bool(params.get("dryRun")), actor_of(params))
 
 
+def reap_audit_proved_scratch(item: dict) -> bool:
+    """A listed scratch folder whose idle proof is on the item and says it is kept (a proof taken, or remembered, with the
+    folder's reason): the audit names that reason without a walk, however little of its budget is left. A folder the listing
+    never reached has no proof and stays `audit-budget-exhausted`."""
+    proof = item.get("idleProof")
+    return item.get("class") == "agent-scratch" and bool(item.get("idleListed")) and isinstance(proof, dict) \
+        and not proof.get("idle") and proof.get("detail") != "listing-budget-exhausted" and item.get("retention") != REAP_DISPOSABLE
+
+
 def reap_audit_item(item: dict, blocker: str | None, ctx: dict, deadline: float) -> dict:
     base = {"path": item["path"], "class": item["class"], "kind": item["kind"]}
     try:
@@ -7131,7 +7603,7 @@ def reap_audit_item(item: dict, blocker: str | None, ctx: dict, deadline: float)
     if blocker:
         entry = {"state": "blocked", "blocking": blocker}
         done = None
-    elif time.monotonic() > deadline:
+    elif time.monotonic() > deadline and not reap_audit_proved_scratch(item):
         entry = {"state": "blocked", "blocking": "audit-budget-exhausted"}
         done = None
     else:
@@ -7196,6 +7668,7 @@ REAP_REASON_ACTIONS = {
     "archive-stale": "the folder, a process or a ref changed after its archive was made: kept; archived again on the next pass",
     "archive-failed": "the archive could not be completed (named after the colon): kept until it can be",
     "archive-verify-failed": "the archive did not verify: kept; nothing was removed",
+    "linked-worktree": "a linked worktree inside the folder: archived (its HEAD bundled) then removed once the folder is idle/expired; its main repository then forgets the entry",
     "linked-worktrees": "a linked worktree of this repository may still exist (or was moved): kept until it is reaped, pruned or provably gone",
     "recently-used-by": "a later job worked in this clone: it expires cloneExpiryDays after that job finished",
     "archive-pending": "inside cloneExpiryDays: nothing is archived or removed before the job has been finished that long",
@@ -7401,9 +7874,19 @@ def reap_audit(only: str | None, limit: int, include_items: bool, budget: int, p
                 entry["items"].append(audited)
                 reap_bucket(categories, reasons, audited, reason_bytes)
         release_rows.append(entry)
-    scratch_rows = []
+    scratch_rows, scratch_report = [], None
     if not only:
-        for item in reap_agent_scratch_items(deadline):  # the listing proves what it can within the audit's own budget
+        with db() as conn:  # the tick's own listing keeps the cursor and the remembered proofs; the audit starts at that cursor and reads them
+            stored = row(conn, "SELECT value FROM meta WHERE key=?", (AGENT_SCRATCH_CURSOR,))
+            scratch_proofs = reap_scratch_proofs_load(conn)
+            with reap_scratch_proofs_in(scratch_proofs):  # proves what it can within the audit's own budget
+                listing = reap_agent_scratch_items(deadline, after=stored["value"] if stored else None)
+            if persist:
+                if getattr(listing, "report", {}).get("cursor"):
+                    conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (AGENT_SCRATCH_CURSOR, listing.report["cursor"]))
+                reap_scratch_proofs_store(conn, scratch_proofs, {os.path.basename(i["path"]) for i in listing})
+        scratch_report = dict(getattr(listing, "report", None) or {})
+        for item in listing:
             audited = reap_audit_item(item, None, ctx, deadline)
             scratch_rows.append(audited)
             reap_bucket(categories, reasons, audited, reason_bytes)
@@ -7426,6 +7909,7 @@ def reap_audit(only: str | None, limit: int, include_items: bool, budget: int, p
             "jobs": listed[:limit], "jobsOmitted": max(0, len(listed) - limit),
             "releases": {"installed": releases["installed"], "rollback": releases["rollback"], "candidates": release_rows},
             "agentScratch": scratch_rows if include_items else len(scratch_rows),
+            "agentScratchListing": scratch_report,
             "incomplete": incomplete}
 
 

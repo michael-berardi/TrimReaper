@@ -173,6 +173,68 @@ copy and archive tools cannot restore an old one. Metadata changes can only keep
 rule would. This is a quiet-window proof, not indefinite retention: use `trimreaper mark <folder> evidence` when needed.
 Tests synthesize old ctimes for unchanged fixture identities; production has no clock or stat-backdating switch.
 
+## Unsaved git work in idle scratch (`unsavedArchiveDays`)
+
+An agent-scratch folder (or a finished job's cache folder) used to be kept for good when its only blocker was unsaved git work:
+a dirty or untracked file, a commit no remote holds, a stash, a linked worktree inside it, or a bare repository nested in it
+(`unproved-git-dir`). Now such a folder quiet for `unsavedArchiveDays` (7, shorter than the `evidenceExpiryDays` idle window) goes
+through the same gates and then the engine's archive: `reap_item` takes the shorter proof (`idleProof.unsavedIdle`), derives
+`disposable` for that window only, and **keeps the folder as `idle-recent-change` unless unsaved git work is what is left**, so a
+folder with nothing unsaved still waits for the longer window. The archive is the one every job folder gets (a git bundle verified in
+an empty repository, a files tar read back against a SHA-256 manifest, stamped as the only copy before the first byte goes, the tree
+compared again, a last look at every gate), written to `<archiveRoot>/scratch-unsaved/`. It carries no protected-copy marker, so it
+follows `archiveExpiryDays` from the removal; the protected-only archive of `agentScratchProtectedCopies: "archive"` is a different
+route and still never expires (the unsaved route is off while that policy is on). What stays unchanged: protected names (`.env*`,
+`.dev.vars*`, `.wrangler`, `.vercel`) keep the folder whole and are never entered, a job claim, an open handle or a process keeps it,
+the cleanup-owner lock, receipts and canonical boundaries apply, and `unsavedArchiveDays: 0` or `cloneArchive: "keep"` keeps the folder.
+A linked worktree inside the folder has its HEAD (and reflog tips) bundled; after the removal its main repository forgets exactly that
+worktree entry (`reap_worktree_forget`: the entry whose `gitdir` names the removed folder, never `git worktree prune`) so it is left
+with no dangling worktree, and the branch stays there. A stray Git directory (`.git-backup`) is bundled whole with
+`git bundle create --all`, read back in an empty repository with every ref's commit a bundle head, and only then are its raw files left
+out of the tar; one git cannot read safely (unsafe config, alternates, grafts), with no ref, or that fails to verify is archived as files,
+byte for byte. A main repository with live linked worktrees outside the folder (`linked-worktrees:<n>`) still keeps it. As for a job folder, the archive
+saves what git does not hold in each repository (and every stray Git directory); files outside every repository are not copied, so they go
+at `unsavedArchiveDays` with the folder instead of at the evidence window. Keep such material in a repository, or mark the folder
+(`trimreaper mark <folder> evidence`).
+
+## Interrupted jobs (`interruptedExpiryDays`)
+
+An `interrupted` job with a continuation chain that finished already aged like a finished job. One nothing continues (no
+`interrupt-heir:` record, no accepted successor, no job resumed from it) never did. After `interruptedExpiryDays` (7) from its
+**verified** interruption clock (the job's own record or the matching `job.interrupted` event, never an unrelated clock) it is treated
+like a failed job by `reap_chain_clock`: its scratch ages by the evidence window, its clone by the clone window, archived first when it
+holds unsaved work. A continuation or successor that is still live, a record that cannot be read, a missing job, an unproved
+interruption, a live worker terminal and `0` keep everything as before. A pin on its folders by another unfinished job (a job waiting on
+it) is unchanged; `reap_pin_released` still ends only for a finished job or inside a ladder rung.
+
+## The resumable scratch listing
+
+The listing of the agent-scratch root has a total budget (20 s). It keeps a cursor (`meta` key `reaper:agent-scratch-cursor`: the last
+folder before the first one the pass could not reach, so that one is next) and starts behind it, wrapping. It also remembers each
+folder's idle proof (`meta` key `reaper:agent-scratch-proofs`) keyed by the folder's device, inode and ctime, with the time taken and
+the windows it was taken for. A remembered proof is reused only while all of those still match, it is younger than three days, it says
+something lasting (idle, recent change, protected leaf, entry or byte budget, depth, mount; never a time-out or an unreadable entry), and a
+`recent-change` is reused only while the change it named is still inside the shortest window. A folder's ctime does not move when a file
+deeper in it changes, so the remembered proof is a **hint that only orders and informs**: the listing takes it once at listing time, and
+the removal (`reap_item_retention` at the gate, again at the last look) walks the folder afresh, so a stale hint can keep a folder a
+little longer but can never remove one. A dry run proves afresh and writes nothing; `reap-status` starts at the cursor, reads the remembered proofs and writes nothing (its
+tick-driven sizing pass writes both); the tick's and `reap --scratch`'s deleting passes write both. The result names `listing.cursor` and `listing.unproved` (folders the pass could not reach: `audit-budget-exhausted` in the
+audit, `idle-budget-time-exceeded` with `listing-budget-exhausted` in a receipt), so "never proved" is visible, and every folder is proved
+within a few passes.
+
+## Thin archive bundles (`archiveBundleMode`)
+
+By default an archive bundle is self-contained. With `thin-local`, the bundle of a **linked worktree** excludes every object reachable
+from the default remote branch of its repository (`refs/remotes/<remote>/HEAD`'s target, else `main`/`master`) that the persistent main
+repository also holds. The main repository is the worktree's common git directory and must be a real repository of the running user
+(not a link), outside the folder being archived and outside every root the reaper removes from (job-cache, scratch, archive, a
+job-named clone). The manifest records the prerequisite commits (read from the bundle header), the main repository's path, the base ref
+and commit. Verification is `git bundle verify` run **inside the main repository** (a missing prerequisite fails there), plus a check
+that every saved tip is reachable from the bundle heads or the base. A missing or unreadable main repository, one inside a reaped root,
+a default branch it cannot find, a base the main repository lacks or any failed step writes the self-contained bundle instead
+(`thinFallback` in the manifest says why). **The trade-off:** a thin bundle cannot be restored without that main repository (an empty
+repository fails its `git bundle verify`), and the archive survives only as long as the main repository does.
+
 ## Narrow exact-output route
 
 `job-derived-output` still uses `reap_item`, receipts, descriptor removal and all final checks. Unlike a source-root
