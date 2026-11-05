@@ -2958,7 +2958,11 @@ def reap_archive_git(gitdir: str, *args: str, data: str | None = None, timeout: 
 REAP_ARCHIVE_SECONDS = 900              # wall-clock bound of ONE archive: a longer one is refused (`archive-failed:time-limit`), never held on the tick
 REAP_ARCHIVE_REFUSED_SECONDS = 86400    # a bundle refused for size, space or time is not attempted again for this long
 REAP_ARCHIVE_BUNDLE_FACTOR = 1.1        # the bundle's estimated bytes are scaled by this before they are compared with the bounds
-REAP_ARCHIVE_REMEMBERED = ("archive-too-large:bundle", "archive-no-space:", "archive-failed:time-limit", "probe-timeout:")
+# A git step that fails on an unchanged folder fails again: remember it too, so it is named once and not retried every pass
+# (2026-11-04: archive-failed:bundle-create:128 on the same five Champollion folders every cleanup pass).
+REAP_ARCHIVE_REMEMBERED = ("archive-too-large:bundle", "archive-no-space:", "archive-failed:time-limit", "probe-timeout:",
+                           "archive-failed:bundle-init:", "archive-failed:bundle-refs:", "archive-failed:bundle-create:",
+                           "archive-verify-failed:bundle-verify:")
 REAP_ARCHIVE_CLOCK = threading.local()
 
 

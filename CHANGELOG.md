@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.14.1 (2026-11-05)
+
+An archive whose git bundle step fails (`bundle-init`, `bundle-refs`, `bundle-create`, `bundle-verify`) is remembered for a day like
+a size, space or time refusal, so an unchanged folder is named once instead of being retried on every pass.
+
 ## 0.14.0 (2026-11-04)
 
 Archive manifests now carry the neutral kind `trimreaper-archive`. Manifests written by earlier versions keep their old kind and
