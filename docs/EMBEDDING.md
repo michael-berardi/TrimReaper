@@ -60,6 +60,14 @@ volume's nominal total or a rounded percentage. `reap_disk_state(volume)` obtain
 `df -kP` probe. A failed or malformed probe includes `measurementError` and leaves `usedBytes` unknown in its
 conservative admission fallback; goals remain `null`, never inferred from shared-container allocation.
 
+## Policy keys the engine reads with its own default
+
+A host whose `load_policy()` predates a key gets the engine's default, so a stored policy never has to name it: `unsavedArchiveDays`
+(7; `0` off; also needs `cloneArchive` `"archive"`), `interruptedExpiryDays` (7; `0` off) and `archiveBundleMode` (`"self-contained"`;
+`"thin-local"` is opt-in). The agent-scratch listing keeps two `meta` rows in the host's store, `reaper:agent-scratch-cursor` and
+`reaper:agent-scratch-proofs`, and `reap_agent_scratch_items` / `reap_agent_scratch_listing` return a list whose `report` names
+the cursor and how many folders remain unproved. Unsaved scratch archives live in `<archive root>/scratch-unsaved/`.
+
 ## Modules the host imports
 
 `errno`, `fcntl`, `hashlib`, `json`, `os`, `plistlib`, `pwd`, `re`, `shutil`, `sqlite3`, `stat`, `subprocess`,

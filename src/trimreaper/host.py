@@ -42,6 +42,15 @@ DEFAULT_POLICY = {
     "archiveExpiryDays": 30,
     # clean-pass archives of unsaved worktrees no job owned: 0 = kept indefinitely
     "cleanWorktreeArchiveExpiryDays": 0,
+    # A scratch folder (or a finished job's folder) quiet this many days whose only blocker is unsaved git work (dirty, unpushed,
+    # stash, a linked worktree, a nested bare repository) is archived, then removed, in the routine pass; 0 = such folders are kept.
+    "unsavedArchiveDays": 7,
+    # An interrupted job with no continuation, successor or resumed job, interrupted this many days ago, ages like a failed one
+    # (its folders are reaped by the ordinary windows); 0 = it keeps its folders for good.
+    "interruptedExpiryDays": 7,
+    # "self-contained": every archive bundle holds the whole history. "thin-local": a linked worktree's bundle holds only the commits its
+    # main repository lacks (verified there); restoring needs that repository. Without one it falls back to self-contained.
+    "archiveBundleMode": "self-contained",
     # compress-logs: idle (this many days) history files under compressLogsRoots get transparent, lossless APFS compression
     # (afsctool, verified clone renamed over the original); nothing is removed. 0 = off. Roots are folders inside home (relative
     # to home unless absolute or ~-prefixed); none by default: the operator names their own agent history folders.
@@ -210,7 +219,7 @@ def check_policy(policy: dict) -> None:
     if not isinstance(merged["compressLogsRoots"], list) or not all(isinstance(r, str) and r for r in merged["compressLogsRoots"]):
         raise HostError(f"policy compressLogsRoots must be a list of folder paths, not {json.dumps(merged['compressLogsRoots'])}")
     for key in ("cloneExpiryDays", "evidenceExpiryDays", "markedEvidenceExpiryDays", "archiveExpiryDays", "cleanWorktreeArchiveExpiryDays",
-                "compressLogsIdleDays"):
+                "compressLogsIdleDays", "unsavedArchiveDays", "interruptedExpiryDays"):
         value = merged[key]
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             raise HostError(f"policy {key} must be a whole number of days (0 = never), not {json.dumps(value)}")
@@ -254,6 +263,8 @@ def check_policy(policy: dict) -> None:
     value = merged["worktreeIdleDays"]
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise HostError(f"policy worktreeIdleDays must be a whole number of days (0 = never), not {json.dumps(value)}")
+    if merged["archiveBundleMode"] not in ("self-contained", "thin-local"):
+        raise HostError(f'policy archiveBundleMode must be "self-contained" or "thin-local", not {json.dumps(merged["archiveBundleMode"])}')
     if merged["cloneArchive"] not in ("archive", "keep"):
         raise HostError(f'policy cloneArchive must be "archive" or "keep", not {json.dumps(merged["cloneArchive"])}')
     if merged["cloneProtectedCopies"] not in ("keep", "remove"):

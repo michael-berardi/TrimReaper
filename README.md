@@ -145,10 +145,10 @@ Every command prints one JSON document on stdout. Exit status:
 | `node_modules`, `.next`, `.open-next`, `.turbo`, `.astro`, `target` in a job's clone | 15 minutes after the job finishes, when git ignores the folder (untracked `.astro` metadata is also recognized without an ignore rule) and tracks nothing in it. Uncommitted or stashed work in the clone does not preserve build output that rebuilds from the source that stays |
 | `dist` in a job's clone | Once the clone itself expires (`dist` can hold a release) |
 | The whole clone | `cloneExpiryDays` (3) after every job named in it finished. Unsaved work is archived first |
-| Per-job scratch folders (`cacheRoot/J-NNNN/*`) | Tool caches (with a `CACHEDIR.TAG`) once the job finishes; anything else `evidenceExpiryDays` (14) after it finished. An interrupted job whose work a durable continuation took over counts as finished, from its verified interruption clock |
+| Per-job scratch folders (`cacheRoot/J-NNNN/*`) | Tool caches (with a `CACHEDIR.TAG`) once the job finishes; anything else `evidenceExpiryDays` (14) after it finished. An interrupted job whose work a durable continuation took over counts as finished, from its verified interruption clock; one nothing continues counts as failed `interruptedExpiryDays` (7) after that clock. A finished job's folder holding only unsaved git work goes after `unsavedArchiveDays` (7), archived first |
 | Screenshots, recordings, traces and logs in a job's scratch | `evidenceExpiryDays` after the job finished. Each file's name and SHA-256 are logged first |
 | Marked bulky job-cache evidence | Strictly more than `markedEvidenceExpiryDays` (5) after the job finished, only with an existing, non-empty `report.md`. A job-root evidence marker does not shorten the `evidenceExpiryDays` window for loose files. Reports, summary/outcome, handoffs and receipts stay. Retained material, protected names and active claims still prevent removal |
-| Agent scratch folders (`scratchRoot/*`) | Once nothing in them changed for `evidenceExpiryDays`. The idle proof covers the root and whole tree (the later of every entry's mtime and ctime, never following a link), so a folder ages out like a small one instead of being kept for good by the walk's own entry limit - up to its per-folder budget (3000000 entries, 60 seconds by default). A folder past that budget is kept as `idle-budget-exceeded` (too many entries) or `idle-budget-time-exceeded` (too slow), and the receipt names the budget and what the walk spent. A fresh copy with preserved modification times still starts a new quiet window, as do metadata changes. A mount keeps the folder without being entered. Caller-supplied absolute idle deadlines also bound later rechecks; `trimreaper mark <folder> evidence` keeps needed evidence. Every unmarked folder the reaper keeps names the reason it was kept (`idle-recent-change`, `idle-budget-exceeded`, `idle-unreadable`, `idle-protected-leaf`, ...). Active or parked job claims preserve that task, not unrelated siblings. Off until you set `scratchRoot`. Protected names keep the task unless `agentScratchProtectedCopies: "archive"` saves a verified private copy first; those archives never expire automatically |
+| Agent scratch folders (`scratchRoot/*`) | Once nothing in them changed for `evidenceExpiryDays`. The idle proof covers the root and whole tree (the later of every entry's mtime and ctime, never following a link), so a folder ages out like a small one instead of being kept for good by the walk's own entry limit - up to its per-folder budget (3000000 entries, 60 seconds by default). A folder past that budget is kept as `idle-budget-exceeded` (too many entries) or `idle-budget-time-exceeded` (too slow), and the receipt names the budget and what the walk spent. A fresh copy with preserved modification times still starts a new quiet window, as do metadata changes. A mount keeps the folder without being entered. Caller-supplied absolute idle deadlines also bound later rechecks; `trimreaper mark <folder> evidence` keeps needed evidence. Every unmarked folder the reaper keeps names the reason it was kept (`idle-recent-change`, `idle-budget-exceeded`, `idle-unreadable`, `idle-protected-leaf`, ...). Active or parked job claims preserve that task, not unrelated siblings. Off until you set `scratchRoot`. Protected names keep the task unless `agentScratchProtectedCopies: "archive"` saves a verified private copy first; those archives never expire automatically. A folder quiet for `unsavedArchiveDays` (7), shorter than that window, whose only blocker is unsaved git work (dirty or untracked files, commits no remote holds, a stash, a linked worktree inside it, a bare repository nested in it) is archived first (see "Archive before delete"), then removed in the routine pass; a folder with nothing unsaved still waits for `evidenceExpiryDays`. The listing of a big root is resumable: a cursor and per-folder proofs keyed by the folder's device, inode and ctime (a hint only; the removal walks the folder afresh) make every folder proved within a few passes, and `reap --scratch` / `reap-status` report the cursor and how many folders remain unproved |
 | Its own archives | `archiveExpiryDays` (30) after a job archive became the only copy; the clean pass's `clean-worktrees` archives only with `cleanWorktreeArchiveExpiryDays` set (default 0: kept); scratch protected-copy archives stay indefinitely |
 | Old release builds and release evidence | Off until configured: [docs/CONFIGURATION.md](docs/CONFIGURATION.md) |
 
@@ -181,6 +181,9 @@ they rebuild it when they resume. The pressure check runs during a `tick` that h
   One more exception: an interrupted job whose work a durable continuation took over (the host recorded the continuation it
   queued, the job's own interruption clock is verified, and the whole continuation chain has finished) is treated as finished
   work, so the ordinary evidence and clone windows release its scratch and its checkout, aged from the chain's last finish.
+  An interrupted job nothing continues (no continuation, successor or resumed job) is treated as failed `interruptedExpiryDays`
+  (7, `0` = never) after its verified interruption: its scratch and clone age by the ordinary windows, archived first when they
+  hold unsaved work. Another unfinished job waiting on it still pins it.
   A continuation that is still queued, waiting for approval or working keeps the source's folders. Every other proof still
   applies, and a live job that claims the folder keeps it. Its own evidence files (screenshots, recordings, traces, logs) still
   expire only through the host's evidence tick, which walks the finished jobs.
@@ -213,7 +216,23 @@ TrimReaper first writes an archive to `archiveRoot/J-NNNN/<folder>-<time>-<run>/
 - `manifest.json`: what was saved, what was left out and why, and how to restore it.
 
 The folder goes only after the archive verifies and a final check finds the folder unchanged. An archive larger than
-4 GiB or 200,000 files is refused, and the folder is kept. To restore:
+4 GiB or 200,000 files is refused, and the folder is kept.
+
+Idle agent scratch (and a finished job's folder) with unsaved git work is archived the same way once quiet for `unsavedArchiveDays`
+(7), into `archiveRoot/scratch-unsaved/`; those archives expire like any other, `archiveExpiryDays` after they became the only copy.
+A linked worktree inside the folder has its HEAD bundled and, once the folder is gone, its main repository forgets exactly that
+worktree entry (the branch stays). A bare repository nested in it (a `.git-backup`) is bundled whole (`git bundle --all`) and
+verified in an empty repository; its raw files are then not copied. `unsavedArchiveDays: 0` or `cloneArchive: "keep"` keeps
+such folders, and `agentScratchProtectedCopies: "archive"` keeps its own protected-only route.
+
+By default every bundle is self-contained: the whole history, restorable anywhere (1.2 GB for a large repository, even when the
+unsaved commits are a few megabytes). With `archiveBundleMode: "thin-local"` the bundle of a linked worktree leaves out what the
+remote's default branch holds (`refs/remotes/<remote>/HEAD`, else `main`/`master`) when its main repository (the worktree's
+common git directory, outside the job-cache, scratch and archive roots) also holds it. The manifest records the prerequisite
+commits and the main repository, the bundle is checked with `git bundle verify` inside that repository and every saved tip must
+be reachable from the bundle heads. The trade-off: restoring a thin bundle needs that main repository
+(`git -C <main> fetch <archive>/repo-0.bundle 'refs/*:refs/ut-archive/*'`). A missing main repository, one inside a reaped root, or
+a failed check writes the self-contained bundle instead (the manifest names why: `thinFallback`). To restore:
 
 ```sh
 git init restored && cd restored
