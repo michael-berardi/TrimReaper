@@ -37,7 +37,7 @@ class Tagged(Home):
             self.addCleanup(patch.stop)
         self.jobs = self.home / ".cache" / "trimreaper" / "jobs"
 
-    def cache(self, folder: Path, hours: float = 10, tag: bytes = TAG, files=("debug/app", "debug/deps/lib.rlib", "release/app")) -> Path:
+    def cache(self, folder: Path, hours: float = 10, tag: bytes = TAG, files=("debug/app", "debug/deps/lib.rlib", "out/app")) -> Path:
         """A tagged folder with some content, every entry `hours` old."""
         for rel in files:
             self.put(folder, rel)
@@ -446,3 +446,160 @@ class Tagged(Home):
         folder = self.target()
         with self.assertRaisesRegex(clean.ReapRefused, "outside-root"):
             clean.clean_tagged_gates({"path": str(folder), "root": str(self.dev), "idleHours": 6}, None)
+
+    # ---- Cargo targets, job evidence and unarchived work (Opus review of 0.15.0) -----------------------------------
+
+    CARGO_TAG = b"Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag created by cargo.\n"
+
+    def test_a_cargo_target_with_an_extensionless_release_binary_is_kept(self):
+        folder = self.cache(self.jobs / "J-0042" / "repo" / "target", files=("debug/app", "release/myapp", "release/.fingerprint/x/lib"),
+                            tag=self.CARGO_TAG)
+        self.kept(folder, "cargo-target")
+        self.assertTrue((folder / "release" / "myapp").exists())
+        bare = self.cache(self.dev / "app" / "tool-out", files=("debug/app", "release/myapp"))   # no Cargo marker at all
+        self.kept(bare, "release-artifact:release-bearing")
+        self.assertTrue((bare / "release" / "myapp").exists())
+
+    def test_a_release_bearing_folder_that_is_not_superseded_is_refused_by_the_engine_proof(self):
+        folder = self.cache(self.dev / "app" / "tool-out", files=("debug/app", "out/data"))
+        with mock.patch.object(clean, "reap_target_release_bearing", lambda path: True), \
+                mock.patch.object(clean, "reap_target_release_superseded", lambda path: False):
+            self.kept(folder, "release-artifact:release-bearing")
+        with mock.patch.object(clean, "reap_target_release_bearing", lambda path: True), \
+                mock.patch.object(clean, "reap_target_release_superseded", lambda path: True):
+            self.assertEqual(self.run_clean()["summary"]["done"], 1)
+
+    def test_a_cargo_target_is_never_taken_by_tagged_caches(self):
+        layouts = {"rustc-info": ((".rustc_info.json", "debug/app"), TAG),
+                   "cargo-tag": (("debug/app",), self.CARGO_TAG),
+                   "debug-fingerprint": (("debug/.fingerprint/a/b", "debug/app"), TAG),
+                   "release-fingerprint": (("release/.fingerprint/a/b",), TAG),
+                   "triple": (("aarch64-apple-darwin/debug/.fingerprint/a/b",), TAG),
+                   "custom-profile": (("dist-lto/.fingerprint/a/b", "dist-lto/app"), TAG)}
+        for name, (files, tag) in layouts.items():
+            with self.subTest(layout=name):
+                folder = self.cache(self.jobs / "J-0042" / "repo" / "target", files=files, tag=tag)
+                self.kept(folder, "cargo-target")
+                shutil.rmtree(folder)
+
+    def test_rust_build_output_still_removes_only_debug_and_incremental(self):
+        repo = self.clone("rustproj")
+        for rel in ("target/debug/app", "target/debug/.fingerprint/a/b", "target/release/app", "target/release/.fingerprint/a/b",
+                    "target/release/incremental/state"):
+            self.put(repo, rel)
+        (repo / "target" / "CACHEDIR.TAG").write_bytes(self.CARGO_TAG)
+        (repo / "target" / ".rustc_info.json").write_text("{}")
+        self.age(repo / "target", 1)
+        tagged = self.cli("clean", "--only", "tagged-caches")
+        self.assertEqual(tagged["summary"]["done"], 0, tagged)
+        self.assertTrue((repo / "target" / "release" / "app").exists())
+        out = self.cli("clean", "--only", "rust-build-output")
+        self.assertGreaterEqual(out["summary"]["done"], 1, out)
+        self.assertFalse((repo / "target" / "debug").exists())
+        self.assertFalse((repo / "target" / "release" / "incremental").exists())
+        self.assertTrue((repo / "target" / "release" / "app").exists())
+
+    def test_a_tagged_job_folder_is_kept(self):
+        folder = self.cache(self.jobs / "J-0042")
+        out = self.kept(folder, "job-folder")
+        self.assertTrue((folder / "debug" / "app").exists(), out)
+
+    def test_a_tagged_top_level_scratch_task_and_the_roots_are_kept(self):
+        scratch = self.tmp / "scratch"
+        self.write_config({"scratchRoot": str(scratch)})
+        task = self.cache(scratch / "task")
+        out = self.run_clean()
+        self.assertTrue(task.exists(), out)
+        self.assertEqual(out["summary"]["done"], 0, out)
+        self.assertEqual([i["keep"] for i in out["items"] if i["path"].endswith("scratch/task")], ["scratch-task-folder"], out)
+        for path in (scratch, self.jobs):
+            with self.assertRaisesRegex(clean.ReapRefused, "collection-root|outside-root"):
+                clean.clean_tagged_gates({"path": str(path), "root": str(path), "idleHours": 6}, None)
+        with self.assertRaisesRegex(clean.ReapRefused, "collection-root"):
+            clean.clean_tagged_identity(str(scratch), str(self.home))
+
+    def test_a_tagged_folder_holding_job_evidence_or_key_material_is_kept(self):
+        for name, rel in (("report", "notes/report.md"), ("pem", "keys/signing.pem"), ("archive", "protected-archive/x"),
+                          ("receipt", "out/review-receipt.md"), ("handoff", "handoffs/note.txt")):
+            with self.subTest(name=name):
+                folder = self.cache(self.dev / "app" / f"cache-{name}", files=("debug/app", rel))
+                self.kept(folder, "retained-names")
+                self.assertTrue((folder / rel).exists())
+                shutil.rmtree(folder)
+
+    def test_a_tagged_folder_inside_an_evidence_folder_is_kept(self):
+        folder = self.cache(self.dev / "app" / "protected-archive" / "cache")
+        with self.assertRaisesRegex(clean.ReapRefused, "evidence-folder"):
+            clean.clean_tagged_gates({"path": str(folder), "root": str(self.dev), "idleHours": 6}, None)
+        self.assertTrue(folder.exists())
+
+    def test_a_release_artifact_deeper_than_the_depth_cap_keeps_the_folder(self):
+        deep = "/".join(f"l{n}" for n in range(clean.CLEAN_TAGGED_RELEASE_LEVELS + 3))
+        folder = self.cache(self.dev / "app" / "deep-cache", files=("debug/app", f"{deep}/App.dmg"))
+        self.kept(folder, "release-scan-incomplete")
+        self.assertTrue((folder / deep / "App.dmg").exists())
+        self.assertIsNone(clean.clean_release_like(str(folder), 2))   # the shared default still fails open for dist/build callers
+        self.assertEqual(clean.clean_release_like(str(folder), 2, strict=True), "release-scan-incomplete")
+
+    def test_a_release_scan_that_runs_out_of_time_keeps_the_folder(self):
+        folder = self.target()
+        with mock.patch.object(clean, "CLEAN_RELEASE_SCAN_SECONDS", -1):
+            out = self.kept(folder, "release-scan-incomplete")
+        self.assertEqual(self.run_clean()["summary"]["done"], 1, out)
+
+    def test_the_last_look_refuses_when_its_release_scan_is_incomplete(self):
+        folder = self.target()
+        original, calls = clean.clean_release_like, []
+        def second_time_incomplete(*args, **kwargs):
+            calls.append(args[0])
+            return original(*args, **kwargs) if len(calls) == 1 else "release-scan-incomplete"
+        with mock.patch.object(clean, "clean_release_like", second_time_incomplete):
+            out = self.run_clean()
+        self.assertGreaterEqual(len(calls), 2, calls)
+        self.assertTrue(folder.exists(), out)
+        self.assertEqual(out["summary"]["done"], 0, out)
+
+    def test_system_named_entries_of_the_user_temp_folder_are_skipped(self):
+        mine = self.cache(self.usertmp / "my-build")
+        system = [self.cache(self.usertmp / name) for name in ("com.apple.cache", ".hidden-cache", "tmux-501", "launchd-1.x")]
+        self.assertEqual([p for p, _ in clean.clean_tagged_find([])], [str(mine)])
+        for folder in system:
+            with self.assertRaisesRegex(clean.ReapRefused, "system-temp-entry"):
+                clean.clean_tagged_gates({"path": str(folder), "root": str(self.usertmp), "idleHours": 6}, None)
+        self.assertEqual(self.run_clean()["summary"]["done"], 1)
+        self.assertTrue(all(p.exists() for p in system))
+
+    def test_code_homes_are_not_swept_in_the_steady_pass(self):
+        code = self.cache(self.dev / "app" / "build-cache")
+        job = self.cache(self.jobs / "J-0042" / "repo" / "out")
+        temp = self.cache(self.usertmp / "scratch" / "out")
+        roots = clean.clean_tagged_roots([], steady=True)
+        self.assertNotIn(str(self.dev), roots)
+        self.assertIn(str(self.usertmp), roots)
+        self.assertEqual(sorted(p for p, _ in clean.clean_tagged_find([], steady=True)), sorted([str(job), str(temp)]))
+        out = clean.clean_pass(False, only=["tagged-caches"], steady=True, report=False)
+        self.assertEqual(out["summary"]["done"], 2, out)
+        self.assertTrue(code.exists())
+        self.assertFalse(job.exists() or temp.exists())
+        self.assertEqual(self.run_clean()["summary"]["done"], 1)   # the ordinary pass still takes it
+        self.assertFalse(code.exists())
+
+    def test_names_that_hold_no_rust_target_are_skipped_in_code_homes_only(self):
+        for name in ("dist", "build", "coverage"):
+            self.cache(self.dev / "app" / name / "cache")
+        elsewhere = self.cache(self.jobs / "J-0042" / "dist" / "cache")
+        self.assertEqual([p for p, _ in clean.clean_tagged_find([])], [str(elsewhere)])
+
+    def test_each_root_has_its_own_share_of_the_discovery_budget(self):
+        for n in range(300):
+            self.put(self.dev / "huge", f"d{n}/f")
+        mine = self.cache(self.usertmp / "my-build")
+        errors = []
+        share = 40
+        with mock.patch.object(clean, "CLEAN_RUST_SCAN_ENTRIES", share * len(clean.clean_tagged_roots([]))):
+            found = clean.clean_tagged_find(errors)
+        self.assertEqual([p for p, _ in found], [str(mine)], found)
+        incomplete = [e for e in errors if "discovery-incomplete" in e["error"]]
+        self.assertEqual(len(incomplete), 1, errors)
+        self.assertIn("~/dev", incomplete[0]["error"])
+        self.assertEqual(incomplete[0]["path"], "~/dev")

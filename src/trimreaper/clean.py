@@ -979,12 +979,19 @@ def clean_project_outputs(errors: list, wide: bool = False) -> list[tuple[str, s
     return found
 
 
-def clean_release_like(path: str, levels: int = 3, limit: int = 20000) -> str | None:
+CLEAN_RELEASE_SCAN_SECONDS = 10   # wall clock a strict release scan may spend; one that runs out is incomplete
+
+
+def clean_release_like(path: str, levels: int = 3, limit: int = 20000, strict: bool = False) -> str | None:
     """The first release artifact (an installer, a disk image, a package, an archive) a folder holds within `levels` levels, else None.
     A scan that cannot finish names itself: `dist` and `build` hold releases for some projects, so they stay unless it is shown
-    they do not."""
+    they do not. `strict` (tagged caches) also names a scan that left a folder unentered below the depth limit or ran past
+    CLEAN_RELEASE_SCAN_SECONDS: "release-scan-incomplete"."""
     count, stack = 0, [(path, 0)]
+    deadline = time.monotonic() + CLEAN_RELEASE_SCAN_SECONDS
     while stack:
+        if strict and time.monotonic() >= deadline:
+            return "release-scan-incomplete"
         folder, depth = stack.pop()
         try:
             with os.scandir(folder) as scan:
@@ -992,10 +999,15 @@ def clean_release_like(path: str, levels: int = 3, limit: int = 20000) -> str | 
                     count += 1
                     if count > limit:
                         return "scan-incomplete"
+                    if strict and count % 1024 == 0 and time.monotonic() >= deadline:
+                        return "release-scan-incomplete"
                     if entry.name.lower().endswith(CLEAN_RELEASE_SUFFIXES):
                         return entry.name[:80]
-                    if depth < levels and entry.is_dir(follow_symlinks=False):
-                        stack.append((entry.path, depth + 1))
+                    if entry.is_dir(follow_symlinks=False):
+                        if depth < levels:
+                            stack.append((entry.path, depth + 1))
+                        elif strict:
+                            return "release-scan-incomplete"
         except OSError:
             return "unreadable"
     return None
@@ -1150,14 +1162,18 @@ CLEAN_TAGGED_RELEASE_LEVELS = 8
 CLEAN_JOB_LIVE = ("starting", "running")
 
 
-def clean_tagged_roots(errors: list) -> list[str]:
+def clean_tagged_roots(errors: list, steady: bool = False) -> list[str]:
     """Where tagged caches are searched: the job cache root, the agent scratch root, the worktree homes, the code homes and clone bases
     (not the home's `.cache`, whose other folders belong to their tools' own cleaners; the job cache and scratch roots inside it are
-    searched on their own) and the per-user temp folder."""
-    roots = [reap_cache_root(), reap_agent_scratch_root(), *clean_worktree_homes(), *(base for base, _ in reap_clone_bases()),
-             *(clean_home(name) for name in CLEAN_CODE_HOMES if name != ".cache")]
+    searched on their own) and the per-user temp folder. The steady pass searches only the job cache root, agent scratch and the
+    user temp folder: it is not a pass over repositories."""
+    roots = [reap_cache_root(), reap_agent_scratch_root()]
+    if not steady:
+        roots.extend([*clean_worktree_homes(), *(base for base, _ in reap_clone_bases()),
+                      *(clean_home(name) for name in CLEAN_CODE_HOMES if name != ".cache")])
     roots.extend(root for root, _ in clean_temp_roots() if root != os.path.realpath("/tmp"))
-    roots.extend(entry["path"] for entry in clean_worktree_entries(errors, []) if entry["kind"] == "worktree")
+    if not steady:
+        roots.extend(entry["path"] for entry in clean_worktree_entries(errors, []) if entry["kind"] == "worktree")
     found = []
     for root in roots:
         try:
@@ -1169,19 +1185,29 @@ def clean_tagged_roots(errors: list) -> list[str]:
     return sorted(found)
 
 
-def clean_tagged_find(errors: list) -> list[tuple[str, str]]:
+def clean_tagged_temp_roots() -> set[str]:
+    try:
+        return {os.path.realpath(root) for root, _ in clean_temp_roots()}
+    except OSError:
+        return set()
+
+
+def clean_tagged_find(errors: list, steady: bool = False) -> list[tuple[str, str]]:
     """(folder, scan root) of every folder holding a valid CACHEDIR.TAG, without entering one, or a repository's `.git`, or a
-    dependency store. Names only; a scan that runs out of its entry budget says so."""
-    key = ("tagged-find",)
+    dependency store. Names only. Every root has its own share of the entry budget, so one large home cannot starve the others;
+    a root that runs out of its share says so, by name."""
+    key = ("tagged-find", steady)
     known = clean_memo_get(key)
     if known is not None:
         return [(path, root) for path, root in known if os.path.lexists(path)]
-    found, seen, count, stopped = [], set(), 0, False
+    found, seen = [], set()
     homes = {clean_home(name) for name in CLEAN_CODE_HOMES}
-    for root in clean_tagged_roots(errors):
-        if stopped:
-            break
-        stack = [(root, 0)]
+    temps = clean_tagged_temp_roots()
+    roots = clean_tagged_roots(errors, steady)
+    share = max(1, CLEAN_RUST_SCAN_ENTRIES // max(1, len(roots)))
+    for root in roots:
+        count, stack = 0, [(root, 0)]
+        in_home = root in homes
         while stack:
             folder, depth = stack.pop()
             if folder in seen:
@@ -1194,9 +1220,9 @@ def clean_tagged_find(errors: list) -> list[tuple[str, str]]:
                 errors.append({"clean": "tagged-caches", "path": clean_tilde(folder), "error": clean_os_refusal(error)})
                 continue
             count += len(entries)
-            if count > CLEAN_RUST_SCAN_ENTRIES:
-                errors.append({"clean": "tagged-caches", "error": f"discovery-incomplete: more than {CLEAN_RUST_SCAN_ENTRIES} entries"})
-                stopped = True
+            if count > share:
+                errors.append({"clean": "tagged-caches", "path": clean_tilde(root),
+                               "error": f"discovery-incomplete: more than {share} entries in {clean_tilde(root)}"})
                 break
             if folder != root and any(e.name == CACHEDIR_TAG for e in entries) and reap_cachedir_tagged(folder):
                 found.append((folder, root))
@@ -1206,7 +1232,11 @@ def clean_tagged_find(errors: list) -> list[tuple[str, str]]:
             for entry in entries:
                 if entry.name in CLEAN_TAGGED_SKIP or reap_protected(entry.name) or not clean_directory(entry, "tagged-caches", errors):
                     continue
-                if folder == root and entry.name in CLEAN_RUST_SCAN_TOOL_CACHES and root in homes:
+                if in_home and entry.name in CLEAN_RUST_SCAN_SKIP:
+                    continue
+                if folder == root and root in temps and CLEAN_TEMP_SYSTEM.match(entry.name):
+                    continue   # what the system or a running app manages in the temp folder is never a candidate
+                if folder == root and entry.name in CLEAN_RUST_SCAN_TOOL_CACHES and in_home:
                     continue
                 stack.append((entry.path, depth + 1))
     found = sorted(set(found))
@@ -1244,6 +1274,58 @@ def clean_tagged_live_job(path: str) -> None:
         raise ReapRefused("job-state-unreadable")
 
 
+def clean_tagged_cargo_target(path: str) -> bool:
+    """True for a folder Cargo wrote: `.rustc_info.json`, a tag whose text names Cargo, or a `.fingerprint` folder in a profile (a
+    `release` or `debug` child, or any child folder or the child of a target-triple folder). Names and one bounded read of the tag only.
+    Such a target is rust-build-output's: it removes the debug profile and incremental caches and keeps `release`."""
+    try:
+        if os.path.lexists(os.path.join(path, ".rustc_info.json")):
+            return True
+        fd = os.open(os.path.join(path, CACHEDIR_TAG), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            if b"cargo" in os.read(fd, 1024).lower():
+                return True
+        finally:
+            os.close(fd)
+    except OSError:
+        pass   # a tag that cannot be read is not proof either way; the profile scan below still looks
+    try:
+        with os.scandir(path) as top:
+            children = [e for e in top if e.is_dir(follow_symlinks=False) and not reap_protected(e.name) and not reap_is_git(e.name)]
+        for child in children:
+            if child.name in ("release", "debug") and os.path.lexists(os.path.join(child.path, ".fingerprint")):
+                return True
+        for child in children:
+            if os.path.lexists(os.path.join(child.path, ".fingerprint")):
+                return True
+            with os.scandir(child.path) as inner:   # <target>/<triple>/<profile>/.fingerprint
+                if any(e.is_dir(follow_symlinks=False) and os.path.lexists(os.path.join(e.path, ".fingerprint")) for e in inner
+                       if not reap_protected(e.name) and not reap_is_git(e.name)):
+                    return True
+    except OSError:
+        return True   # unreadable: it could be a target, so it is not this target's to take
+    return False
+
+
+def clean_tagged_identity(path: str, root: str) -> None:
+    """What a tag cannot make a cache: the roots themselves, a job's own folder or a scratch task's own folder (their evidence window and
+    records are theirs), anything in or inside a kept evidence folder, a system-named entry of the temp folder, and a Cargo target."""
+    cache, scratch = reap_canon(reap_cache_root()), reap_canon(reap_agent_scratch_root())
+    if path in (cache, scratch, root):
+        raise ReapRefused("collection-root")
+    parent = os.path.dirname(path)
+    if parent == cache and CLEAN_JOB_FOLDER.fullmatch(os.path.basename(path)):
+        raise ReapRefused("job-folder")
+    if parent == scratch:
+        raise ReapRefused("scratch-task-folder")
+    if any(reap_fold(part) in EVIDENCE_KEEP_DIRS for part in Path(path).parts):
+        raise ReapRefused("evidence-folder")
+    if parent in clean_tagged_temp_roots() and CLEAN_TEMP_SYSTEM.match(os.path.basename(path)):
+        raise ReapRefused("system-temp-entry")
+    if clean_tagged_cargo_target(path):
+        raise ReapRefused("cargo-target:left-to-rust-build-output")
+
+
 def clean_tagged_static(path: str, root: str) -> None:
     """The proofs no window changes: a real directory of this user that still carries a valid tag, below no protected name, holding
     none (names only), no nested repository, no other volume, not in or around a release root, holding no release artifact."""
@@ -1259,9 +1341,15 @@ def clean_tagged_static(path: str, root: str) -> None:
         released = reap_canon(released)
         if reap_inside(path, released) or reap_inside(released, path):
             raise ReapRefused("release-root")
-    found = clean_release_like(path, CLEAN_TAGGED_RELEASE_LEVELS, REAP_WALK_ENTRIES)
+    found = clean_release_like(path, CLEAN_TAGGED_RELEASE_LEVELS, REAP_WALK_ENTRIES, strict=True)
+    if found == "release-scan-incomplete":
+        raise ReapRefused(found)
     if found:
         raise ReapRefused("release-artifact:" + found)
+    if reap_target_release_bearing(path) and not reap_target_release_superseded(path):
+        raise ReapRefused("release-artifact:release-bearing")
+    if not reap_no_retained_names(path):   # a record, a key, a certificate or an evidence folder anywhere below keeps the whole folder
+        raise ReapRefused("retained-names")
     # Inside a repository, git must track nothing in it (a tag is a claim by the folder, not a proof about the repository).
     repo = os.path.dirname(path)
     while reap_inside(repo, root):
@@ -1279,6 +1367,7 @@ def clean_tagged_gates(entry: dict, table: dict | None) -> None:
         raise ReapRefused("off:taggedCacheIdleHours=0")
     if reap_canon(path) != path or path == root or not reap_inside(path, root):
         raise ReapRefused("outside-root")
+    clean_tagged_identity(path, root)
     clean_tagged_live_job(path)
     busy = sorted(set(CLEAN_RUST_BUSY) & clean_running())
     if busy:
@@ -1494,7 +1583,7 @@ def clean_extra_entries(only: set, errors: list, idle_hours: int = 48, rung: dic
             add("project-dependencies", path, os.path.dirname(path), repo=repo, idleHours=idle_hours, proof=proof)
     if "tagged-caches" in only:
         hours = rung["taggedHours"] if rung else CLEAN_POLICY["taggedCacheIdleHours"]
-        for path, root in clean_tagged_find(errors) if hours else ():
+        for path, root in clean_tagged_find(errors, bool(rung and rung["name"] == CLEAN_STEADY)) if hours else ():
             add("tagged-caches", path, root, idleHours=hours)
     if "agent-leftovers" in only:
         for root, sessions in clean_leftover_roots():
