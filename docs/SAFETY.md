@@ -189,13 +189,22 @@ route and still never expires (the unsaved route is off while that policy is on)
 the cleanup-owner lock, receipts and canonical boundaries apply, and `unsavedArchiveDays: 0` or `cloneArchive: "keep"` keeps the folder.
 A linked worktree inside the folder has its HEAD (and reflog tips) bundled; after the removal its main repository forgets exactly that
 worktree entry (`reap_worktree_forget`: the entry whose `gitdir` names the removed folder, never `git worktree prune`) so it is left
-with no dangling worktree, and the branch stays there. A stray Git directory (`.git-backup`) is bundled whole with
-`git bundle create --all`, read back in an empty repository with every ref's commit a bundle head, and only then are its raw files left
-out of the tar; one git cannot read safely (unsafe config, alternates, grafts), with no ref, or that fails to verify is archived as files,
-byte for byte. A main repository with live linked worktrees outside the folder (`linked-worktrees:<n>`) still keeps it. As for a job folder, the archive
-saves what git does not hold in each repository (and every stray Git directory); files outside every repository are not copied, so they go
-at `unsavedArchiveDays` with the folder instead of at the evidence window. Keep such material in a repository, or mark the folder
-(`trimreaper mark <folder> evidence`).
+with no dangling worktree, and the branch stays there. That forgetting is skipped, and the folder kept as `worktree-main-busy:<why>`
+(checked before the archive, again before the removal, and by `reap_worktree_forget` itself), while the main repository has an
+`index.lock` or is in the middle of a rebase, merge, cherry-pick, revert or bisect. A stray Git directory (`.git-backup`) is archived
+as its raw files, byte for byte, **always**: they stay in `files.tar.gz`. It is also bundled with `git bundle create --all` and read
+back in an empty repository with every ref's commit a bundle head, but that bundle is only an extra, verified copy, because a bundle
+leaves out older stash entries (the `refs/stash` reflog), submodule repositories under `modules/`, LFS objects under `lfs/objects`,
+`worktrees/`, config and remotes, hooks, `info/exclude` and dangling commits. A Git directory with a `commondir` file is never
+bundled (git would bundle the repository the file points to): it is archived as raw files only, as is one git cannot read safely
+(unsafe config, alternates, grafts), with no ref, or that fails to verify. A main repository with live linked worktrees outside the folder (`linked-worktrees:<n>`) still keeps it.
+As for a job folder, the archive saves what git does not hold in each repository (and every stray Git directory). Because this route
+removes the folder at `unsavedArchiveDays`, before the evidence window, it also copies the files that belong to no repository (notes, a
+non-git copy beside a dirty repository), except regenerable output (`node_modules`, `dist`, caches...) and protected names, which
+stay as before; the manifest counts them (`looseFiles`) and they restore from `files.tar.gz` like the rest. They count against the
+same size and file-count bounds as everything else: when they push the archive over a bound the folder is kept as
+`archive-too-large:...:with-<n>-files-outside-every-repository` and waits for the evidence window. A folder with nothing unsaved is
+not archived and keeps the longer window.
 
 ## Interrupted jobs (`interruptedExpiryDays`)
 
@@ -234,6 +243,19 @@ that every saved tip is reachable from the bundle heads or the base. A missing o
 a default branch it cannot find, a base the main repository lacks or any failed step writes the self-contained bundle instead
 (`thinFallback` in the manifest says why). **The trade-off:** a thin bundle cannot be restored without that main repository (an empty
 repository fails its `git bundle verify`), and the archive survives only as long as the main repository does.
+
+**The pin.** Prerequisites alone are not enough: if upstream force-pushes and the main repository later prunes and collects garbage,
+the base commits could vanish and the bundle would never restore. So every thin bundle pins its prerequisite commits in the main
+repository with one ref, `refs/trimreaper/thin/<archive-id>` (a commit with an empty tree whose parents are exactly the
+prerequisites), written last, after the bundle verified, and read back (the ref exists, names that commit, every prerequisite is
+reachable from it) before the archive is accepted. The manifest records it (`thin.pinRef`, `thin.pinCommit`). If the ref cannot be
+written or verified, the bundle is self-contained instead (`thinFallback`). A failed archive removes its own pins; an archive is reused
+(same folder, same fingerprint) only while its pin still stands. The pin ends when the archive does: the expiry of its archive
+(`reap --archives`, the tick) removes it after the archive folder is gone, and so does the supersession of an older archive of the same
+clone by a newer verified one. A removal that fails keeps the pin, which only keeps history alive longer. **Never-expiring archives are
+never thin**: with `archiveExpiryDays` 0, a clean-pass archive while `cleanWorktreeArchiveExpiryDays` is 0, or a protected-copy
+scratch archive (which never expires), the bundle is self-contained (`thinFallback: thin-forbidden:never-expires:...`), because its
+pin could never be released. Thin archives written before pins existed have none; they stay as unprotected as they were.
 
 ## Narrow exact-output route
 
@@ -290,9 +312,10 @@ These also remove files, each with its own checks:
   file's name and SHA-256 in `evidence-expired.jsonl` first, rechecks ancestor retention markers and protected names before unlink, and skips any folder holding a marker, `.git`, a protected
   name or a tool cache, except report-backed evidence markers past the separate five-day window. Bulky marked folders use `reap_item`, not the file-unlink route: shared build-queue and discovered Cargo locks, all Git/archive proofs, protected scans and fresh claims/process checks still apply. Retained record names stop a whole-folder removal, including if they appear during removal. Marked expiry never uses the protected-template exception. Automatic scans retry marker-preserved folders hourly.
 - **Its own leftovers**, without receipts: a `.partial-*` staging folder of an archive that crashed more than a day ago;
-  older archives of the same clone once a newer one verified (never one that is already the only copy); and a removed
-  linked worktree's entry in its main repository (`.git/worktrees/<name>`, only when it points at the folder just
-  removed and is not locked).
+  older archives of the same clone once a newer one verified (never one that is already the only copy), and their thin-bundle pins
+  (`refs/trimreaper/thin/<archive-id>` in the main repository); and a removed linked worktree's entry in its main repository
+  (`.git/worktrees/<name>`, only when it points at the folder just removed, is not locked, and the main repository has no
+  `index.lock` and is not mid-rebase or mid-merge).
 
 ## What it cannot detect
 

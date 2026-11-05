@@ -10,10 +10,12 @@ longer evidence window.
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import tarfile
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 from trimreaper import core
 
@@ -249,8 +251,9 @@ class ScratchUnsaved(UnsavedFixtures):
         self.assertTrue(entry["bundle"]["whole"], entry)
         restored = self.restored(archive / entry["bundle"]["file"])
         self.assertEqual(subprocess.run(["git", "-C", str(restored), "cat-file", "-t", head], capture_output=True, text=True).stdout.strip(), "commit")
-        names = tarfile.open(archive / "files.tar.gz").getnames() if (archive / "files.tar.gz").exists() else []
-        self.assertFalse([n for n in names if ".git-backup" in n], names)  # the bundle replaces its raw files
+        names = tarfile.open(archive / "files.tar.gz").getnames()
+        self.assertIn(".git-backup/HEAD", names)  # the bundle is an extra copy: the raw files stay (older stashes, modules, LFS, config...)
+        self.assertIn(".git-backup/packed-refs", names)
 
     def test_an_unsaved_scratch_archive_expires_with_archiveExpiryDays(self):
         self.main_with_worktree("expiring")
@@ -265,6 +268,206 @@ class ScratchUnsaved(UnsavedFixtures):
 
         self.assertEqual(out["deleted"], 1, out)
         self.assertEqual(self.unsaved_archives(), [])
+
+
+class StrayGitDirectory(UnsavedFixtures):
+    """B3: the raw files of a stray Git directory always stay in files.tar.gz; its bundle is an extra, verified copy."""
+
+    def stray(self, task: str) -> tuple[Path, Path]:
+        """A scratch task holding `.git-backup`: a repository's git directory with a submodule repository under modules/, an LFS
+        object under lfs/objects and two stash entries (a bundle `--all` keeps only the newest one)."""
+        source = self.tmp / "stray-source"
+        sub = self.tmp / "stray-sub"
+        for repo in (source, sub):
+            repo.mkdir(parents=True)
+            self.git(repo, "init", "-q", "-b", "main")
+        (sub / "lib.txt").write_text("library\n")
+        self.git(sub, "add", "-A")
+        self.git(sub, "commit", "-q", "-m", "lib")
+        (source / "a.txt").write_text("one\n")
+        self.git(source, "add", "-A")
+        self.git(source, "commit", "-q", "-m", "base")
+        self.git(source, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub), "vendor/sub")
+        self.git(source, "commit", "-q", "-m", "submodule")
+        (source / "a.txt").write_text("first stash content\n")
+        self.git(source, "stash", "push", "-q", "-m", "first-stash")
+        (source / "a.txt").write_text("second stash content\n")
+        self.git(source, "stash", "push", "-q", "-m", "second-stash")
+        lfs = source / ".git" / "lfs" / "objects" / "ab" / "cd"
+        lfs.mkdir(parents=True)
+        (lfs / ("abcd" + "0" * 60)).write_bytes(b"the only copy of a large file\n")
+        folder = self.scratch(task)
+        folder.mkdir(parents=True)
+        os.rename(source / ".git", folder / ".git-backup")
+        self.put(folder, "notes.txt", b"notes\n")
+        return folder, folder / ".git-backup"
+
+    def test_raw_gitdir_files_stay_in_the_archive_and_restore_the_older_stash(self):
+        folder, gitdir = self.stray("stray")
+        before = self.git(gitdir.parent, "--git-dir", str(gitdir), "stash", "list")
+        self.assertEqual(len(before.splitlines()), 2, before)  # sanity: two stash entries
+        self.age(folder, 9)
+
+        out = self.cli("reap", "--scratch")
+
+        self.assertEqual(out["deleted"], 1, out)
+        self.assertFalse(folder.exists())
+        (archive,) = self.unsaved_archives()
+        manifest = self.manifest(archive)
+        (entry,) = [r for r in manifest["repositories"] if r["mode"] == "git-dir" and r["relative"] == ".git-backup"]
+        self.assertTrue(entry["bundle"]["whole"], entry)  # the bundle is still written: an extra, verified copy
+        names = tarfile.open(archive / "files.tar.gz").getnames()
+        self.assertIn(".git-backup/logs/refs/stash", names)  # the reflog that holds the OLDER stash entry
+        self.assertTrue([n for n in names if n.startswith(".git-backup/modules/")], names)  # the submodule repository
+        self.assertIn(".git-backup/lfs/objects/ab/cd/abcd" + "0" * 60, names)  # the LFS object
+        self.assertIn(".git-backup/config", names)
+        self.assertIn(".git-backup/info/exclude", names)
+        # restore: extract the tar; the second (older) stash entry is back
+        target = self.tmp / "restored-stray"
+        target.mkdir()
+        with tarfile.open(archive / "files.tar.gz") as tar:
+            tar.extractall(target, filter="data")
+        listing = self.git(target, "--git-dir", str(target / ".git-backup"), "stash", "list")
+        self.assertIn("first-stash", listing)  # stash@{1}: not in `git bundle --all` (it keeps only refs/stash)
+        self.assertIn("second-stash", listing)
+        restored = self.git(target, "--git-dir", str(target / ".git-backup"), "show", "stash@{1}:a.txt")
+        self.assertEqual(restored, "first stash content\n")
+        self.assertEqual((target / ".git-backup" / "lfs" / "objects" / "ab" / "cd" / ("abcd" + "0" * 60)).read_bytes(), b"the only copy of a large file\n")
+
+    def test_a_commondir_file_refuses_the_gitdir_bundle(self):
+        other = self.clone("other-repo")
+        task = self.scratch("common")
+        task.mkdir(parents=True)
+        gitdir = task / ".git-backup"
+        subprocess.run(["git", "init", "-q", "--bare", str(gitdir)], check=True, capture_output=True)
+        (gitdir / "commondir").write_text(str(other / ".git") + "\n")  # git would read ANOTHER repository's refs and objects
+        with self.assertRaises(core.ReapRefused) as caught:
+            core.reap_archive_gitdir_gate(str(gitdir))
+        self.assertEqual(str(caught.exception), "git-error:unsafe-metadata:commondir")
+        stage = self.tmp / "stage"
+        stage.mkdir()
+        self.assertIsNone(core.reap_archive_gitdir_bundle({"root": str(gitdir), "kind": "git-dir"}, str(stage), 0))
+        self.assertEqual(os.listdir(stage), [])
+        self.age(task, 9)
+
+        out = self.cli("reap", "--scratch")
+
+        self.assertEqual(out["deleted"], 1, out)
+        (archive,) = self.unsaved_archives()
+        (entry,) = [r for r in self.manifest(archive)["repositories"] if r["mode"] == "git-dir"]
+        self.assertIsNone(entry["bundle"])  # raw-only
+        self.assertIn(".git-backup/commondir", tarfile.open(archive / "files.tar.gz").getnames())
+
+
+class LooseFilesAndBusyMain(UnsavedFixtures):
+    """SF1: the unsaved route also archives files outside every repository. NIT: no worktree is forgotten under a busy main."""
+
+    def test_loose_notes_beside_a_dirty_repository_are_archived_and_restore(self):
+        main, worktree = self.main_with_worktree("loose")
+        task = self.scratch("loose")
+        self.put(task, "notes.txt", b"meeting notes, not in any repository\n")
+        self.put(task, "copy/docs/plan.md", b"a non-git copy\n")
+        self.age(task, 9)
+
+        out = self.cli("reap", "--scratch")
+
+        self.assertEqual(out["deleted"], 1, out)
+        self.assertFalse(task.exists())
+        (archive,) = self.unsaved_archives()
+        manifest = self.manifest(archive)
+        self.assertEqual(manifest["looseFiles"], 2)
+        target = self.tmp / "restored-loose"
+        target.mkdir()
+        with tarfile.open(archive / "files.tar.gz") as tar:
+            tar.extractall(target, filter="data")
+        self.assertEqual((target / "notes.txt").read_bytes(), b"meeting notes, not in any repository\n")
+        self.assertEqual((target / "copy" / "docs" / "plan.md").read_bytes(), b"a non-git copy\n")
+        self.assertEqual((target / "wt" / "README.md").read_bytes(), b"dirty edit\n")  # the repository's own unsaved file, as before
+
+    def test_regenerable_output_beside_the_repository_is_still_left_out(self):
+        self.main_with_worktree("regen")
+        task = self.scratch("regen")
+        self.put(task, "node_modules/pkg/index.js", b"module.exports = 1\n")
+        self.age(task, 9)
+
+        out = self.cli("reap", "--scratch")
+
+        self.assertEqual(out["deleted"], 1, out)
+        (archive,) = self.unsaved_archives()
+        self.assertFalse([n for n in tarfile.open(archive / "files.tar.gz").getnames() if "node_modules" in n])
+
+    def test_oversize_loose_files_keep_the_folder_with_a_named_reason(self):
+        self.main_with_worktree("big")
+        task = self.scratch("big")
+        self.put(task, "dump/blob.bin", os.urandom(200_000))
+        self.age(task, 9)
+
+        with mock.patch.object(core, "REAP_ARCHIVE_MAX_BYTES", 100_000):
+            out = self.cli("reap", "--scratch")
+
+        self.assertEqual(out["deleted"], 0, out)
+        self.assertTrue((task / "dump" / "blob.bin").exists())
+        held = next(i for i in out["items"] if i["path"] == str(task))
+        self.assertTrue(held["reason"].startswith("archive-too-large:"), held)
+        self.assertIn("files-outside-every-repository", held["reason"])
+        self.assertEqual(self.unsaved_archives(), [])
+
+    def test_the_full_window_route_does_not_copy_loose_files_of_a_clean_folder(self):
+        # nothing unsaved: the longer evidence window applies and no archive is written (unchanged behaviour)
+        task = self.scratch("plain-old")
+        self.put(task, "notes.txt", b"quiet notes\n")
+        self.age(task, 20)
+
+        out = self.cli("reap", "--scratch")
+
+        self.assertEqual(out["deleted"], 1, out)
+        self.assertEqual(self.unsaved_archives(), [])
+
+    def test_an_index_lock_in_the_main_repository_keeps_the_folder(self):
+        main, worktree = self.main_with_worktree("locked-main")
+        task = self.scratch("locked-main")
+        self.age(task, 9)
+        lock = main / ".git" / "index.lock"
+        lock.write_text("")
+
+        out = self.cli("reap", "--scratch")
+
+        self.assertEqual(out["deleted"], 0, out)
+        self.assertTrue(worktree.exists())
+        held = next(i for i in out["items"] if i["path"] == str(task))
+        self.assertEqual(held["reason"], "worktree-main-busy:index-lock", held)
+        lock.unlink()
+
+        again = self.cli("reap", "--scratch")
+
+        self.assertEqual(again["deleted"], 1, again)
+        self.assertFalse(task.exists())
+
+    def test_a_main_repository_in_the_middle_of_a_rebase_keeps_the_folder(self):
+        main, worktree = self.main_with_worktree("rebasing")
+        task = self.scratch("rebasing")
+        self.age(task, 9)
+        (main / ".git" / "rebase-merge").mkdir()
+
+        out = self.cli("reap", "--scratch")
+
+        self.assertEqual(out["deleted"], 0, out)
+        self.assertTrue(worktree.exists())
+        held = next(i for i in out["items"] if i["path"] == str(task))
+        self.assertEqual(held["reason"], "worktree-main-busy:mid-operation:rebase-merge", held)
+
+    def test_forgetting_a_worktree_entry_is_skipped_under_a_lock_or_a_merge(self):
+        main, worktree = self.main_with_worktree("forget")
+        (entry,) = (main / ".git" / "worktrees").iterdir()
+        for marker, reason in (("index.lock", "index-lock"), ("MERGE_HEAD", "mid-operation:MERGE_HEAD")):
+            (main / ".git" / marker).write_text("")
+            result = core.reap_worktree_forget(str(main / ".git"), str(entry), str(worktree))
+            (main / ".git" / marker).unlink()
+            self.assertEqual(result, f"worktree-entry-kept:main-busy:{reason}")
+            self.assertTrue(entry.is_dir())
+        shutil.rmtree(worktree)
+        self.assertEqual(core.reap_worktree_forget(str(main / ".git"), str(entry), str(worktree)), "worktree-entry-forgotten")
+        self.assertFalse(entry.exists())
 
 
 class JobFolderUnsaved(UnsavedFixtures):
