@@ -158,5 +158,6 @@ errors)` reaps one job the moment its worker closes.
 
 ## On-disk formats
 
-The retention marker prefix `.ut-retention-` and the archive manifest kind `ut-overseer-reap-archive` come from
-UltraTerm, where the engine started. They stay as they are so existing markers and archives keep working.
+The retention marker prefix `.ut-retention-` comes from UltraTerm, where the engine started, and stays as it is so existing
+markers keep working. Archives are written with manifest kind `trimreaper-archive`; manifests written before 0.14.0 carry an
+older kind, which the engine still reads.

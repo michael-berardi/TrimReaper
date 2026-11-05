@@ -305,3 +305,36 @@ class OwnerCompact(Home):
         out = self.cli("owner", "compact", "--run", status["expectedRun"])
         self.assertTrue(out["compacted"])
         self.assertTrue(Path(out["archive"]).exists())
+
+
+class ArchiveKind(Home):
+    """Archives carry the neutral kind `trimreaper-archive`; manifests from before 0.14.0 still count as archives."""
+
+    def archive_of(self, job):
+        repo = self.clone(f"app-{job.lower().replace('-', '')}")
+        (repo / "notes.txt").write_text("unsaved\n")
+        self.add_job(job, repo, finished_ago=4 * DAY)
+        self.cli("reap", "--job", job)
+        return repo, next((self.home / f".cache/trimreaper/archive/{job}").iterdir())
+
+    def test_a_new_archive_names_the_neutral_kind(self):
+        _, archive = self.archive_of("J-0174")
+        self.assertEqual(json.loads((archive / "manifest.json").read_text())["kind"], "trimreaper-archive")
+
+    def test_a_legacy_kind_is_still_superseded_by_a_newer_archive_of_the_same_clone(self):
+        _, archive = self.archive_of("J-0175")
+        manifest = archive / "manifest.json"
+        data = json.loads(manifest.read_text())
+        data["kind"] = core.REAP_ARCHIVE_KINDS[1]
+        older = archive.with_name(archive.name + "-older")
+        archive.rename(older)
+        (older / "manifest.json").write_text(json.dumps(data))
+        (older / "sole-copy-since.json").unlink(missing_ok=True)  # an archive of a clone that still exists
+        past = time.time() - 3600
+        os.utime(older, (past, past))
+        final = older.with_name(archive.name)
+        final.mkdir()
+        (final / "manifest.json").write_text(json.dumps({**data, "kind": core.REAP_ARCHIVE_KIND}))
+        removed = core.reap_archive_supersede(str(older.parent), str(final), data["path"], data["job"])
+        self.assertEqual(removed, 1)
+        self.assertFalse(older.exists())

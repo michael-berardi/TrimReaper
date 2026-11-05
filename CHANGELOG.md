@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.14.0 (2026-11-04)
+
+Archive manifests now carry the neutral kind `trimreaper-archive`. Manifests written by earlier versions keep their old kind and
+are still read, so existing archives keep expiring and superseding as before. The neutrality test now also refuses the name of
+the agent stack the engine was first built inside.
+
 ## 0.13.0 (2026-11-04)
 
 - New `compress-logs` target (every pass, including the quiet steady pass): history files (transcripts, receipts, logs) that
