@@ -48,6 +48,12 @@ reads it wherever it read `load_policy()` for a window) and `reap_pin_released(c
 another (UltraTerm's artifact inputs) should ask `reap_pin_released` for the pinning job, so a finished or failed job never pins and
 an interrupted one stops pinning only inside a rung, after `cleanEscalatePinnedHours`.
 
+Three more policy keys have no `CLEAN_POLICY` fallback, and a host that wants them sets them itself: `cleanEmergencyPercent` /
+`cleanEmergencyHours` (shorter windows on the worktree and finished-job rungs at that occupancy; `CLEAN_POLICY` ships 90 and 6), and
+`compressLogsIdleDays` / `compressLogsRoots` for the `compress-logs` target. That target runs `afsctool` on the host's files in every
+pass once roots are configured; with no roots it does nothing. Its result is `out["compress"]`; a host should surface
+`compress.errors` and `compress.freedBytes` in its own receipts.
+
 Results include `initialOccupancy`, `finalOccupancy`, `remainingBytes` and `goalMet`.
 `disk_state()` must supply exact `usedBytes` and `freeBytes`: occupancy uses used/(used+free), not an APFS
 volume's nominal total or a rounded percentage. `reap_disk_state(volume)` obtains these columns with a bounded

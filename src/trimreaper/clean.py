@@ -10,7 +10,7 @@ Three things, each with its own rule:
   its HEAD ever pointed at is still on a branch, tag or remote. It goes through the guarded removal; its branch stays.
 * Stale build/session debris and superseded browser builds use guarded removal; models and disk images are report-only.
 
-Only names, sizes and times are read, never file contents. Space freed is the volume's free space after minus before.
+Planning reads only names, sizes and times; dedupe-clones and compress-logs read a file's bytes to compare and compress it. Space freed is the volume's free space after minus before.
 Everything between the `trimreaper clean` markers can be vendored byte for byte after the engine, like the engine itself
 (docs/EMBEDDING.md): it reads the engine's names and the host's names as globals, and every name it defines starts with
 `clean_` or `CLEAN_`.
@@ -1933,7 +1933,7 @@ def clean_pass_run(dry_run: bool, deep: bool, only: list | None, report: bool, p
         for entry in sized:
             entry["paths"] = []
     dedupe_out = clean_dedupe(chosen, dry_run) if CLEAN_DEDUPE_NAME in chosen and (dry_run or steady or initial["goalMet"] is not True) else None
-    compress_out = clean_compress(chosen, dry_run, policy) if CLEAN_COMPRESS_NAME in chosen else None
+    compress_out = clean_compress(chosen, dry_run, policy) if CLEAN_COMPRESS_NAME in chosen and not stopped else None
     if not dry_run:
         clean_forget_refusals()
     all_entries = sorted(merged.values(), key=lambda e: ("keep" in e, -(e.get("bytes") or 0)))
@@ -2164,14 +2164,20 @@ def clean_dedupe(chosen: set, dry_run: bool) -> dict:
 # Agent transcripts, run receipts and logs are kept for history, are written once and are mostly text. APFS can store a file
 # compressed (decmpfs, the same transparent compression macOS uses for its own files): every reader sees the exact same bytes,
 # nothing is removed, and a later write simply stores the file uncompressed again. The target compresses text-like files that
-# have not changed for compressLogsIdleDays in the operator's history folders (compressLogsRoots), through `afsctool` when it is
-# installed (macOS only; elsewhere, or without the tool, the target says why it was skipped). Files open in a process, files
-# already compressed, executables, links and hard-linked files are left alone.
+# have not changed for compressLogsIdleDays in the operator's history folders (compressLogsRoots; none by default), with
+# `afsctool` (macOS only; elsewhere, or without the tool, the target says why it was skipped).
+# The original is never rewritten in place: each file is APFS-cloned to a private temporary name next to it, the CLONE is
+# compressed and verified by afsctool, its bytes are compared with the original's, the original's identity (inode, size,
+# mtime, ctime) is checked unchanged, and only then is the clone renamed over it. A writer that appended meanwhile, a kill or
+# a timeout leaves the original untouched (the temporary is removed). Open files, links, hard links, executables, protected
+# names, other devices and files under 128 KiB are skipped. Each batch takes the cleanup-owner lock on its own, and a pass
+# spends at most CLEAN_COMPRESS_SECONDS; the rest waits for the next pass.
 CLEAN_COMPRESS_NAME = "compress-logs"
 CLEAN_COMPRESS_SUFFIXES = (".jsonl", ".json", ".log", ".md", ".txt")
 CLEAN_COMPRESS_MIN_BYTES = 128 * 1024
-CLEAN_COMPRESS_BATCH = 200
-CLEAN_COMPRESS_DEFAULT_ROOTS = (".claude/projects", ".pi/agent/sessions", ".pi/agent/usap")
+CLEAN_COMPRESS_BATCH = 25
+CLEAN_COMPRESS_SECONDS = 300
+CLEAN_COMPRESS_TEMP = ".trimreaper-compress"
 CLEAN_UF_COMPRESSED = 0x20
 
 
@@ -2181,15 +2187,19 @@ def clean_compress_tool() -> str | None:
     return shutil.which("afsctool")
 
 
-def clean_compress_roots(policy: dict) -> list[str]:
-    roots = policy.get("compressLogsRoots")
-    if roots is None:
-        roots = list(CLEAN_COMPRESS_DEFAULT_ROOTS)
+def clean_compress_roots(policy: dict, errors: list) -> list[str]:
+    roots = policy.get("compressLogsRoots") or []
     if not isinstance(roots, list) or not all(isinstance(r, str) and r for r in roots):
+        errors.append({"clean": CLEAN_COMPRESS_NAME, "error": "compressLogsRoots must be a list of folder paths"})
         return []
+    home = os.path.realpath(clean_home())
     found = []
     for root in roots:
-        path = os.path.expanduser(root) if root.startswith("~") or os.path.isabs(root) else clean_home(root)
+        path = os.path.realpath(os.path.expanduser(root) if root.startswith("~") or os.path.isabs(root) else clean_home(root))
+        parts = Path(path).parts
+        if path in (home, "/") or not path.startswith(home + os.sep) or any(reap_protected(p) or p == ".git" for p in parts):
+            errors.append({"clean": CLEAN_COMPRESS_NAME, "path": clean_tilde(path), "error": "root-refused:must-be-a-folder-inside-home"})
+            continue
         if os.path.isdir(path) and not os.path.islink(path):
             found.append(path)
     return found
@@ -2203,9 +2213,17 @@ def clean_compress_candidates(roots: list[str], idle_days: float, at: float):
         except OSError:
             continue
         for folder, dirs, files in os.walk(root):
-            dirs[:] = [d for d in dirs if not reap_protected(d) and not os.path.islink(os.path.join(folder, d))]
+            kept = []
+            for d in dirs:
+                try:
+                    info = os.lstat(os.path.join(folder, d))
+                except OSError:
+                    continue
+                if d != ".git" and not reap_protected(d) and stat.S_ISDIR(info.st_mode) and info.st_dev == device:
+                    kept.append(d)
+            dirs[:] = kept
             for name in files:
-                if not name.endswith(CLEAN_COMPRESS_SUFFIXES) or reap_protected(name):
+                if not name.endswith(CLEAN_COMPRESS_SUFFIXES) or reap_protected(name) or CLEAN_COMPRESS_TEMP in name:
                     continue
                 full = os.path.join(folder, name)
                 try:
@@ -2219,42 +2237,116 @@ def clean_compress_candidates(roots: list[str], idle_days: float, at: float):
                 yield full, info
 
 
+def clean_compress_identity(info) -> tuple:
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_nlink)
+
+
+def clean_compress_same_bytes(a: str, b: str) -> bool:
+    with open(a, "rb") as one, open(b, "rb") as two:
+        while True:
+            x, y = one.read(1 << 20), two.read(1 << 20)
+            if x != y:
+                return False
+            if not x:
+                return True
+
+
+def clean_compress_one(tool: str, path: str, info, deadline: float) -> str | None:
+    """Compress `path` through a verified clone renamed over it. None when done, else the reason it was left as it was."""
+    temp = f"{path}.{CLEAN_COMPRESS_TEMP}-{os.getpid()}"
+    try:
+        if clean_compress_identity(os.lstat(path)) != clean_compress_identity(info):
+            return "changed-before-compression"
+        clean_dedupe_clone(path, temp)
+        left = max(5.0, deadline - time.monotonic())
+        try:
+            done = subprocess.run([tool, "-c", "-T", "LZFSE", temp], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                  errors="replace", timeout=left)
+        except subprocess.TimeoutExpired:
+            return "timeout"
+        if done.returncode != 0:
+            return f"afsctool-exit-{done.returncode}:{(done.stderr or done.stdout).strip()[:160]}"
+        if not os.lstat(temp).st_flags & CLEAN_UF_COMPRESSED:
+            return "not-compressible"
+        if not clean_compress_same_bytes(path, temp):
+            return "bytes-differ"
+        if clean_compress_identity(os.lstat(path)) != clean_compress_identity(info):
+            return "changed-during-compression"
+        os.utime(temp, ns=(info.st_atime_ns, info.st_mtime_ns), follow_symlinks=False)
+        os.chmod(temp, stat.S_IMODE(info.st_mode))
+        os.rename(temp, path)
+        return None
+    except OSError as error:
+        return "os-error:" + clean_os_refusal(error)
+    finally:
+        try:
+            os.unlink(temp)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+
 def clean_compress(chosen: set, dry_run: bool, policy: dict | None = None) -> dict:
     """Transparent, lossless APFS compression of idle history files (see above). Removes nothing."""
     policy = policy if policy is not None else load_policy()
-    result = {"name": CLEAN_COMPRESS_NAME, "dryRun": dry_run, "files": 0, "bytes": 0, "errors": []}
+    result = {"name": CLEAN_COMPRESS_NAME, "dryRun": dry_run, "planned": 0, "files": 0, "bytes": 0, "kept": {}, "errors": []}
     days = policy.get("compressLogsIdleDays", 2)
     if not isinstance(days, (int, float)) or isinstance(days, bool) or days <= 0:
         result["skipped"] = "compressLogsIdleDays is 0 (off)"
+        return result
+    roots = clean_compress_roots(policy, result["errors"])
+    if not roots:
+        result["skipped"] = "no compressLogsRoots configured"
         return result
     tool = clean_compress_tool()
     if not tool:
         result["skipped"] = "needs macOS and afsctool (brew install afsctool)"
         return result
-    roots = clean_compress_roots(policy)
     result["roots"] = len(roots)
+    planned = list(clean_compress_candidates(roots, days, now()))
+    if not planned:
+        return result
     try:
         table = reap_process_table()
-    except ReapRefused as error:  # no open-file proof, no compression: a file a process writes is never rewritten under it
+    except ReapRefused as error:  # no open-file proof, no compression
         result["skipped"] = str(error)
         return result
-    held = {path for _, _, _, path in table.get("files", ())}
-    batch = []
-    for path, info in clean_compress_candidates(roots, days, now()):
-        if path in held:
+    held = set()
+    for _, _, _, name in table.get("files", ()):
+        try:
+            got = os.stat(name)
+            held.add((got.st_dev, got.st_ino))
+        except OSError:
             continue
-        result["files"] += 1
-        result["bytes"] += info.st_size
-        batch.append(path)
-    if dry_run or not batch:
+    planned = [(p, i) for p, i in planned if (i.st_dev, i.st_ino) not in held]
+    result["planned"] = len(planned)
+    result["plannedBytes"] = sum(i.st_size for _, i in planned)
+    if dry_run:
         return result
-    before = clean_free()
-    with reap_cleanup_owner("clean"):
-        for start in range(0, len(batch), CLEAN_COMPRESS_BATCH):
-            chunk = batch[start:start + CLEAN_COMPRESS_BATCH]
-            code, out = clean_run([tool, "-c", "-T", "LZFSE", *chunk], CLEAN_TOOL_SECONDS)
-            if code != 0:
-                result["errors"].append({"clean": CLEAN_COMPRESS_NAME, "error": f"afsctool exit {code}: {out.strip()[:200]}"})
+    before, deadline = clean_free(), time.monotonic() + CLEAN_COMPRESS_SECONDS
+    for start in range(0, len(planned), CLEAN_COMPRESS_BATCH):
+        if time.monotonic() >= deadline:
+            result["deferred"] = len(planned) - start
+            break
+        try:
+            with reap_cleanup_owner("clean"):
+                for path, info in planned[start:start + CLEAN_COMPRESS_BATCH]:
+                    if time.monotonic() >= deadline:
+                        break
+                    reason = clean_compress_one(tool, path, info, deadline)
+                    if reason is None:
+                        result["files"] += 1
+                        result["bytes"] += info.st_size
+                    else:
+                        key = reason.split(":", 1)[0]
+                        result["kept"][key] = result["kept"].get(key, 0) + 1
+                        if key.startswith(("afsctool-exit", "os-error", "bytes-differ")):
+                            result["errors"].append({"clean": CLEAN_COMPRESS_NAME, "path": clean_tilde(path), "error": reason})
+        except ReapRefused as error:  # the reaper is busy: the rest waits for the next pass
+            result["skipped"] = str(error)
+            result["deferred"] = len(planned) - start
+            break
     after = clean_free()
     result["freedBytes"] = None if None in (before, after) else after - before
     return result
@@ -2351,8 +2443,18 @@ def clean_auto(conn, policy: dict, actions: list, errors: list, event=None) -> N
                     "rungs": [{k: r[k] for k in ("name", "done", "removedBytes", "goalMet")} for r in out.get("rungs", [])],
                     "topBlockers": out.get("topBlockers", [])[:3]})
     errors.extend(out["errors"])
+    clean_compress_report(out, actions, errors)
     if out.get("stopped"):
         errors.append({"clean": "auto", "stopped": out["stopped"]})
+
+
+def clean_compress_report(out: dict, actions: list, errors: list) -> None:
+    """compress-logs results reach the automatic passes' receipts: what it compressed and saved, and every error it named."""
+    compressed = out.get("compress") or {}
+    errors.extend(compressed.get("errors") or [])
+    if compressed.get("files"):
+        actions.append({"did": "compressed-history", "files": compressed["files"], "bytes": compressed["bytes"],
+                        "freedBytes": compressed.get("freedBytes"), "deferred": compressed.get("deferred", 0)})
 
 
 def clean_steady_due(conn, policy: dict) -> bool:
@@ -2387,6 +2489,7 @@ def clean_steady_tick(conn, policy: dict, actions: list, errors: list) -> None:
         actions.append({"did": "cleaned-steady", "done": out["summary"]["done"], "removedBytes": out["summary"].get("removedBytes") or 0,
                         "freedBytes": after["freeBytes"] - before["freeBytes"] if after and before else None})
     errors.extend(out["errors"])
+    clean_compress_report(out, actions, errors)
     if out.get("stopped"):
         errors.append({"clean": "steady", "stopped": out["stopped"]})
 # <<< trimreaper clean <<<
