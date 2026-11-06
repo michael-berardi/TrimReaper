@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.15.1 (2026-11-06)
+
+Fixture removal may clear a nested Git store inside a proven scoped folder, when a host scope is set by the caller: a Git store
+at the fixture root, under a protected name or under another Git store is still refused, and with no scope the old refusal stands.
+
+- `tagged-caches` discovery no longer reports an error (and `tick` no longer exits 3) when a folder in a shared temp root is removed by
+  its owner between being listed and being scanned: a folder that is gone is skipped, not refused.
+
 ## 0.15.0 (2026-11-05)
 
 Finds the debris agents leave where earlier versions never looked, without loosening any proof.

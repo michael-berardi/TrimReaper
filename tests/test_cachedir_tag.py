@@ -603,3 +603,24 @@ class Tagged(Home):
         self.assertEqual(len(incomplete), 1, errors)
         self.assertIn("~/dev", incomplete[0]["error"])
         self.assertEqual(incomplete[0]["path"], "~/dev")
+
+
+    def test_a_folder_removed_while_discovery_walks_is_not_an_error(self):
+        """0.15.1: the shared temp folder churns (other processes' own temp folders come and go), and a folder listed by its parent but
+        gone before it was checked or scanned made `tick` exit 3 with `missing:FileNotFoundError:ENOENT`. Gone is not a refusal."""
+        gone = self.usertmp / "uo-gone"
+        gone.mkdir()
+        real_scandir = os.scandir
+
+        def scandir(path):
+            if str(path) != str(self.usertmp):
+                return real_scandir(path)
+            entries = list(real_scandir(path))
+            if gone.exists():
+                gone.rmdir()  # removed by its owner after the listing
+            return contextlib.nullcontext(entries)
+
+        with mock.patch.object(clean.os, "scandir", scandir):
+            errors: list = []
+            clean.clean_tagged_find(errors)
+        self.assertEqual([e for e in errors if "ENOENT" in str(e.get("error"))], [])

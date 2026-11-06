@@ -1216,6 +1216,8 @@ def clean_tagged_find(errors: list, steady: bool = False) -> list[tuple[str, str
             try:
                 with os.scandir(folder) as scan:
                     entries = list(scan)
+            except FileNotFoundError:
+                continue  # removed by its owner since it was listed (a shared temp folder churns): nothing to find, nothing refused
             except OSError as error:
                 errors.append({"clean": "tagged-caches", "path": clean_tilde(folder), "error": clean_os_refusal(error)})
                 continue
@@ -1230,7 +1232,11 @@ def clean_tagged_find(errors: list, steady: bool = False) -> list[tuple[str, str
             if depth >= CLEAN_TAGGED_DEPTH:
                 continue
             for entry in entries:
-                if entry.name in CLEAN_TAGGED_SKIP or reap_protected(entry.name) or not clean_directory(entry, "tagged-caches", errors):
+                if entry.name in CLEAN_TAGGED_SKIP or reap_protected(entry.name):
+                    continue
+                if folder == root and root in temps and not os.path.lexists(entry.path):
+                    continue  # a shared temp root churns: an entry its owner removed since the listing is gone, not refused
+                if not clean_directory(entry, "tagged-caches", errors):
                     continue
                 if in_home and entry.name in CLEAN_RUST_SCAN_SKIP:
                     continue
