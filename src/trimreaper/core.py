@@ -364,6 +364,18 @@ def reap_is_git(name: str) -> bool:
     return reap_fold(name) == ".git"
 
 
+REAP_GIT_SCOPE = threading.local()  # .scope: a recorded fixture's proven Git folders; set only while fixture_remove_and_verify runs
+
+
+def reap_git_scoped(rel: str, scope=None) -> bool:
+    """Whether a Git entry at `rel` (relative to the scanned folder) sits below one of the proven top-level folders `scope`. The
+    fixture root itself never qualifies, and the caller must have proved the scope (fixture_git_scope) before passing it."""
+    scope = getattr(REAP_GIT_SCOPE, "scope", frozenset()) if scope is None else scope
+    parts = rel.split("/") if rel else []
+    return (len(parts) >= 2 and parts[0] in scope and not reap_protected(parts[-1])
+            and not any(reap_protected(part) or reap_is_git(part) for part in parts[1:-1]))
+
+
 def reap_refuse_git_layout(rel: str, names: list) -> None:
     """A directory that lists HEAD, objects and refs is a Git directory whatever it is called: a bare repository, a
     `--separate-git-dir` target, a moved `.git`. Names only (nothing is stat'ed, opened or run, and the directory is refused
@@ -1306,7 +1318,7 @@ def reap_vendored_templates(path: str) -> dict:
 def reap_protected_scan(path: str, allow_git: bool = False, markers: bool = False, budget: int = REAP_WALK_ENTRIES,
                         repos: list | None = None, nested_disposable: bool = False, templates: frozenset = frozenset(),
                         protected_ok: bool = False, git_dirs: list | None = None, secrets: list | None = None,
-                        expiring_evidence: bool = False, scratch: bool = False) -> int:
+                        expiring_evidence: bool = False, scratch: bool = False, git_scope: frozenset = frozenset()) -> int:
     """Names only, descriptor-relative (reap_fd_walk). Preserve the item if a protected name (.wrangler, .vercel, .env*,
     .dev.vars*) or, unless `allow_git`, a nested git repository sits anywhere inside it. The walk raises on seeing a
     protected name and never scans it, so it cannot enter the state it protects. Symlinks are named, not followed, and a
@@ -1340,9 +1352,12 @@ def reap_protected_scan(path: str, allow_git: bool = False, markers: bool = Fals
         try:
             reap_refuse_git_layout(rel, names)
         except ReapRefused as refusal:
-            if git_dirs is None or not str(refusal).startswith("unproved-git-dir:"):
+            if not str(refusal).startswith("unproved-git-dir:"):
                 raise
-            git_dirs.append(rel or ".")
+            if not reap_git_scoped(rel, git_scope):
+                if git_dirs is None:
+                    raise
+                git_dirs.append(rel or ".")
     def visit(rel, name, info, level, device):
         if reap_protected(name) and not scratch:
             if expiring_evidence:
@@ -1367,11 +1382,13 @@ def reap_protected_scan(path: str, allow_git: bool = False, markers: bool = Fals
             if secrets is not None:
                 secrets.append(rel)
         if reap_is_git(name):
-            if not allow_git:
+            if not allow_git and not reap_git_scoped(rel, git_scope):
                 raise ReapRefused(f"nested-git:{rel}")
             if repos is not None:
                 parent = rel.rpartition("/")[0]
                 repos.append(os.path.join(path, parent) if parent else path)
+            if not allow_git:
+                return False  # a proven scoped Git store is named, never entered or stat'ed: it goes with its scoped folder
         if info is not None and getattr(info, "st_flags", 0) & protected_flags:
             raise ReapRefused("filesystem-protected-flags:" + rel)
         if markers and level > 0 and reap_fold(name).startswith(REAP_MARKER_PREFIX) \
@@ -5688,7 +5705,7 @@ def reap_empty_directory(fd: int, dev: int, depth: int, rel: str, tally: dict, a
                     tally["removed"] += 1
                     continue
             raise ReapRefused(f"protected-leaf-appeared:{sub}")
-        if reap_is_git(name) and not allow_git:
+        if reap_is_git(name) and not allow_git and not reap_git_scoped(sub):
             raise ReapRefused(f"nested-git-appeared:{sub}")
         entry = os.stat(name, dir_fd=fd, follow_symlinks=False)
         if stat.S_ISDIR(entry.st_mode):
