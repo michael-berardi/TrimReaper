@@ -17,7 +17,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from . import __version__, clean, core, host
+from . import __version__, clean, core, host, offload
 
 BEGIN, END = "# >>> trimreaper core >>>\n", "# <<< trimreaper core <<<\n"
 CLEAN_BEGIN, CLEAN_END = "# >>> trimreaper clean >>>\n", "# <<< trimreaper clean <<<\n"
@@ -149,6 +149,13 @@ def cmd_tick(args) -> dict:
         core.reap_tick(conn, policy, [], actions, errors)
         core.evidence_expiry_tick(conn, policy, [], actions, errors)
         clean.clean_auto(conn, policy, actions, errors, event=host.clean_release_event_token(conn))
+    try:
+        moved = offload.offload_pass()
+        if moved.get("moved") or moved.get("errors"):
+            actions.append({"kind": "offload", "movedBytes": moved.get("movedBytes"), "count": len(moved["moved"])})
+        errors.extend(moved.get("errors", []))
+    except (host.HostError, core.ReapRefused, OSError) as error:
+        errors.append(f"offload: {error}")
     out = {"at": host.iso(), "actions": actions, "errors": errors}
     if args.record:
         write_private(host.state_dir() / "last-tick.json", json.dumps(out, indent=2, sort_keys=True, default=str) + "\n")
@@ -164,6 +171,17 @@ def cmd_clean(args) -> dict:
         policy["cleanToPercent"] = args.clean_to_percent
     return clean.clean_pass(args.dry_run, args.deep, only, report=not args.no_report, policy=policy,
                             escalate=False if getattr(args, "no_escalate", False) else None, steady=bool(getattr(args, "steady", False)))
+
+
+def cmd_offload(args) -> dict:
+    if args.action == "status":
+        return offload.status()
+    if args.action == "restore":
+        if not args.path:
+            raise host.HostError("restore needs the original path")
+        return offload.restore(args.path)
+    limit = None if args.limit_gb is None else int(args.limit_gb * 1024 ** 3)
+    return offload.offload_pass(args.dry_run, limit, args.path)
 
 
 def write_private(path: Path, text: str, mode: int = 0o600) -> None:
@@ -356,6 +374,13 @@ def parser() -> argparse.ArgumentParser:
     tidy.add_argument("--no-escalate", action="store_true", help="routine rules only: do not climb the ladder when the goal is unmet")
     tidy.add_argument("--steady", action="store_true", help="the quiet pass: only long-idle repository output and old finished-job artifacts, whatever the disk level")
     tidy.set_defaults(func=cmd_clean)
+
+    move = sub.add_parser("offload", help="move cold folders to the external overflow volume (config key `offload`), leaving symlinks")
+    move.add_argument("action", choices=("run", "status", "restore"))
+    move.add_argument("path", nargs="?", help="restore: the original path; run: only this source folder")
+    move.add_argument("--dry-run", action="store_true", help="plan and size; copy and remove nothing")
+    move.add_argument("--limit-gb", type=float, help="stop after about this many GB")
+    move.set_defaults(func=cmd_offload)
 
     schedule = sub.add_parser("schedule", help="run `tick` on a schedule with launchd (macOS)")
     schedule.add_argument("action", choices=("install", "remove", "status"))

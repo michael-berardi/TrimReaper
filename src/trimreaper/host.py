@@ -121,6 +121,7 @@ DEFAULT_CONFIG = {
     "buildQueueStateDir": None,       # a build queue's lock folder; default: <stateDir>/build-queue
     "diskVolume": None,               # volume measured for disk pressure; default: /System/Volumes/Data, else /
     "worktreeHomes": None,            # where agent tools keep worktrees; default: the known homes (docs/CONFIGURATION.md)
+    "offload": None,                  # overflow to an external volume: {"root", "minFreeGB", "sources"} (off until set)
     "policy": {},
 }
 
@@ -187,6 +188,9 @@ def check_config(merged: dict, path: Path) -> None:
     if not isinstance(release, dict) or set(release) - {"installedApp", "rollbackApp"} \
             or any(v is not None and not isinstance(v, str) for v in release.values()):
         bad("release", '{"installedApp": path or null, "rollbackApp": path or null}')
+    if merged["offload"] is not None:
+        from . import offload
+        offload.check(merged["offload"], path)
     if not isinstance(merged["policy"], dict):
         bad("policy", "an object")
     check_policy(merged["policy"])

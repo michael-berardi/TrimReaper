@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.16.0 (2026-11-07)
+
+- New `offload` config key and `trimreaper offload run|status|restore`: cold folders move to an external overflow volume and a
+  symlink stays behind, so tools keep working. Guarded by idle time, open-file checks, a verified copy, a free-space floor on the
+  volume and a durable receipt. `tick` runs it after the routine passes and skips it, with a named cause, when the drive is absent.
+
 ## 0.15.1 (2026-11-06)
 
 Fixture removal may clear a nested Git store inside a proven scoped folder, when a host scope is set by the caller: a Git store
