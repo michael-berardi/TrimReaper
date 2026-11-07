@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.17.0 (2026-11-07)
+
+- `offload` has no fixed age. A finished job's folder moves as soon as nothing has it open; a live job's folder never moves and a
+  moved one returns when its job is live again; other folders move after `quietMinutes` without a change. Largest first, stopping
+  at `cleanToPercent` (`--all` moves everything that qualifies). Job state comes from the configurable `jobStatusCommand`; if it
+  fails, nothing moves. `idleDays` is gone.
+
 ## 0.16.0 (2026-11-07)
 
 - New `offload` config key and `trimreaper offload run|status|restore`: cold folders move to an external overflow volume and a

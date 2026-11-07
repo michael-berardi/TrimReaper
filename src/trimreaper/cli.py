@@ -181,7 +181,7 @@ def cmd_offload(args) -> dict:
             raise host.HostError("restore needs the original path")
         return offload.restore(args.path)
     limit = None if args.limit_gb is None else int(args.limit_gb * 1024 ** 3)
-    return offload.offload_pass(args.dry_run, limit, args.path)
+    return offload.offload_pass(args.dry_run, limit, args.path, args.all)
 
 
 def write_private(path: Path, text: str, mode: int = 0o600) -> None:
@@ -379,6 +379,7 @@ def parser() -> argparse.ArgumentParser:
     move.add_argument("action", choices=("run", "status", "restore"))
     move.add_argument("path", nargs="?", help="restore: the original path; run: only this source folder")
     move.add_argument("--dry-run", action="store_true", help="plan and size; copy and remove nothing")
+    move.add_argument("--all", action="store_true", help="move everything that qualifies, not only until the disk reaches cleanToPercent")
     move.add_argument("--limit-gb", type=float, help="stop after about this many GB")
     move.set_defaults(func=cmd_offload)
 

@@ -1,18 +1,29 @@
 """Overflow to an external volume: move cold folders there, leave a symlink behind.
 
 Nothing is deleted before the copy is proved. A folder moves only when it is idle (nothing changed inside for
-`idleDays`), no process has it open, and the volume is mounted with room to spare. The original path becomes a symlink
+`quietMinutes` or its job finished), no process has it open, and the volume is mounted with room to spare. The original path becomes a symlink
 into the overflow root, so every tool keeps working; `restore` brings a folder back. Every step writes a receipt first.
 
+There is no fixed age. A folder is judged by whether anything is using it:
+  - a folder of a finished job (done, failed, cancelled) moves as soon as no process has it open;
+  - a folder of a job that is still live never moves, and a moved one is copied back once its job is live again;
+  - any other folder moves when no process has it open and nothing in it changed for `quietMinutes`.
+The biggest qualifying folders go first, and the pass stops once the disk is back under `cleanToPercent`
+(`--all` ignores that goal and moves everything that qualifies).
+
 Configuration (config.json, key `offload`):
-    {"root": "/Volumes/Disk/Overflow", "minFreeGB": 20,
-     "sources": [{"path": "~/.cache/jobs", "idleDays": 3, "children": true}]}
-`children: true` moves each direct child separately; otherwise the source folder itself moves.
+    {"root": "/Volumes/Disk/Overflow", "minFreeGB": 20, "quietMinutes": 60,
+     "jobStatusCommand": ["/path/to/tool", "list-jobs"],
+     "sources": [{"path": "~/.cache/jobs", "children": true, "jobs": true}]}
+`children: true` moves each direct child separately; otherwise the source folder itself moves. `jobs: true` reads a job
+number (J-0042) from each child's name and asks `jobStatusCommand`, which prints JSON: {"J-0042": "done"} or
+{"jobs": [{"id": "J-0042", "status": "done"}]}.
 """
 from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -24,6 +35,10 @@ from . import core, host
 DAY = 86400
 WALK_ENTRIES = 400_000
 WALK_SECONDS = 20
+JOB_NAME = re.compile(r"[Jj]-?(\d{4,5})")
+FINISHED = {"done", "failed", "cancelled"}
+LIVE = {"queued", "approved", "running", "blocked"}  # parked and interrupted jobs are idle: the quiet rule decides
+SETTLE_SECONDS = 300  # a finished job's folder must still have been quiet this long (late writes, a closing process)
 README = ("This folder is TrimReaper's overflow: cold folders moved off the Mac's internal disk.\n"
           "Each folder keeps its home-relative path below here, and the original location is a symlink to it.\n"
           "Bring one back with `trimreaper offload restore <original path>`.\n")
@@ -33,13 +48,49 @@ def settings() -> dict | None:
     cfg = host.config().get("offload")
     if not cfg:
         return None
-    return {"root": host.expand(cfg["root"]), "minFreeGB": cfg.get("minFreeGB", 20), "sources": cfg.get("sources", [])}
+    return {"root": host.expand(cfg["root"]), "minFreeGB": cfg.get("minFreeGB", 20), "quietMinutes": cfg.get("quietMinutes", 60),
+            "jobStatusCommand": cfg.get("jobStatusCommand"), "sources": cfg.get("sources", [])}
+
+
+def job_statuses(cfg: dict) -> dict:
+    """{"J-0042": "done"} from the configured command; raises HostError naming the cause when it fails."""
+    command = cfg.get("jobStatusCommand")
+    if not command:
+        return {}
+    argv = [str(host.expand(part)) if part.startswith("~/") else part for part in command]
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise host.HostError(f"jobStatusCommand failed to run: {error}")
+    if result.returncode:
+        raise host.HostError(f"jobStatusCommand exited {result.returncode}: {result.stderr.strip()[:200]}")
+    try:
+        data = json.loads(result.stdout)
+    except ValueError as error:
+        raise host.HostError(f"jobStatusCommand did not print JSON: {error}")
+    rows = data.get("jobs") if isinstance(data, dict) and isinstance(data.get("jobs"), list) else None
+    if rows is not None:
+        data = {row["id"]: row["status"] for row in rows if isinstance(row, dict) and "id" in row and "status" in row}
+    if not isinstance(data, dict) or not data:
+        raise host.HostError("jobStatusCommand printed no jobs; refusing to guess which are finished")
+    return {str(k).upper(): str(v) for k, v in data.items()}
+
+
+def job_of(name: str) -> str | None:
+    match = JOB_NAME.search(name)
+    return f"J-{match.group(1)}" if match else None
 
 
 def check(cfg: dict, path: Path) -> None:
     """Config shape, named failures."""
-    if not isinstance(cfg, dict) or set(cfg) - {"root", "minFreeGB", "sources"}:
-        raise host.HostError(f"{path}: offload takes root, minFreeGB and sources only")
+    if not isinstance(cfg, dict) or set(cfg) - {"root", "minFreeGB", "quietMinutes", "jobStatusCommand", "sources"}:
+        raise host.HostError(f"{path}: offload takes root, minFreeGB, quietMinutes, jobStatusCommand and sources only")
+    command = cfg.get("jobStatusCommand")
+    if command is not None and (not isinstance(command, list) or not command or not all(isinstance(c, str) for c in command)):
+        raise host.HostError(f"{path}: offload.jobStatusCommand must be a command as a list of strings")
+    minutes = cfg.get("quietMinutes", 60)
+    if isinstance(minutes, bool) or not isinstance(minutes, (int, float)) or minutes < 0:
+        raise host.HostError(f"{path}: offload.quietMinutes must be a number of minutes, not {json.dumps(minutes)}")
     if not isinstance(cfg.get("root"), str):
         raise host.HostError(f"{path}: offload.root must be a path")
     host.path_form(cfg["root"])
@@ -50,12 +101,14 @@ def check(cfg: dict, path: Path) -> None:
     if not isinstance(sources, list):
         raise host.HostError(f"{path}: offload.sources must be a list")
     for source in sources:
-        if not isinstance(source, dict) or set(source) - {"path", "idleDays", "children", "minMB"} or not isinstance(source.get("path"), str):
-            raise host.HostError(f"{path}: offload source {json.dumps(source)} needs a path and may have idleDays, children, minMB")
+        if not isinstance(source, dict) or set(source) - {"path", "quietMinutes", "children", "minMB", "jobs"} or not isinstance(source.get("path"), str):
+            raise host.HostError(f"{path}: offload source {json.dumps(source)} needs a path and may have quietMinutes, children, minMB, jobs")
         host.path_form(source["path"])
-        days = source.get("idleDays", 3)
-        if isinstance(days, bool) or not isinstance(days, (int, float)) or days < 0:
-            raise host.HostError(f"{path}: offload source idleDays must be a number of days, not {json.dumps(days)}")
+        if source.get("jobs") and not command:
+            raise host.HostError(f"{path}: a source with jobs needs offload.jobStatusCommand")
+        minutes = source.get("quietMinutes", 0)
+        if isinstance(minutes, bool) or not isinstance(minutes, (int, float)) or minutes < 0:
+            raise host.HostError(f"{path}: offload source quietMinutes must be a number of minutes, not {json.dumps(minutes)}")
 
 
 def mount_of(path: Path) -> Path:
@@ -112,7 +165,8 @@ def candidates(cfg: dict) -> list[dict]:
             continue
         targets = [p for p in sorted(base.iterdir())] if source.get("children") else [base]
         for target in targets:
-            items.append({"path": target, "idleDays": source.get("idleDays", 3), "minBytes": int(source.get("minMB", 0)) * 1024 * 1024})
+            items.append({"path": target, "quiet": max(source.get("quietMinutes", 0), cfg["quietMinutes"]) * 60,
+                          "jobs": bool(source.get("jobs")), "minBytes": int(source.get("minMB", 0)) * 1024 * 1024})
     out = []
     for item in items:
         try:
@@ -123,7 +177,7 @@ def candidates(cfg: dict) -> list[dict]:
     return out
 
 
-def refusal(item: dict, stats: dict, table: dict, now: float) -> str | None:
+def refusal(item: dict, stats: dict, table: dict, now: float, statuses: dict) -> str | None:
     path = item["path"]
     if path.is_symlink():
         return "already-offloaded" if os.path.realpath(path).startswith(str(item["dest"].parent.parent)) else "symlink"
@@ -133,8 +187,15 @@ def refusal(item: dict, stats: dict, table: dict, now: float) -> str | None:
         return "protected"
     if not stats["complete"]:
         return "walk-incomplete"
-    if now - stats["newest"] < item["idleDays"] * DAY:
-        return f"changed-within-{item['idleDays']}d"
+    job = job_of(item["path"].name) if item["jobs"] else None
+    state = statuses.get(job) if job else None
+    if job and state is None:
+        return f"job-unknown:{job}"
+    if state in LIVE:
+        return f"job-live:{job}:{state}"
+    quiet = SETTLE_SECONDS if state in FINISHED else item["quiet"]
+    if now - stats["newest"] < quiet:
+        return f"changed-within-{int(quiet // 60)}min"
     if stats["bytes"] < item["minBytes"]:
         return "below-minimum-size"
     try:
@@ -189,7 +250,7 @@ def move_one(item: dict, dry_run: bool) -> dict:
     return {"path": str(path), "to": str(dest), "bytes": item["bytes"], "moved": True}
 
 
-def offload_pass(dry_run: bool = False, limit_bytes: int | None = None, only: str | None = None) -> dict:
+def offload_pass(dry_run: bool = False, limit_bytes: int | None = None, only: str | None = None, everything: bool = False) -> dict:
     cfg = settings()
     if not cfg:
         return {"skipped": "offload is not configured (config key `offload`)", "moved": [], "kept": [], "errors": []}
@@ -197,6 +258,8 @@ def offload_pass(dry_run: bool = False, limit_bytes: int | None = None, only: st
     cause = volume_ready(root)
     if cause:
         return {"skipped": cause, "moved": [], "kept": [], "errors": []}
+    statuses = job_statuses(cfg)
+    returned = bring_back_live(cfg, statuses, dry_run)
     free = shutil.disk_usage(mount_of(root)).free
     floor = int(cfg["minFreeGB"] * 1024 ** 3)
     table = core.reap_process_table()
@@ -218,13 +281,16 @@ def offload_pass(dry_run: bool = False, limit_bytes: int | None = None, only: st
         item["bytes"] = item["stats"]["bytes"]
         sized.append(item)
     for item in sorted(sized, key=lambda i: -i["bytes"]):
-        why = refusal(item, item["stats"], table, now)
+        why = refusal(item, item["stats"], table, now, statuses)
         if why:
             if why != "already-offloaded":
                 kept.append({"path": str(item["path"]), "why": why, "bytes": item["bytes"]})
             continue
         if free - planned_bytes - item["bytes"] < floor:
             kept.append({"path": str(item["path"]), "why": "overflow-volume-would-drop-below-minFreeGB", "bytes": item["bytes"]})
+            continue
+        if not everything and goal_met(planned_bytes):
+            kept.append({"path": str(item["path"]), "why": "disk-goal-met", "bytes": item["bytes"]})
             continue
         if limit_bytes is not None and planned_bytes >= limit_bytes:
             kept.append({"path": str(item["path"]), "why": "pass-limit-reached", "bytes": item["bytes"]})
@@ -234,8 +300,42 @@ def offload_pass(dry_run: bool = False, limit_bytes: int | None = None, only: st
             planned_bytes += item["bytes"]
         except (host.HostError, core.ReapRefused, OSError) as error:
             errors.append(f"{item['path']}: {error}")
-    return {"root": str(root), "dryRun": dry_run, "movedBytes": planned_bytes, "moved": moved, "kept": kept[:60],
+    return {"root": str(root), "dryRun": dry_run, "movedBytes": planned_bytes, "moved": moved, "returned": returned, "kept": kept[:60],
             "keptCount": len(kept), "errors": errors, "disk": host.disk_state()}
+
+
+def goal_met(planned_bytes: int) -> bool:
+    """True once the home disk is at or under cleanToPercent, counting what this pass already planned to move."""
+    disk = host.disk_state()
+    if not disk or not disk.get("usedBytes") or disk.get("freeBytes") is None:
+        return False
+    goal = host.load_policy()["cleanToPercent"]
+    return (disk["usedBytes"] - planned_bytes) / (disk["usedBytes"] + disk["freeBytes"]) * 100 <= goal
+
+
+def bring_back_live(cfg: dict, statuses: dict, dry_run: bool) -> list:
+    """A moved folder whose job is live again returns to the internal disk before its work needs the speed."""
+    back = []
+    for source in cfg["sources"]:
+        if not source.get("jobs"):
+            continue
+        base = host.expand(source["path"])
+        if not base.is_dir():
+            continue
+        for path in sorted(base.iterdir()):
+            job = job_of(path.name)
+            if not path.is_symlink() or not job or statuses.get(job) not in LIVE:
+                continue
+            if not os.readlink(path).startswith(str(cfg["root"])):
+                continue
+            if not dry_run:
+                try:
+                    restore(str(path))
+                except (host.HostError, core.ReapRefused, OSError) as error:
+                    back.append({"path": str(path), "error": str(error)})
+                    continue
+            back.append({"path": str(path), "job": job, "status": statuses[job]})
+    return back
 
 
 def status() -> dict:
