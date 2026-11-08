@@ -1,7 +1,7 @@
 """TrimReaper ships no built-in model, provider, fallback or personal-name choice.
 
 Those choices belong in the operator's own configuration. This test keeps the shipped
-source, documentation and README free of them. Exceptions are limited to provider
+source, tests, documentation and README free of them. Exceptions are limited to provider
 adapter modules that name a provider's own catalog and to legal attribution files.
 """
 
@@ -28,8 +28,8 @@ PERSONAL = re.compile(
     re.IGNORECASE,
 )
 
-# Documented exceptions: legal attribution and package metadata are not shipped behaviour.
-EXCLUDED_NAMES = {"LICENSE", "pyproject.toml", "test_neutrality.py"}
+# The neutrality test contains the denylist itself.
+NEUTRALITY_TEST = os.path.join(ROOT, "tests", "test_neutrality.py")
 # Provider-adapter modules may name their own provider's catalog but may not set defaults.
 ADAPTER_DIRS = {os.path.join("src", "trimreaper", "adapters")}
 
@@ -48,6 +48,9 @@ def _shipped_files():
     src = os.path.join(ROOT, "src")
     if os.path.isdir(src):
         paths.extend(_files(src))
+    tests = os.path.join(ROOT, "tests")
+    if os.path.isdir(tests):
+        paths.extend(_files(tests))
     docs = os.path.join(ROOT, "docs")
     if os.path.isdir(docs):
         paths.extend(_files(docs))
@@ -57,7 +60,7 @@ def _shipped_files():
     return [
         path
         for path in paths
-        if os.path.basename(path) not in EXCLUDED_NAMES
+        if path != NEUTRALITY_TEST
         and not any(part in ADAPTER_DIRS for part in os.path.relpath(path, ROOT).split(os.sep))
     ]
 

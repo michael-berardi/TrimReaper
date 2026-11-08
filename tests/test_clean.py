@@ -313,7 +313,7 @@ class Debris(Home):
         for command in ("123 docker build .", "123 docker buildx build .", "123 /bin/docker-buildx build ."):
             with mock.patch.object(clean, "clean_docker_up", return_value=None), mock.patch.object(clean, "clean_run", return_value=(0, command)):
                 self.assertEqual(clean.clean_docker_ready(), "in-use:docker-build")
-        with mock.patch.dict(os.environ, {"DOCKER_HOST": "unix:///Users/test/.colima/default/docker.sock"}), \
+        with mock.patch.dict(os.environ, {"DOCKER_HOST": "unix:///home/test/.colima/default/docker.sock"}), \
                 mock.patch.object(clean, "clean_run", return_value=(0, "")) as run:
             clean.clean_colima_trim()
             self.assertEqual(run.call_args.args[0], ["colima", "ssh", "--", "sudo", "fstrim", "-av"])
