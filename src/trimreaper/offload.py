@@ -15,7 +15,10 @@ Configuration (config.json, key `offload`):
     {"root": "/Volumes/Disk/Overflow", "minFreeGB": 20, "quietMinutes": 60,
      "jobStatusCommand": ["/path/to/tool", "list-jobs"],
      "sources": [{"path": "~/.cache/jobs", "children": true, "jobs": true}]}
-`children: true` moves each direct child separately; otherwise the source folder itself moves. `jobs: true` reads a job
+`children: true` moves each direct child separately; otherwise the source folder itself moves. `keepFolder: true` (with
+`children`) keeps every child a real directory holding real files and moves only that child's subfolders, so a tool that
+refuses symlinks (a job store reading `J-0042/coordination.jsonl`) still works; links made by an earlier version are split
+or copied back the same way. `jobs: true` reads a job
 number (J-0042) from each child's name and asks `jobStatusCommand`, which prints JSON: {"J-0042": "done"} or
 {"jobs": [{"id": "J-0042", "status": "done"}]}.
 """
@@ -101,9 +104,11 @@ def check(cfg: dict, path: Path) -> None:
     if not isinstance(sources, list):
         raise host.HostError(f"{path}: offload.sources must be a list")
     for source in sources:
-        if not isinstance(source, dict) or set(source) - {"path", "quietMinutes", "children", "minMB", "jobs"} or not isinstance(source.get("path"), str):
-            raise host.HostError(f"{path}: offload source {json.dumps(source)} needs a path and may have quietMinutes, children, minMB, jobs")
+        if not isinstance(source, dict) or set(source) - {"path", "quietMinutes", "children", "minMB", "jobs", "keepFolder"} or not isinstance(source.get("path"), str):
+            raise host.HostError(f"{path}: offload source {json.dumps(source)} needs a path and may have quietMinutes, children, minMB, jobs, keepFolder")
         host.path_form(source["path"])
+        if source.get("keepFolder") and not source.get("children"):
+            raise host.HostError(f"{path}: offload source keepFolder needs children")
         if source.get("jobs") and not command:
             raise host.HostError(f"{path}: a source with jobs needs offload.jobStatusCommand")
         minutes = source.get("quietMinutes", 0)
@@ -157,16 +162,26 @@ def tree_stats(path: Path) -> dict:
 
 
 def candidates(cfg: dict) -> list[dict]:
-    items = []
     home = host.reap_home()
+    items = []
     for source in cfg["sources"]:
         base = host.expand(source["path"])
         if base.is_symlink() or not base.is_dir():
             continue
-        targets = [p for p in sorted(base.iterdir())] if source.get("children") else [base]
-        for target in targets:
-            items.append({"path": target, "quiet": max(source.get("quietMinutes", 0), cfg["quietMinutes"]) * 60,
-                          "jobs": bool(source.get("jobs")), "minBytes": int(source.get("minMB", 0)) * 1024 * 1024})
+        quiet = max(source.get("quietMinutes", 0), cfg["quietMinutes"]) * 60
+        common = {"quiet": quiet, "jobs": bool(source.get("jobs")), "minBytes": int(source.get("minMB", 0)) * 1024 * 1024}
+        if not source.get("children"):
+            items.append({"path": base, "owner": base.name, **common})
+        elif not source.get("keepFolder"):
+            items += [{"path": p, "owner": p.name, **common} for p in sorted(base.iterdir())]
+        else:
+            for folder in sorted(base.iterdir()):
+                if folder.is_symlink():
+                    split_link(folder, cfg)
+                if folder.is_symlink() or not folder.is_dir():
+                    continue
+                heal_file_links(folder, cfg)
+                items += [{"path": p, "owner": folder.name, **common} for p in sorted(folder.iterdir()) if p.is_dir() and not p.is_symlink()]
     out = []
     for item in items:
         try:
@@ -175,6 +190,44 @@ def candidates(cfg: dict) -> list[dict]:
             continue
         out.append(item)
     return out
+
+
+def heal_file_links(folder: Path, cfg: dict) -> None:
+    """A link to a single file inside a kept folder (made by an earlier version) is replaced by the file itself."""
+    root = str(cfg["root"])
+    for entry in sorted(folder.iterdir()):
+        if entry.is_symlink() and os.readlink(entry).startswith(root) and os.path.isfile(entry):
+            target = Path(os.readlink(entry))
+            partial = folder / f".offload-{entry.name}.restoring"
+            shutil.copy2(target, partial)
+            if partial.stat().st_size != target.stat().st_size:
+                partial.unlink()
+                raise host.HostError(f"copy of {target} does not match; the link was left in place")
+            entry.unlink()
+            os.rename(partial, entry)
+            target.unlink()
+            core.reap_receipt({"kind": "offload-file-restored", "path": str(entry), "from": str(target)})
+
+
+def split_link(folder: Path, cfg: dict) -> None:
+    """A whole-folder link from an earlier version becomes a real folder holding one link per entry; nothing is copied."""
+    dest = Path(os.readlink(folder))
+    if not str(dest).startswith(str(cfg["root"])) or not dest.is_dir():
+        return
+    holding = folder.parent / f".offload-{folder.name}.splitting"
+    holding.mkdir()
+    try:
+        for entry in sorted(dest.iterdir()):
+            if entry.is_dir() and not entry.is_symlink():
+                os.symlink(entry, holding / entry.name)
+            else:
+                shutil.copy2(entry, holding / entry.name)
+        folder.unlink()
+        os.rename(holding, folder)
+    except OSError:
+        shutil.rmtree(holding, ignore_errors=True)
+        raise
+    core.reap_receipt({"kind": "offload-split", "path": str(folder), "from": str(dest)})
 
 
 def refusal(item: dict, stats: dict, table: dict, now: float, statuses: dict) -> str | None:
@@ -187,7 +240,7 @@ def refusal(item: dict, stats: dict, table: dict, now: float, statuses: dict) ->
         return "protected"
     if not stats["complete"]:
         return "walk-incomplete"
-    job = job_of(item["path"].name) if item["jobs"] else None
+    job = job_of(item["owner"]) if item["jobs"] else None
     state = statuses.get(job) if job else None
     if job and state is None:
         return f"job-unknown:{job}"
@@ -313,28 +366,41 @@ def goal_met(planned_bytes: int) -> bool:
     return (disk["usedBytes"] - planned_bytes) / (disk["usedBytes"] + disk["freeBytes"]) * 100 <= goal
 
 
-def bring_back_live(cfg: dict, statuses: dict, dry_run: bool) -> list:
-    """A moved folder whose job is live again returns to the internal disk before its work needs the speed."""
-    back = []
+def links_of(cfg: dict):
+    """(owner name, link path) for every offloaded link under the sources, whole-folder or per-entry."""
+    root = str(cfg["root"])
     for source in cfg["sources"]:
-        if not source.get("jobs"):
-            continue
         base = host.expand(source["path"])
+        if base.is_symlink():
+            if os.readlink(base).startswith(root):
+                yield base.name, base, source
+            continue
         if not base.is_dir():
             continue
         for path in sorted(base.iterdir()):
-            job = job_of(path.name)
-            if not path.is_symlink() or not job or statuses.get(job) not in LIVE:
+            if path.is_symlink():
+                if os.readlink(path).startswith(root):
+                    yield path.name, path, source
+            elif source.get("children") and source.get("keepFolder") and path.is_dir():
+                for inner in sorted(path.iterdir()):
+                    if inner.is_symlink() and os.readlink(inner).startswith(root):
+                        yield path.name, inner, source
+
+
+def bring_back_live(cfg: dict, statuses: dict, dry_run: bool) -> list:
+    """A moved folder whose job is live again returns to the internal disk before its work needs the speed."""
+    back = []
+    for owner, path, source in links_of(cfg):
+        job = job_of(owner) if source.get("jobs") else None
+        if not job or statuses.get(job) not in LIVE:
+            continue
+        if not dry_run:
+            try:
+                restore(str(path))
+            except (host.HostError, core.ReapRefused, OSError) as error:
+                back.append({"path": str(path), "error": str(error)})
                 continue
-            if not os.readlink(path).startswith(str(cfg["root"])):
-                continue
-            if not dry_run:
-                try:
-                    restore(str(path))
-                except (host.HostError, core.ReapRefused, OSError) as error:
-                    back.append({"path": str(path), "error": str(error)})
-                    continue
-            back.append({"path": str(path), "job": job, "status": statuses[job]})
+        back.append({"path": str(path), "job": job, "status": statuses[job]})
     return back
 
 
@@ -344,14 +410,7 @@ def status() -> dict:
         return {"configured": False}
     root = cfg["root"]
     cause = volume_ready(root)
-    links = []
-    for source in cfg["sources"]:
-        base = host.expand(source["path"])
-        if not base.is_dir() and not base.is_symlink():
-            continue
-        for path in ([base] if base.is_symlink() else sorted(base.iterdir())):
-            if path.is_symlink() and str(os.readlink(path)).startswith(str(root)):
-                links.append({"path": str(path), "to": os.readlink(path), "present": os.path.exists(path)})
+    links = [{"path": str(path), "to": os.readlink(path), "present": os.path.exists(path)} for _, path, _ in links_of(cfg)]
     out = {"configured": True, "root": str(root), "ready": cause is None, "cause": cause, "offloaded": len(links),
            "dangling": [l["path"] for l in links if not l["present"]]}
     if cause is None:

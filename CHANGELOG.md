@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.17.1 (2026-11-07)
+
+- `offload` source option `keepFolder`: with `children`, each child stays a real folder holding real files and only its
+  subfolders move. A job store that refuses symlinks (`J-0042/coordination.jsonl`) kept failing when a whole job folder became
+  a link. Links made by 0.16/0.17.0 are split, or copied back for single files, on the next pass.
+- `offload status` and the return-when-live step now follow per-entry links.
+
 ## 0.17.0 (2026-11-07)
 
 - `offload` has no fixed age. A finished job's folder moves as soon as nothing has it open; a live job's folder never moves and a

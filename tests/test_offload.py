@@ -125,3 +125,63 @@ class OffloadJobs(Base):
         with self.assertRaisesRegex(host.HostError, "exited 3"):
             offload.offload_pass(everything=True)
         self.assertFalse((self.base / "app-j0001").is_symlink())
+
+
+class KeepFolder(Base):
+    def setUp(self):
+        super().setUp()
+        self.quiet_since = time.time() - 600
+        self.script = self.tmp / "jobs.py"
+        self.statuses = {"J-0001": "done", "J-0002": "running"}
+        self.script.write_text("import json;print(json.dumps(%r))" % self.statuses)
+        self.base = self.home / "jobs"
+        for name in ("J-0001", "J-0002"):
+            for inner in ("wt", "notes"):
+                (self.base / name / inner).mkdir(parents=True)
+                (self.base / name / inner / "f").write_bytes(b"z" * 4096)
+            (self.base / name / "coordination.jsonl").write_text("log")
+        self.write_config({"offload": {"root": str(self.root), "minFreeGB": 0, "quietMinutes": 10 ** 6,
+                                       "jobStatusCommand": ["python3", str(self.script)],
+                                       "sources": [{"path": "~/jobs", "children": True, "jobs": True, "keepFolder": True}]}})
+
+    def fake_stats(self, path):
+        return {"entries": 2, "bytes": 8192, "newest": self.quiet_since, "complete": True}
+
+    def test_job_folder_stays_a_real_directory(self):
+        out = offload.offload_pass(everything=True)
+        self.assertEqual(out["errors"], [])
+        self.assertFalse((self.base / "J-0001").is_symlink())
+        self.assertTrue((self.base / "J-0001" / "wt").is_symlink())
+        self.assertEqual((self.base / "J-0001" / "wt" / "f").read_bytes(), b"z" * 4096)
+        self.assertFalse((self.base / "J-0002" / "wt").is_symlink())
+        self.assertFalse((self.base / "J-0001" / "coordination.jsonl").is_symlink())
+
+    def test_file_links_from_an_earlier_version_become_files_again(self):
+        offload.offload_pass(everything=True)
+        dest = self.root / "home" / "jobs" / "J-0001" / "coordination.jsonl"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        (self.base / "J-0001" / "coordination.jsonl").rename(dest)
+        os.symlink(dest, self.base / "J-0001" / "coordination.jsonl")
+        offload.offload_pass(everything=True)
+        self.assertFalse((self.base / "J-0001" / "coordination.jsonl").is_symlink())
+        self.assertEqual((self.base / "J-0001" / "coordination.jsonl").read_text(), "log")
+        self.assertFalse(dest.exists())
+
+    def test_earlier_whole_folder_link_is_split_without_copying(self):
+        dest = self.root / "home" / "jobs" / "J-0001"
+        dest.parent.mkdir(parents=True)
+        os.rename(self.base / "J-0001", dest)
+        os.symlink(dest, self.base / "J-0001")
+        offload.offload_pass(everything=True)
+        self.assertFalse((self.base / "J-0001").is_symlink())
+        self.assertTrue((self.base / "J-0001" / "notes").is_symlink())
+        self.assertEqual((self.base / "J-0001" / "notes" / "f").read_bytes(), b"z" * 4096)
+
+    def test_entries_return_when_job_runs_again(self):
+        offload.offload_pass(everything=True)
+        self.statuses["J-0001"] = "running"
+        self.script.write_text("import json;print(json.dumps(%r))" % self.statuses)
+        out = offload.offload_pass(everything=True)
+        self.assertEqual(len(out["returned"]), 2)
+        self.assertFalse((self.base / "J-0001" / "wt").is_symlink())
+        self.assertEqual(offload.status()["offloaded"], 0)
