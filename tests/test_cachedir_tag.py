@@ -590,13 +590,14 @@ class Tagged(Home):
         elsewhere = self.cache(self.jobs / "J-0042" / "dist" / "cache")
         self.assertEqual([p for p, _ in clean.clean_tagged_find([])], [str(elsewhere)])
 
-    def test_each_root_has_its_own_share_of_the_discovery_budget(self):
+    def test_each_root_has_the_whole_discovery_budget(self):
+        """0.17.2: the budget was divided by the number of roots (every linked worktree is one), starving ~/dev at 47k of 3M entries."""
         for n in range(300):
             self.put(self.dev / "huge", f"d{n}/f")
         mine = self.cache(self.usertmp / "my-build")
         errors = []
         share = 40
-        with mock.patch.object(clean, "CLEAN_RUST_SCAN_ENTRIES", share * len(clean.clean_tagged_roots([]))):
+        with mock.patch.object(clean, "CLEAN_RUST_SCAN_ENTRIES", share):
             found = clean.clean_tagged_find(errors)
         self.assertEqual([p for p, _ in found], [str(mine)], found)
         incomplete = [e for e in errors if "discovery-incomplete" in e["error"]]

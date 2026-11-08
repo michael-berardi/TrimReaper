@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.17.2 (2026-11-07)
+
+- `tagged-caches` discovery gave every root an equal slice of the entry budget, and every linked worktree is a root, so a code
+  home such as `~/dev` got about 47,000 of 3,000,000 entries and reported `discovery-incomplete` on every pass. Each root now has
+  the whole budget, and one pass stops at 12,000,000 entries in total, still naming the cause.
+
 ## 0.17.1 (2026-11-07)
 
 - `offload` source option `keepFolder`: with `children`, each child stays a real folder holding real files and only its

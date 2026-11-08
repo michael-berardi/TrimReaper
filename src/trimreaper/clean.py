@@ -1156,6 +1156,7 @@ def clean_job_outputs(errors: list, outputs: dict) -> list[tuple[str, str]]:
 # A folder holding a valid CACHEDIR.TAG (the Cache Directory Tagging standard) says it is a cache: Cargo writes one into every target
 # folder, and other tools do too, whatever the folder is called and wherever it sits. It goes when nothing has touched it for
 # taggedCacheIdleHours, no process has it open or runs a Rust producer, nothing in it is protected or a release, and no live job owns it.
+CLEAN_TAGGED_TOTAL_ENTRIES = 12_000_000          # entries listed across all roots in one pass
 CLEAN_TAGGED_DEPTH = 10                          # levels below a scan root searched for a tag
 CLEAN_TAGGED_SKIP = frozenset({".git", "node_modules", ".Trash", ".venv", "venv", "__pycache__", "site-packages", ".pnpm-store"})
 CLEAN_TAGGED_RELEASE_LEVELS = 8
@@ -1204,8 +1205,14 @@ def clean_tagged_find(errors: list, steady: bool = False) -> list[tuple[str, str
     homes = {clean_home(name) for name in CLEAN_CODE_HOMES}
     temps = clean_tagged_temp_roots()
     roots = clean_tagged_roots(errors, steady)
-    share = max(1, CLEAN_RUST_SCAN_ENTRIES // max(1, len(roots)))
+    # Every linked worktree is a root, so dividing the budget by the root count starved the big roots (a code home got 47k entries
+    # of 3M): each root gets the whole budget, and the pass as a whole stops at CLEAN_TAGGED_TOTAL_ENTRIES.
+    share, scanned = CLEAN_RUST_SCAN_ENTRIES, 0
     for root in roots:
+        if scanned > CLEAN_TAGGED_TOTAL_ENTRIES:
+            errors.append({"clean": "tagged-caches", "path": clean_tilde(root),
+                           "error": f"discovery-incomplete: more than {CLEAN_TAGGED_TOTAL_ENTRIES} entries in all roots"})
+            break
         count, stack = 0, [(root, 0)]
         in_home = root in homes
         while stack:
@@ -1222,6 +1229,7 @@ def clean_tagged_find(errors: list, steady: bool = False) -> list[tuple[str, str
                 errors.append({"clean": "tagged-caches", "path": clean_tilde(folder), "error": clean_os_refusal(error)})
                 continue
             count += len(entries)
+            scanned += len(entries)
             if count > share:
                 errors.append({"clean": "tagged-caches", "path": clean_tilde(root),
                                "error": f"discovery-incomplete: more than {share} entries in {clean_tilde(root)}"})
