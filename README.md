@@ -311,3 +311,7 @@ in this package or vendored byte for byte into another program that supplies its
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+---
+
+Part of [Pareto Cybernetics](https://paretocybernetics.com/projects/trimreaper/): free, private, open-source tools for working with AI agents.
