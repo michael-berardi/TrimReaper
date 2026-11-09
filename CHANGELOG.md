@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.18.1 (2026-11-09)
+
+- A merged scratch worktree is now removed under the same discipline as a whole clone. The protected-name scan runs before any
+  `git status --ignored=matching`, so git never lists ignored or untracked paths in a tree that may hold a protected leaf. The
+  worktree's own build-queue lock and every Cargo lock in its `target` directories are held from the plan receipt through
+  `git worktree remove` (a busy lock keeps the worktree, `producer-locks` is recorded).
+- `reap_pid_start` reads elapsed time (`ps -o etime=`) instead of `lstart`, which `ps` prints in the system zone while the
+  caller's `TZ` could differ: with `TZ=UTC` in a UTC+ zone a live cleanup owner read as a reused pid and its note was acknowledged
+  automatically.
+
 ## 0.18.0 (2026-11-09)
 
 - A cleanup run left `interrupted` by a dead process no longer blocks every later clean until a person acknowledges it. When the

@@ -257,6 +257,40 @@ class MergedWorktrees(ScratchBase):
         self.assertEqual((fresh / ".env.local").read_bytes(), b"SECRET=1\n")
         self.assertTrue(fresh.exists())
 
+    def test_the_protected_scan_runs_before_git_ever_lists_ignored_or_status(self):
+        main, wt = self.worktree("a/order")
+        (wt / ".env.local").write_bytes(b"SECRET=1\n")
+        self.quiet()
+        seen = []
+        real = core.reap_git_clean_closed
+        with mock.patch.object(core, "reap_git_clean_closed", side_effect=lambda *a, **k: (seen.append(a), real(*a, **k))[1]), \
+                mock.patch.object(core, "reap_scratch_regen_items", return_value=([], [])):  # only the worktree item is under test
+            out = self.regen()
+        self.assertEqual(seen, [], "git status ran on a worktree that holds a protected leaf")
+        self.assertTrue(wt.exists())
+        self.assertEqual((wt / ".env.local").read_bytes(), b"SECRET=1\n")
+        self.assertTrue(self.mine(out)[0]["reason"], out)
+
+    def test_a_busy_queue_or_cargo_lock_keeps_the_worktree(self):
+        import fcntl, os
+        main, wt = self.worktree("a/locked-queue")
+        self.quiet()
+        for lock in (core.reap_queue_lock(str(wt)), wt / "target" / "debug" / ".cargo-lock"):
+            lock.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o666)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                out = self.regen()
+                self.assertTrue(wt.exists(), lock)
+                self.assertIn("lock-busy", self.mine(out)[0]["reason"], out)
+            finally:
+                os.close(fd)
+            if lock.name == ".cargo-lock":
+                break
+        out = self.regen()
+        self.assertEqual([i["outcome"] for i in self.mine(out)], ["deleted"], out)
+        self.assertIn("producer-locks", [c for r in self.receipts() if r.get("phase") == "result" for c in r["checks"]])
+
     def test_below_pressure_a_merged_worktree_stays(self):
         main, wt = self.worktree()
         self.quiet()

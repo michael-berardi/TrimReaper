@@ -100,6 +100,22 @@ class DeadOwnerAcknowledge(unittest.TestCase):
                 self.fail("entered while the recorded owner is alive")
         self.assertFalse([n for n in self.journal() if n.get("auto")])
 
+    def test_the_start_time_does_not_depend_on_the_callers_time_zone(self):
+        import time
+        before = time.time()
+        child = self.sleeper()
+        time.sleep(1.2)
+        for zone in ("UTC", "Etc/GMT-14", "Etc/GMT+12"):
+            with mock.patch.dict(os.environ, {"TZ": zone}):
+                time.tzset()
+                try:
+                    start = core.reap_pid_start(child.pid)
+                finally:
+                    pass
+            self.assertIsNotNone(start)
+            self.assertLess(abs(start - before), 5, f"TZ={zone}: a live pid would read as reused")
+        time.tzset()
+
     def test_a_pid_reused_by_a_process_with_another_start_time_counts_as_dead(self):
         child = self.sleeper()
         start = core.reap_pid_start(child.pid)

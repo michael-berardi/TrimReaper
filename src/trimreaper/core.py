@@ -5844,14 +5844,22 @@ def reap_run_has_receipts(run: str) -> bool:
 
 
 def reap_pid_start(pid: int) -> float | None:
-    """The start time (epoch seconds, 1 s resolution) of a live process, else None. Metadata only: `ps -o lstart=`."""
+    """The start time (epoch seconds, 1 s resolution) of a live process, else None. Metadata only: `ps -o etime=` (elapsed time), so the
+    answer does not depend on the time zone `ps` prints in (/etc/localtime) versus the caller's TZ."""
     try:
-        done = subprocess.run(["/bin/ps", "-o", "lstart=", "-p", str(int(pid))], capture_output=True, text=True, timeout=5,
+        done = subprocess.run(["/bin/ps", "-o", "etime=", "-p", str(int(pid))], capture_output=True, text=True, timeout=5,
                               env={"LC_ALL": "C", "PATH": "/bin:/usr/bin"})
         text = done.stdout.strip()
         if done.returncode != 0 or not text:
             return None
-        return time.mktime(time.strptime(re.sub(r"\s+", " ", text), "%a %b %d %H:%M:%S %Y"))
+        days, _, clock = text.rpartition("-")
+        parts = [int(part) for part in clock.split(":")]
+        if not 2 <= len(parts) <= 3 or min(parts) < 0:
+            return None
+        seconds = 0
+        for part in parts:
+            seconds = seconds * 60 + part
+        return float(int(time.time()) - seconds - (int(days) * 86400 if days else 0))
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
 
@@ -7940,6 +7948,18 @@ def reap_scratch_worktree(root: str, mode: str = "delete", ctx: dict | None = No
                 raise ReapRefused("not-a-linked-worktree")
             checks.append("canonical-boundary")
             window = hours * 3600
+            # the producers' locks, held through `git worktree remove` as for a whole clone: this worktree's own build-queue lock and every Cargo lock in it
+            stack.enter_context(reap_locks([reap_queue_lock(root)], create=apply))
+            for target in ("target", "src-tauri/target"):
+                if os.path.isdir(os.path.join(root, target)) and not os.path.islink(os.path.join(root, target)):
+                    stack.enter_context(reap_locks(reap_cargo_locks(os.path.join(root, target)), create=False))
+            checks.append("producer-locks")
+            # protected names first: git must not list ignored or untracked paths in a tree that may hold one
+            repos = []
+            reap_protected_scan(root, allow_git=True, markers=True, repos=repos, nested_disposable=True, templates=reap_tracked_templates(root))
+            if set(repos) != {root}:
+                raise ReapRefused("nested-git-in-worktree")
+            checks.append("no-protected-leaf")
             with reap_git_session(root):
                 checks.extend(reap_git_repo_checks(root, ("clean", "pushed", "clone-root")))
                 code, upstream = reap_git(root, "rev-parse", "--symbolic-full-name", "@{upstream}")
@@ -7966,11 +7986,6 @@ def reap_scratch_worktree(root: str, mode: str = "delete", ctx: dict | None = No
                 if busy:
                     raise ReapRefused(f"worktree-main-busy:{busy}")
                 checks.append("main-repository-idle")
-                repos = []
-                reap_protected_scan(root, allow_git=True, markers=True, repos=repos, nested_disposable=True, templates=reap_tracked_templates(root))
-                if set(repos) != {root}:
-                    raise ReapRefused("nested-git-in-worktree")
-                checks.append("no-protected-leaf")
                 proof = reap_scratch_idle_proof(root, policy, seconds=ctx.get("sizeBudget", 120), window=window)
                 if not proof["idle"]:
                     raise ReapRefused("retention-preserved:worktree-not-quiet:" + str(proof.get("reason")))
