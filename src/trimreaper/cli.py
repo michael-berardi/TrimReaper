@@ -134,7 +134,7 @@ def cmd_reap(args) -> dict:
     params = {"dryRun": args.dry_run, "actor": host.actor_of({})}
     if args.job:
         params["job"] = args.job
-    for flag, key in (("releases", "releases"), ("scratch", "agentScratch"), ("release_evidence", "releaseEvidence"), ("archives", "archives")):
+    for flag, key in (("releases", "releases"), ("scratch", "agentScratch"), ("scratch_regen", "scratchRegen"), ("release_evidence", "releaseEvidence"), ("archives", "archives")):
         if getattr(args, flag):
             params[key] = True
     if args.expire_evidence:
@@ -149,6 +149,15 @@ def cmd_tick(args) -> dict:
         core.reap_tick(conn, policy, [], actions, errors)
         core.evidence_expiry_tick(conn, policy, [], actions, errors)
         clean.clean_auto(conn, policy, actions, errors, event=host.clean_release_event_token(conn))
+    try:
+        regen = core.reap_scratch_regen(False)  # only at cleanAtPercent: merged scratch worktrees, then regenerable folders of clean pushed checkouts
+        if regen["pressure"] or regen["items"]:
+            actions.append({"kind": "scratch-regenerable", "deleted": regen["deleted"], "reclaimedBytes": regen["reclaimedBytes"]})
+        if regen.get("stopped"):
+            errors.append("scratch-regen: sweep stopped: " + str(regen["stopped"]))
+        errors.extend("scratch-regen: " + str(n) for n in regen.get("notes", [])[:5])
+    except (host.HostError, core.ReapRefused, OSError) as error:
+        errors.append(f"scratch-regen: {error}")
     try:
         moved = offload.offload_pass()
         if moved.get("moved") or moved.get("errors"):
@@ -353,6 +362,8 @@ def parser() -> argparse.ArgumentParser:
     target = reap.add_mutually_exclusive_group(required=True)
     target.add_argument("--job", type=job_id, help="one finished job's clones and cache folders")
     target.add_argument("--scratch", "--agentScratch", action="store_true", help="idle agent scratch folders")
+    target.add_argument("--scratch-regen", "--scratchRegen", action="store_true",
+                        help="at cleanAtPercent: regenerable folders of clean pushed scratch checkouts and merged scratch worktrees")
     target.add_argument("--archives", action="store_true", help="archives past archiveExpiryDays")
     target.add_argument("--release-evidence", "--releaseEvidence", action="store_true", help="superseded release evidence")
     target.add_argument("--releases", action="store_true", help="build targets of superseded release candidates")

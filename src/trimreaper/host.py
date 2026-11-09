@@ -84,6 +84,10 @@ DEFAULT_POLICY = {
     # tagged-caches: a folder holding a valid CACHEDIR.TAG (build caches such as Rust targets) goes once nothing in it changed
     # for this many hours and nothing holds it; ladder rungs use at most 2. 0 = off.
     "taggedCacheIdleHours": 6,
+    # At cleanAtPercent, regenerable folders (node_modules, .next, target ...) of a clean, fully pushed checkout under agent scratch
+    # go after this many quiet hours, and a linked worktree merged into its upstream goes after scratchWorktreeIdleHours. 0 = off.
+    "scratchRegenIdleHours": 2,
+    "scratchWorktreeIdleHours": 6,
     # Below cleanAtPercent a quiet pass still runs every cleanSteadyHours (0 = off): regenerable output of repositories idle for
     # cleanSteadyRepoDays, and the artifacts of jobs finished cleanSteadyJobHours ago.
     "cleanSteadyHours": 6,
@@ -260,6 +264,10 @@ def check_policy(policy: dict) -> None:
         value = merged[key]
         if not isinstance(value, int) or isinstance(value, bool) or not (0 if key == "cleanSteadyHours" else 1) <= value <= high:
             raise HostError(f"policy {key} must be a whole number from {0 if key == 'cleanSteadyHours' else 1} to {high}, not {json.dumps(value)}")
+    for key in ("scratchRegenIdleHours", "scratchWorktreeIdleHours"):
+        value = merged[key]
+        if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 24 * 365:
+            raise HostError(f"policy {key} must be a whole number of hours from 0 (off) to 8760, not {json.dumps(value)}")
     value = merged["taggedCacheIdleHours"]
     if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 24 * 365:
         raise HostError(f"policy taggedCacheIdleHours must be a whole number from 0 (off) to 8760, not {json.dumps(value)}")

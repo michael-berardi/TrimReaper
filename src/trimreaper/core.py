@@ -255,6 +255,9 @@ REAP_CLASSES = {
     "job-clone-regenerable": {"git": ("ignored", "clean", "pushed", "untracked"), "derivedGit": ("ignored", "untracked"),
                               "lock": True, "retention": "marker"},
     "job-cache-subdir": {"git": (), "lock": False, "retention": "marker"},
+    # Regenerable dirs of a git checkout under agent scratch (the derived rule of 2026-11-09): disposable only at disk pressure, once the
+    # checkout is clean with every commit pushed and no stash, and nothing in it changed or opened for scratchRegenIdleHours.
+    "scratch-regenerable": {"git": ("clean", "pushed", "ignored", "untracked"), "lock": True, "retention": "marker"},
     "release-target": {"git": ("ignored", "untracked"), "lock": True, "retention": "marker"},
     # <scratch root>/<task>: the one home for agent scratch outside a job (delegation staging, ad-hoc audits).
     # Each folder goes once nothing in it changed for evidenceExpiryDays; nested repos are proved like job cache folders.
@@ -2065,7 +2068,7 @@ def reap_item_retention(item: dict, prove: bool = True) -> str:
     if found != "unmarked":
         return found
     cls = item.get("class")
-    if os.path.basename(item["path"]) == "target" and cls in ("job-derived-output", "job-clone-regenerable", "job-cache-subdir"):
+    if os.path.basename(item["path"]) == "target" and cls in ("job-derived-output", "job-clone-regenerable", "job-cache-subdir", "scratch-regenerable"):
         # Cargo's release profile can contain either rebuildable binaries or retained signed releases.
         # Neither the target name, cache tag nor a parent disposable marker resolves that ambiguity.
         if reap_target_release_bearing(item["path"]) and not reap_target_release_superseded(item["path"]):
@@ -2089,6 +2092,20 @@ def reap_item_retention(item: dict, prove: bool = True) -> str:
         if reap_job_unsaved_window(item["owner"]) and reap_no_retained_names(item["path"]):
             item["unsavedWindow"] = True  # reap_item_strict keeps the folder unless unsaved git work is what is left (archived first)
             return REAP_DISPOSABLE
+    if cls == "scratch-regenerable":
+        item.pop("quietReason", None)
+        if found != "unmarked" or item.get("kind") not in REAP_DERIVED_KINDS or os.path.basename(item["path"]) != item.get("kind"):
+            return found
+        if not reap_scratch_pressure_on():
+            item["quietReason"] = "below-pressure-threshold"
+            return found
+        if not prove:
+            return REAP_DISPOSABLE  # a listing only claims it; the deleting pass re-derives with the quiet proof
+        quiet = reap_scratch_regen_quiet(item)
+        if quiet is None:
+            return REAP_DISPOSABLE
+        item["quietReason"] = quiet
+        return found
     if cls == "agent-scratch":
         # A marker decides; only an unmarked folder is judged by its own idle proof, and the proof (its reason, its counts
         # and the budget it spent) rides on the item, so the receipt says why the folder stayed instead of naming an
@@ -3975,7 +3992,7 @@ def reap_scratch_proof_seconds(item: dict) -> float | None:
     return seconds
 
 
-def reap_scratch_idle_proof(path: str, policy: dict | None = None, seconds: float | None = None) -> dict:
+def reap_scratch_idle_proof(path: str, policy: dict | None = None, seconds: float | None = None, window: float | None = None) -> dict:
     """Whether nothing in the folder changed within evidenceExpiryDays, and what the walk that says so spent.
 
     The proof covers the whole tree: the walk is descriptor-relative (a symlink is never followed, a directory swapped
@@ -3992,7 +4009,7 @@ def reap_scratch_idle_proof(path: str, policy: dict | None = None, seconds: floa
         budget = {**budget, "seconds": min(budget["seconds"], max(0.0, float(seconds)))}
     proof = {"idle": False, "reason": "", "detail": "", "entries": 0, "bytes": 0, "newest": None, "budget": budget, "elapsed": 0.0}
     days = evidence_expiry_days(policy)
-    if not days:
+    if not days and window is None:
         proof["reason"] = "expiry-off"
         return proof
     # With unsavedArchiveDays shorter than the idle window, the walk takes the shorter cutoff: a folder quiet for that long is
@@ -4000,7 +4017,9 @@ def reap_scratch_idle_proof(path: str, policy: dict | None = None, seconds: floa
     # and keeps the folder otherwise). Quiet for the longer window too, it is idle exactly as before.
     unsaved = reap_unsaved_days(policy)
     unsaved = unsaved if 0 < unsaved < days else 0
-    cutoff = now() - (unsaved or days) * 86400
+    if window is not None:
+        unsaved = 0  # a caller's own window (seconds) is the only cutoff: no unsaved-archive shortcut
+    cutoff = now() - (window if window is not None else (unsaved or days) * 86400)
     started = time.monotonic()
     deadline = started + budget["seconds"]
     newest, seen, completed = [0.0], set(), [False]
@@ -4063,7 +4082,7 @@ def reap_scratch_idle_proof(path: str, policy: dict | None = None, seconds: floa
     proof["newest"] = newest[0] or None
     if not proof["reason"] and not completed[0]:
         proof["reason"] = "unreadable"  # a walk that did not finish never proves anything
-    if not proof["reason"] and unsaved and newest[0] > now() - days * 86400:
+    if not proof["reason"] and unsaved and window is None and newest[0] > now() - days * 86400:
         proof["reason"], proof["unsavedIdle"] = "recent-change", True  # quiet for unsavedArchiveDays only: not idle for removal
     if not proof["reason"]:
         proof["idle"], proof["reason"] = True, "idle"
@@ -5405,6 +5424,12 @@ def reap_boundary(item: dict) -> str:
         else:
             raise ReapRefused("unknown-ownership")
         kind = reap_kind(rel)
+    elif cls == "scratch-regenerable":
+        scratch_root = reap_canon(reap_agent_scratch_root())
+        if owner != AGENT_SCRATCH_OWNER or root == scratch_root or not reap_inside(root, scratch_root) or not os.path.lexists(os.path.join(root, ".git")):
+            raise ReapRefused("outside-allowed-roots")
+        reap_vet_root(scratch_root)
+        kind = reap_kind(rel)
     elif cls == "job-cache-subdir":
         if parent != reap_canon(reap_cache_root()) or os.path.basename(root) != owner or len(rel) != 1 or reap_protected(rel[0]):
             raise ReapRefused("outside-allowed-roots")
@@ -5503,11 +5528,11 @@ def reap_authority(item: dict) -> dict:
         ids = []  # an archive of a folder no job owned (an idle worktree, a scratch task): its expiry window is the only claim on it
     # Scratch tasks and release versions are independent siblings, not claims on their collection root.
     # Repository output still uses its source root so a source consumer preserves its build output.
-    independent = item["class"] in ("agent-scratch", "release-evidence", "job-cache-subdir")
-    scope = item["path"] if independent or item["class"] == "job-clone-root" else item["root"]
+    independent = item["class"] in ("agent-scratch", "release-evidence", "job-cache-subdir", "scratch-regenerable")
+    scope = item["root"] if item["class"] == "scratch-regenerable" else (item["path"] if independent or item["class"] == "job-clone-root" else item["root"])
     clean_archive = item["class"] == "job-archive" and item["owner"] == REAP_ARCHIVE_CLEAN_OWNER
     clean_archive = clean_archive or (item["class"] == "job-archive" and item["owner"] == REAP_ARCHIVE_UNSAVED_OWNER)
-    if item["class"] not in ("release-target", "agent-scratch", "release-evidence") and not clean_archive and item["owner"] not in ids:
+    if item["class"] not in ("release-target", "agent-scratch", "release-evidence", "scratch-regenerable") and not clean_archive and item["owner"] not in ids:
         raise ReapRefused("owner-not-recorded")
     for job_id in ids:
         job = jobs.get(job_id)
@@ -5818,29 +5843,180 @@ def reap_run_has_receipts(run: str) -> bool:
     return False
 
 
+def reap_pid_start(pid: int) -> float | None:
+    """The start time (epoch seconds, 1 s resolution) of a live process, else None. Metadata only: `ps -o lstart=`."""
+    try:
+        done = subprocess.run(["/bin/ps", "-o", "lstart=", "-p", str(int(pid))], capture_output=True, text=True, timeout=5,
+                              env={"LC_ALL": "C", "PATH": "/bin:/usr/bin"})
+        text = done.stdout.strip()
+        if done.returncode != 0 or not text:
+            return None
+        return time.mktime(time.strptime(re.sub(r"\s+", " ", text), "%a %b %d %H:%M:%S %Y"))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def reap_note_epoch(value) -> float | None:
+    """Epoch seconds of an owner note's `YYYY-MM-DDTHH:MM:SS+ZZZZ` time (the engine's iso()); None when it does not parse."""
+    text = str(value)
+    if len(text) != 24 or text[19] not in "+-" or not text[20:].isdigit():
+        return None
+    try:
+        parsed = time.strptime(text[:19], "%Y-%m-%dT%H:%M:%S")
+    except (ValueError, OverflowError):
+        return None
+    year, month = parsed.tm_year, parsed.tm_mon
+    year -= month <= 2  # days from civil (proleptic Gregorian), so no module beyond `time` is needed
+    era, yoe = divmod(year, 400)
+    doy = (153 * (month + (-3 if month > 2 else 9)) + 2) // 5 + parsed.tm_mday - 1
+    days = era * 146097 + yoe * 365 + yoe // 4 - yoe // 100 + doy - 719468
+    offset = (int(text[20:22]) * 3600 + int(text[22:24]) * 60) * (1 if text[19] == "+" else -1)
+    return float(days * 86400 + parsed.tm_hour * 3600 + parsed.tm_min * 60 + parsed.tm_sec - offset)
+
+
+def reap_owner_pid_state(previous: dict) -> str:
+    """'gone' (no such process), 'reused' (the pid now belongs to a process that started after the recorded owner ran), 'alive',
+    or 'unknown' (cannot tell). Only 'gone' and 'reused' prove the recorded owner is dead; everything else keeps the block."""
+    pid = previous.get("pid")
+    if type(pid) is not int or pid <= 1 or pid == os.getpid():
+        return "alive"
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return "gone"
+    except PermissionError:
+        pass  # exists, owned by someone else: compare start times below
+    except OSError:
+        return "unknown"
+    started = reap_pid_start(pid)
+    if started is None:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return "gone"  # exited between the two looks
+        except OSError:
+            pass
+        return "unknown"
+    recorded = previous.get("pidStart")
+    if isinstance(recorded, (int, float)) and not isinstance(recorded, bool):
+        return "reused" if abs(started - recorded) > 2 else "alive"
+    # An older journal line has no recorded start: a process that began after the line was written cannot have written it.
+    wrote = reap_note_epoch(previous.get("at"))
+    if wrote is not None and started > wrote + 2:
+        return "reused"
+    return "alive"
+
+
 def reap_dead_owner_note(previous: dict | None, phase: str) -> str | None:
     """Why an unfinished cleanup handoff may be recorded as reviewed without a person, else None: the note is a well-formed
     'started' record (the sweep was killed: timeout, crash, reboot) whose owner process no longer exists. An error
     ('interrupted'), a deliberate stop ('stopped'), a fragment, an invalid journal or a live or unknown owner still needs
-    the explicit acknowledgment."""
+    the explicit acknowledgment (an interrupted note is reviewed by reap_dead_owner_report instead)."""
     if phase != "started" or not isinstance(previous, dict):
-        return None  # "interrupted" means the sweep raised an error: that is a defect to look at, not a kill
-    pid = previous.get("pid")
-    if type(pid) is not int or pid <= 1 or pid == os.getpid():
         return None
-    try:
-        os.kill(pid, 0)
-        return None  # alive: it may still be sweeping
-    except ProcessLookupError:
-        pass
-    except OSError:
-        return None  # cannot tell: keep the human acknowledgment
+    state = reap_owner_pid_state(previous)
+    if state not in ("gone", "reused"):
+        return None
+    pid = previous.get("pid")
     # A failed final note leaves 'started' behind even when the sweep already removed work. Any receipt the dead run wrote
     # (plan, archive, result) proves it may have touched paths, so only a person may review that run. Unreadable receipts fail closed.
     if reap_run_has_receipts(previous.get("run")):
         return None
-    return (f"auto-acknowledged: owner pid {pid} of run {previous.get('run')} ({previous.get('scope')}) exited without a final note; "
+    return (f"auto-acknowledged: owner pid {pid} ({'reused by another process' if state == 'reused' else 'gone'}) of run {previous.get('run')} ({previous.get('scope')}) exited without a final note; "
             "every planned path passed its gates before its plan receipt and the next sweep re-runs every fresh gate")
+
+
+REAP_ACK_REPORT_LIMIT = 200
+
+
+def reap_run_receipt_records(run: str) -> list | None:
+    """Every receipt record that names this cleanup run, or None when the receipts cannot be read (fail closed)."""
+    found, needle = [], str(run).encode()
+    try:
+        directory = reap_receipt_dir()
+        if not directory.is_dir():
+            return []
+        with os.scandir(directory) as entries:
+            for entry in sorted(entries, key=lambda e: e.name):
+                if not (entry.name.startswith("receipts-") and entry.name.endswith(".jsonl")):
+                    continue
+                with open(entry.path, "rb") as handle:
+                    for line in handle:
+                        if needle not in line:
+                            continue
+                        try:
+                            record = json.loads(line)
+                        except ValueError:
+                            continue
+                        if isinstance(record, dict) and record.get("cleanupOwnerRun") == run:
+                            found.append({**record, "_file": entry.name})
+    except OSError:
+        return None
+    return found
+
+
+def reap_ack_report_problem(token: str, data: bytes) -> str | None:
+    """The handoff checklist an acknowledgment report must satisfy (shared by the manual reap-acknowledge and the generated one)."""
+    try:
+        text = data.decode("utf-8")
+    except UnicodeError:
+        return "not utf-8"
+    required = (f"Cleanup owner run: {token}", "Receipts reviewed: yes", "Unresolved paths preserved: yes",
+                "Deleted paths:", "Retained paths:", "Receipt references:", "Active consumers:", "Next safe step:")
+    lines = text.splitlines()
+    if b"\0" in data or any(line not in lines for line in required[:3]) \
+            or any(not any(entry.startswith(line) and entry[len(line):].strip() for entry in lines) for line in required[3:]):
+        return "incomplete"
+    return None
+
+
+def reap_dead_owner_report(previous: dict | None, phase: str, state: str | None = None) -> tuple[str, dict] | None:
+    """An interrupted cleanup run whose owner process is provably gone (no such process, or the pid now belongs to a process that started
+    later) gets a generated acknowledgment report built from the run's own receipts, with the same checklist fields the manual
+    reap-acknowledge requires. Returns (report text, summary) or None (alive/unknown owner, unreadable receipts: a person decides).
+    The report lists what the receipts prove; paths the run never reached have no receipt and are re-gated by the next sweep."""
+    if phase != "interrupted" or not isinstance(previous, dict):
+        return None
+    state = state or reap_owner_pid_state(previous)
+    if state not in ("gone", "reused"):
+        return None
+    run = str(previous.get("run"))
+    records = reap_run_receipt_records(run)
+    if records is None:
+        return None
+    last: dict[str, dict] = {}
+    planned: dict[str, dict] = {}
+    for record in records:
+        path = str(record.get("path"))
+        if record.get("phase") == "plan":
+            planned.setdefault(path, record)
+        elif record.get("phase") == "result":
+            last[path] = record
+    deleted = sorted(p for p, r in last.items() if r.get("outcome") == "deleted" or r.get("removed"))
+    retained = sorted(p for p in last if p not in deleted)
+    unresolved = sorted(p for p in planned if p not in last)
+    files = sorted({r["_file"] for r in records})
+
+    def listing(paths):
+        shown = [f"  - {p}" for p in paths[:REAP_ACK_REPORT_LIMIT]]
+        if len(paths) > REAP_ACK_REPORT_LIMIT:
+            shown.append(f"  - ... {len(paths) - REAP_ACK_REPORT_LIMIT} more in the receipt files")
+        return shown
+    why = "reused by a different process" if state == "reused" else "no longer exists"
+    text = "\n".join([
+        "Generated automatically: the recorded cleanup owner is provably dead, so this handoff was reviewed by the host, not a person.",
+        f"Cleanup owner run: {run}",
+        "Receipts reviewed: yes",
+        "Unresolved paths preserved: yes",
+        f"Deleted paths: {len(deleted)} per the run's result receipts" + ("" if deleted else " (none)"), *listing(deleted),
+        f"Retained paths: {len(retained)} refused or kept per the run's result receipts" + ("" if retained else " (none)"), *listing(retained),
+        f"Unresolved paths: {len(unresolved)} planned without a result receipt; preserved, never deleted from this report" + ("" if unresolved else " (none)"), *listing(unresolved),
+        f"Receipt references: {', '.join(files) or 'none written'} in {reap_receipt_dir()} (records naming cleanupOwnerRun {run}); {len(records)} records",
+        f"Active consumers: none; owner pid {previous.get('pid')} {why} (scope {previous.get('scope')}, last note {previous.get('at')})",
+        "Next safe step: the next sweep re-runs every normal gate (owner, retention, git proof, locks, open handles, protected leaves) on every path, including those this run never reached",
+        ""])
+    return text, {"deleted": len(deleted), "retained": len(retained), "unresolved": len(unresolved), "receiptFiles": files,
+                  "receiptRecords": len(records), "ownerState": state}
 
 
 @contextmanager
@@ -5938,20 +6114,45 @@ def reap_cleanup_owner(scope: str, acknowledge: dict | None = None, inspect: boo
                     raise ReapRefused("cleanup-acknowledge-stale:read-current-owner-status")
             elif phase not in ("none", "finished", "acknowledged"):
                 dead = reap_dead_owner_note(previous, phase)
-                if not dead:
+                generated = None if dead else reap_dead_owner_report(previous, phase)
+                if not dead and not generated:
                     raise ReapRefused("cleanup-handoff-incomplete:previous-worker; read reap-owner-status and acknowledge reviewed notes and receipts")
                 # A killed sweep (a timeout, a crash, a reboot) left no final note. Its owner is gone, and every path it planned
                 # passed every gate before its plan receipt; the next sweep re-runs all fresh gates on whatever is left. Record
                 # that review in the journal instead of blocking all cleanup until a person signs off (2026-10-29: one killed
                 # run stopped every reap, the tick's included, and the disk kept filling).
-                auto = (json.dumps({"run": token, "pid": previous.get("pid"), "scope": previous.get("scope"), "phase": "acknowledged",
-                                    "outcome": dead, "auto": True, "at": iso()}, sort_keys=True) + "\n").encode()
+                # An interrupted run whose owner is provably gone (2026-11-08: pid 8903 died at 17:25 and 78 cleans were refused for
+                # nine hours) is reviewed the same way, with a generated private report carrying the manual checklist.
+                ack = {"run": token, "pid": previous.get("pid"), "scope": previous.get("scope"), "phase": "acknowledged", "auto": True, "at": iso()}
+                if dead:
+                    ack["outcome"] = dead
+                else:
+                    text, summary = generated
+                    data = text.encode()
+                    if len(data) > 65536 or reap_ack_report_problem(token, data):
+                        raise ReapRefused("cleanup-handoff-incomplete:generated-report-invalid")
+                    name = f"auto-ack-{token}-{int(time.time())}.md"
+                    try:
+                        report_fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dfd)
+                        try:
+                            if os.write(report_fd, data) != len(data):
+                                raise ReapRefused("cleanup-handoff-unavailable:short-write")
+                            reap_durable(report_fd)
+                        finally:
+                            os.close(report_fd)
+                    except OSError as error:
+                        raise ReapRefused("cleanup-handoff-unavailable:" + reap_named(error)) from error
+                    ack.update(outcome=f"auto-acknowledged interrupted run: owner pid {previous.get('pid')} is {summary['ownerState']}; generated report reviewed receipts "
+                                       f"({summary['deleted']} deleted, {summary['retained']} retained, {summary['unresolved']} unresolved preserved); "
+                                       "every path is re-gated by the next sweep",
+                               evidence=str(Path(root, *REAP_OWNER_DIRS, name)), evidenceSha256=hashlib.sha256(data).hexdigest(), report=summary)
+                auto = (json.dumps(ack, sort_keys=True) + "\n").encode()
                 if tail and not tail.endswith(b"\n"):
                     auto = b"\n" + auto
                 if os.write(fd, auto) != len(auto):
                     raise ReapRefused("cleanup-handoff-unavailable:short-write")
                 reap_durable(fd)
-            owner = {"pid": os.getpid(), "root": str(root), "run": uuid.uuid4().hex[:12], "scope": scope,
+            owner = {"pid": os.getpid(), "pidStart": reap_pid_start(os.getpid()), "root": str(root), "run": uuid.uuid4().hex[:12], "scope": scope,
                      "receipts": str(reap_receipt_dir()), "previousRun": token if tail or history else None}
             if acknowledge:
                 owner.update(evidence=acknowledge["evidence"], evidenceSha256=acknowledge["evidenceSha256"],
@@ -6183,6 +6384,8 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
                     raise ReapRefused("retention-changed")
                 raise ReapRefused(reap_item_idle_reason(item))
             if declared != REAP_DISPOSABLE:
+                if item.get("class") == "scratch-regenerable" and declared == "unmarked" and item.get("quietReason"):
+                    raise ReapRefused("retention-preserved:" + str(item["quietReason"])[:60])
                 raise ReapRefused(f"retention-preserved:{declared[:40]}")
             checks.append("retention-owner-class")
             info = os.lstat(item["path"])
@@ -6220,6 +6423,8 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
             if retention != REAP_DISPOSABLE:
                 if item.get("class") == "agent-scratch" and retention == "unmarked":
                     raise ReapRefused(reap_item_idle_reason(item))
+                if item.get("class") == "scratch-regenerable" and retention == "unmarked" and item.get("quietReason"):
+                    raise ReapRefused("retention-preserved:" + str(item["quietReason"])[:60])
                 raise ReapRefused(f"retention-preserved:{retention}")
             checks.append("retention-disposable")
             expiring_evidence = reap_marked_evidence_item(item)
@@ -7542,6 +7747,331 @@ def reap_release_items(candidate: dict) -> list[dict]:
     return items
 
 
+# ---- agent scratch: regenerable dirs and merged worktrees at disk pressure ------------------------------------
+# On 2026-11-08 the disk reached 97% with 122 GB under the agent scratch folder: finished, clean, fully pushed checkouts (node_modules, .astro,
+# built output) inside folders that were still active, so rule 4 (a folder untouched for evidenceExpiryDays) never reached them. Two
+# derived rules, both only at the disk-pressure threshold (cleanAtPercent), both through the single deletion path and its receipts:
+#   1. regenerable dirs (REAP_DERIVED_KINDS: never dist, never a protected leaf) of a checkout that is clean, has no unpushed commit and no
+#      stash, and had no write and no open handle for scratchRegenIdleHours (2): class scratch-regenerable, removed by reap_item_strict.
+#   2. a linked worktree fully merged into its upstream and idle scratchWorktreeIdleHours (6): `git worktree remove`, never --force.
+REAP_SCRATCH_CHECKOUT_DEPTH = 8
+REAP_SCRATCH_CHECKOUT_ENTRIES = 300000
+REAP_SCRATCH_CHECKOUT_SECONDS = 30
+
+
+def reap_scratch_pressure_on(policy: dict | None = None) -> bool:
+    """The disk is at or above cleanAtPercent. Unknown (no reading, automatic cleaning off) is not pressure."""
+    policy = policy if policy is not None else reap_policy()
+    high = policy.get("cleanAtPercent")
+    if type(high) is not int or high <= 0:
+        return False
+    try:
+        disk = disk_state()
+    except (OSError, HostError):
+        return False
+    percent = disk.get("usedPercent") if isinstance(disk, dict) else None
+    return isinstance(percent, (int, float)) and not isinstance(percent, bool) and percent >= high
+
+
+def reap_scratch_hours(policy: dict, key: str, default: int) -> int:
+    hours = policy.get(key, default)
+    return hours if type(hours) is int and hours > 0 else 0
+
+
+def reap_scratch_git_quiet(repo: str, window: float) -> str | None:
+    """None when the checkout's own state was quiet for `window` seconds: the folder, its git entry, HEAD, the index and the HEAD reflog (a
+    linked worktree's live in its git dir). A reason otherwise; missing or unreadable state is a reason too."""
+    cutoff = now() - window
+    stamps = [repo]
+    code, out = reap_git(repo, "rev-parse", "--path-format=absolute", "--git-dir")
+    gitdir = out.strip()
+    if code != 0 or not gitdir or not os.path.isdir(gitdir):
+        return "git-error:git-dir"
+    stamps.extend([os.path.join(repo, ".git"), os.path.join(gitdir, "HEAD"), os.path.join(gitdir, "index"), os.path.join(gitdir, "logs", "HEAD")])
+    for path in stamps:
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            if path.endswith(os.sep + "index") or path.endswith(os.path.join("logs", "HEAD")):
+                continue  # no index or reflog written yet: nothing was staged or committed
+            return "git-error:missing:" + os.path.basename(path)
+        except OSError:
+            return "git-error:unreadable:" + os.path.basename(path)
+        if reap_scratch_changed(info) > cutoff:
+            return "checkout-recent-change:" + os.path.basename(path)
+    return None
+
+
+def reap_scratch_regen_quiet(item: dict) -> str | None:
+    """None when the regenerable dir and its checkout had no write for scratchRegenIdleHours; otherwise the reason it is not quiet. Open
+    handles are the deleting pass's own fresh lsof/ps scan (reap_item_holders), under the producer locks."""
+    policy = reap_policy()
+    hours = reap_scratch_hours(policy, "scratchRegenIdleHours", 2)
+    if not hours:
+        return "scratch-regen-off"
+    window = hours * 3600
+    try:
+        proof = reap_scratch_idle_proof(item["path"], policy, seconds=reap_scratch_proof_seconds(item), window=window)
+        if not proof["idle"]:
+            return "not-quiet:" + str(proof.get("reason") or "unknown")
+        return reap_scratch_git_quiet(item.get("repo") or item["root"], window)
+    except (ReapRefused, OSError) as error:
+        return "not-quiet:" + (str(error) if isinstance(error, ReapRefused) else reap_named(error))[:60]
+
+
+def reap_scratch_checkouts(deadline: float | None = None) -> tuple[list[str], bool]:
+    """Every directory under the agent-scratch root that holds a `.git` entry (names only, never following a link, never entering .git,
+    protected names, regenerable dirs or another device). Returns (canonical checkout roots, whether the walk was cut short)."""
+    top = reap_canon(reap_agent_scratch_root())
+    deadline = deadline if deadline is not None else time.monotonic() + REAP_SCRATCH_CHECKOUT_SECONDS
+    found, seen, incomplete = [], 0, False
+    try:
+        device = os.lstat(top).st_dev
+    except OSError:
+        return [], False
+    stack = [(top, 0)]
+    while stack:
+        current, depth = stack.pop()
+        if time.monotonic() >= deadline or seen > REAP_SCRATCH_CHECKOUT_ENTRIES:
+            return sorted(found), True
+        try:
+            with os.scandir(current) as entries:
+                children = list(entries)
+        except OSError:
+            incomplete = True
+            continue
+        seen += len(children)
+        if any(child.name == ".git" for child in children) and current != top:
+            found.append(current)
+        if depth >= REAP_SCRATCH_CHECKOUT_DEPTH:
+            continue
+        for child in children:
+            name = child.name
+            if reap_protected(name) or reap_is_git(name) or name in REAP_REGENERABLE:
+                continue
+            try:
+                if child.is_symlink() or not child.is_dir(follow_symlinks=False) or child.stat(follow_symlinks=False).st_dev != device:
+                    continue
+            except OSError:
+                incomplete = True
+                continue
+            stack.append((os.path.join(current, name), depth + 1))
+    return sorted(found), incomplete
+
+
+def reap_scratch_regen_items(deadline: float | None = None) -> tuple[list[dict], list[str]]:
+    """Regenerable dirs (never dist) of every checkout under agent scratch, as items. Listing only claims retention (no quiet proof): the
+    deleting pass re-derives it from the directory itself, under the locks."""
+    roots, incomplete = reap_scratch_checkouts(deadline)
+    notes = ["scratch checkout walk incomplete"] if incomplete else []
+    chosen: dict[str, dict] = {}
+    for root in roots:
+        found, partial = reap_scan_clone(root)
+        if partial:
+            notes.append(f"scan incomplete: {root}")
+        for path, kind in found:
+            if kind not in REAP_DERIVED_KINDS:
+                continue
+            item = {"path": path, "root": root, "repo": reap_repo_of(path, root), "owner": AGENT_SCRATCH_OWNER, "jobs": [],
+                    "class": "scratch-regenerable", "kind": kind, "ownership": "scratch-checkout"}
+            if path not in chosen or len(root) > len(chosen[path]["root"]):
+                chosen[path] = item
+    items = []
+    for path in sorted(chosen):
+        claim = dict(chosen[path])
+        retention = reap_item_retention(claim, prove=False)  # also leaves claim["quietReason"] when it is not (yet) removable
+        items.append({**claim, "retention": retention})
+    return items, notes
+
+
+def reap_scratch_worktree_roots() -> tuple[list[str], list[str]]:
+    """Checkouts under agent scratch whose `.git` is a file (a linked worktree)."""
+    roots, notes = [], []
+    found, incomplete = reap_scratch_checkouts()
+    if incomplete:
+        notes.append("scratch checkout walk incomplete")
+    for root in found:
+        try:
+            if stat.S_ISREG(os.lstat(os.path.join(root, ".git")).st_mode):
+                roots.append(root)
+        except OSError:
+            continue
+    return roots, notes
+
+
+def reap_scratch_worktree(root: str, mode: str = "delete", ctx: dict | None = None) -> dict:
+    """One linked worktree under agent scratch, removed with `git worktree remove` (never --force) at disk pressure, once it is fully merged
+    into its remote-tracking upstream, clean (no stash), holds no protected name, nothing wrote to it for scratchWorktreeIdleHours and no
+    process has it open. Fail closed: any git error, unreadable state or doubt preserves it. Receipts before and after."""
+    ctx = ctx if ctx is not None else {}
+    apply = mode == "delete"
+    result = {"path": root, "owner": AGENT_SCRATCH_OWNER, "class": "scratch-worktree", "kind": "worktree", "ownership": "scratch-linked-worktree",
+              "retention": "unmarked", "bytes": None, "bytesIncomplete": False, "sizeReason": None, "archive": None, "checks": [], "preserved": [],
+              "outcome": "refused", "reason": None}
+    checks = result["checks"]
+    cleanup_owner = getattr(REAP_CLEANUP_OWNER, "held", None)
+    with ExitStack() as stack:
+        try:
+            if apply:
+                cleanup_owner = stack.enter_context(reap_cleanup_owner("scratch-worktree"))
+                checks.append("single-cleanup-worker")
+            policy = reap_policy()
+            hours = reap_scratch_hours(policy, "scratchWorktreeIdleHours", 6)
+            if not hours:
+                raise ReapRefused("retention-preserved:scratch-worktree-off")
+            if not reap_scratch_pressure_on(policy):
+                raise ReapRefused("retention-preserved:below-pressure-threshold")
+            checks.append("disk-pressure")
+            scratch_root = reap_canon(reap_agent_scratch_root())
+            if reap_canon(root) != root:
+                raise ReapRefused("path-not-canonical")
+            if root == scratch_root or not reap_inside(root, scratch_root):
+                raise ReapRefused("outside-allowed-roots")
+            reap_vet_root(scratch_root)
+            for part in Path(root).parts:
+                if reap_protected(part):
+                    raise ReapRefused(f"protected-ancestor:{part}")
+            info = os.lstat(root)
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                raise ReapRefused("not-a-real-directory")
+            if info.st_uid != os.getuid() or info.st_dev != os.lstat(scratch_root).st_dev:
+                raise ReapRefused("foreign-owner-or-device")
+            if not stat.S_ISREG(os.lstat(os.path.join(root, ".git")).st_mode) or not reap_linked_worktree(root):
+                raise ReapRefused("not-a-linked-worktree")
+            checks.append("canonical-boundary")
+            window = hours * 3600
+            with reap_git_session(root):
+                checks.extend(reap_git_repo_checks(root, ("clean", "pushed", "clone-root")))
+                code, upstream = reap_git(root, "rev-parse", "--symbolic-full-name", "@{upstream}")
+                upstream = upstream.strip()
+                if code != 0 or not upstream.startswith("refs/remotes/"):
+                    raise ReapRefused("no-remote-upstream")
+                code, out = reap_git(root, "rev-list", "--count", "HEAD", "--not", upstream)
+                if code != 0 or not out.strip().isdigit():
+                    raise ReapRefused(f"git-error:rev-list-upstream:{code}")
+                if int(out) > 0:
+                    raise ReapRefused(f"not-merged-into-upstream:{int(out)}")
+                checks.append("merged-into-upstream")
+                code, dirs = reap_git(root, "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir")
+                lines = dirs.split("\n")
+                if code != 0 or len(lines) < 2 or not lines[0].strip() or not lines[1].strip():
+                    raise ReapRefused("git-error:git-dir")
+                gitdir, common = lines[0].strip(), lines[1].strip()
+                main = os.path.dirname(common)
+                if os.path.basename(common) != ".git" or not os.path.isdir(main) or reap_inside(reap_canon(main), root) or reap_canon(main) != main:
+                    raise ReapRefused("main-repository-unusable")
+                if os.path.lexists(os.path.join(gitdir, "locked")):
+                    raise ReapRefused("worktree-locked")
+                busy = reap_worktree_main_busy(common)
+                if busy:
+                    raise ReapRefused(f"worktree-main-busy:{busy}")
+                checks.append("main-repository-idle")
+                repos = []
+                reap_protected_scan(root, allow_git=True, markers=True, repos=repos, nested_disposable=True, templates=reap_tracked_templates(root))
+                if set(repos) != {root}:
+                    raise ReapRefused("nested-git-in-worktree")
+                checks.append("no-protected-leaf")
+                proof = reap_scratch_idle_proof(root, policy, seconds=ctx.get("sizeBudget", 120), window=window)
+                if not proof["idle"]:
+                    raise ReapRefused("retention-preserved:worktree-not-quiet:" + str(proof.get("reason")))
+                quiet = reap_scratch_git_quiet(root, window)
+                if quiet:
+                    raise ReapRefused("retention-preserved:worktree-not-quiet:" + quiet)
+                checks.append("idle-" + str(hours) + "h")
+                result["bytes"] = proof["bytes"]
+                result["retention"] = REAP_DISPOSABLE
+                reap_holders(root, root, ctx.get("table") if mode == "audit" else None)
+                checks.append("no-process-or-handle")
+                if not apply:
+                    result["outcome"] = "would-delete"
+                    return result
+                reap_receipt({"phase": "plan", "run": ctx.get("run"), **{k: result[k] for k in ("path", "owner", "class", "kind", "ownership", "retention", "bytes", "archive", "checks", "preserved")}})
+                checks.append("plan-receipt-durable")
+                # the last look, locks and owner still held: nothing may have changed since the proofs
+                checks.extend(reap_git_repo_checks(root, ("clean", "pushed")))
+                if reap_scratch_git_quiet(root, window) or reap_scratch_pressure_on(policy) is False:
+                    raise ReapRefused("retention-changed")
+                last = os.lstat(root)
+                if (last.st_dev, last.st_ino) != (info.st_dev, info.st_ino):
+                    raise ReapRefused("identity-changed")
+                reap_holders(root, root, None)
+                checks.append("no-process-or-handle-final")
+            # outside the worktree's own git session: that session gates the worktree's metadata once more on exit, and it is about to be gone
+            code, out = reap_git(main, "worktree", "remove", "--", root)  # never --force: git itself refuses a dirty or locked worktree
+            if code != 0:
+                raise ReapRefused(f"git-worktree-remove-refused:{code}:{' '.join(str(out).split())[:80]}")
+            checks.append("git-worktree-remove")
+            if os.path.lexists(root):
+                result["outcome"], result["reason"] = "partial", "worktree-still-present-after-remove"
+                result["stopped"] = "partial:worktree-still-present-after-remove"
+            else:
+                result["outcome"], result["removed"] = "deleted", 1
+                checks.append("readback-absent")
+        except ReapRefused as refusal:
+            result["reason"] = str(refusal)
+        except (OSError, ValueError) as error:
+            result["outcome"], result["reason"] = "error", f"{error.__class__.__name__}:{getattr(error, 'errno', '')}"
+        finally:
+            if apply and checks and "plan-receipt-durable" in checks:  # only a worktree the plan receipt named gets a result receipt
+                try:
+                    reap_receipt({"phase": "result", "run": ctx.get("run"), "outcome": result["outcome"], "reason": result["reason"], "removed": result.get("removed"),
+                                  "bytesIncomplete": result["bytesIncomplete"], "sizeReason": result["sizeReason"],
+                                  **{k: result[k] for k in ("path", "owner", "class", "kind", "ownership", "retention", "bytes", "archive", "checks", "preserved")}})
+                except ReapRefused:
+                    result["stopped"] = result.get("stopped") or "result-receipt-unavailable"
+                if cleanup_owner and result.get("stopped"):
+                    cleanup_owner["stopped"] = cleanup_owner.get("stopped") or result["stopped"]
+    return result
+
+
+def reap_scratch_regen(dry_run: bool) -> dict:
+    """`reap --scratchRegen [--dryRun]` and the detached clean pass: at the disk-pressure threshold, merged worktrees and then regenerable dirs of
+    clean pushed checkouts under agent scratch, largest effort last, until the disk is back under cleanToPercent. Below the threshold nothing
+    is removed and every item says so."""
+    mode, ctx = ("dry-run" if dry_run else "delete"), {"run": uuid.uuid4().hex[:12]}
+    policy = reap_policy()
+    pressure = reap_scratch_pressure_on(policy)
+    low = policy.get("cleanToPercent")
+
+    def goal_met() -> bool:
+        try:
+            disk = disk_state()
+        except (OSError, HostError):
+            return False
+        used = disk.get("usedPercent") if isinstance(disk, dict) else None
+        return isinstance(used, (int, float)) and type(low) is int and used <= low
+
+    def run() -> tuple[list[dict], list[str], str | None]:
+        done, notes, stopped = [], [], None
+        roots, walk_notes = reap_scratch_worktree_roots()
+        notes.extend(walk_notes)
+        for root in roots:
+            if mode == "delete" and goal_met():
+                break
+            result = reap_scratch_worktree(root, mode, ctx)
+            done.append(result)
+            if result.get("stopped"):
+                return done, notes, f"{result['stopped']} ({os.path.basename(root)})"
+        items, item_notes = reap_scratch_regen_items()
+        notes.extend(item_notes)
+        for item in items:
+            if mode == "delete" and goal_met():
+                break
+            more, stopped = reap_sweep([item], mode, ctx)
+            done.extend(more)
+            if stopped:
+                break
+        return done, notes, stopped
+    if mode == "delete":
+        with reap_cleanup_owner("scratch-regen"):
+            done, notes, stopped = run()
+    else:
+        done, notes, stopped = run()
+    out = {"items": done, "pressure": pressure, "notes": notes, **({"stopped": stopped} if stopped else {})}
+    out.update(reap_summarize(done))
+    return out
+
+
 def reap_agent_scratch(dry_run: bool, items: list[dict] | None = None) -> dict:
     """One bounded discovery pass followed by a sweep that visits every folder it listed. A tick passes its listed items.
 
@@ -7713,10 +8243,7 @@ def tool_reap_acknowledge(params: dict) -> dict:
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600 or not 0 < info.st_size <= 65536:
             raise HostError("cleanup acknowledgment report must be owned, regular, single-linked, 0600 and at most 64 KiB")
         data = os.read(fd, 65537)
-        text = data.decode("utf-8")
-        required = (f"Cleanup owner run: {token}", "Receipts reviewed: yes", "Unresolved paths preserved: yes",
-                    "Deleted paths:", "Retained paths:", "Receipt references:", "Active consumers:", "Next safe step:")
-        if len(data) != info.st_size or b"\0" in data or any(line not in text.splitlines() for line in required[:3]) or any(not any(entry.startswith(line) and entry[len(line):].strip() for entry in text.splitlines()) for line in required[3:]):
+        if len(data) != info.st_size or reap_ack_report_problem(token, data):
             raise HostError("cleanup acknowledgment report is incomplete: use the documented handoff checklist and exact run token")
         evidence = {"run": token, "evidence": str(path), "evidenceSha256": hashlib.sha256(data).hexdigest()}
         with reap_cleanup_owner("acknowledge:" + actor_of(params), acknowledge=evidence) as owner:
@@ -7737,6 +8264,10 @@ def tool_reap(params: dict) -> dict:
 
 def tool_reap_owned(params: dict) -> dict:
     """`reap --job J-NNNN [--dry-run]`: the explicit run of the same gates; `reap --releases` prunes superseded candidates."""
+    if params.get("scratchRegen"):
+        if any(params.get(k) for k in ("job", "releases", "agentScratch", "releaseEvidence", "archives", "expireEvidence")):
+            raise HostError("reap --scratchRegen cannot be combined with another reap target")
+        return reap_scratch_regen(bool(params.get("dryRun")))
     if params.get("agentScratch") or params.get("releaseEvidence") or params.get("archives"):
         if params.get("job") or params.get("releases") or sum(1 for k in ("agentScratch", "releaseEvidence", "archives") if params.get(k)) > 1:
             raise HostError("reap takes one of --job, --releases, --agentScratch, --releaseEvidence or --archives")

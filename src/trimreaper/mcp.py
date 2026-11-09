@@ -46,7 +46,7 @@ TOOLS = [
      "annotations": {"destructiveHint": True},
      "inputSchema": {"type": "object", "additionalProperties": False, "properties": {
          "job": {**JOB, "description": "One finished job's clones and scratch folders"},
-         "target": {"type": "string", "enum": ["job", "scratch", "archives", "release-evidence", "releases"], "default": "job"},
+         "target": {"type": "string", "enum": ["job", "scratch", "scratch-regen", "archives", "release-evidence", "releases"], "default": "job"},
          "expireEvidence": {"type": "boolean", "default": False, "description": "With job: expire old screenshots, recordings and logs instead"},
          "dryRun": {"type": "boolean", "default": True}}}},
     {"name": "clean",
@@ -125,7 +125,7 @@ def call(name: str, args: dict) -> dict:
         dry_run = args.get("dryRun", True)
         if not isinstance(dry_run, bool):
             raise host.HostError("dryRun must be true or false")
-        return cli.cmd_reap(namespace(job=cli.job_id(args["job"]) if target == "job" else None, scratch=target == "scratch",
+        return cli.cmd_reap(namespace(job=cli.job_id(args["job"]) if target == "job" else None, scratch=target == "scratch", scratch_regen=target == "scratch-regen",
                                       archives=target == "archives", release_evidence=target == "release-evidence",
                                       releases=target == "releases", expire_evidence=bool(args.get("expireEvidence")), dry_run=dry_run))
     if name == "clean":

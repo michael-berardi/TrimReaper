@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.18.0 (2026-11-09)
+
+- A cleanup run left `interrupted` by a dead process no longer blocks every later clean until a person acknowledges it. When the
+  recorded owner pid is gone, or was reused by a process that started later (compared with the `pidStart` now recorded in every
+  owner note; old notes are judged by the note time), the next clean writes the acknowledgment itself: a private 0600 report built
+  from the run's own receipts (deleted, retained and unresolved paths, receipt files, next safe step) and a journal line marked
+  `auto` with the report path and sha256. Nothing is deleted by it: every path is re-gated by the normal sweep, including paths the
+  dead run never reached. A live or unknown owner, unreadable receipts and a deliberate `stopped` handoff still need a person.
+- New `scratch-regenerable` class and `reap --scratch-regen [--dry-run]` (also run by `tick`, after the other passes): at
+  `cleanAtPercent`, `node_modules .astro .next .turbo target .open-next` (never `dist`, never protected leaves) of a git checkout under
+  agent scratch are removed when the checkout is clean with every commit pushed and no stash, nothing in it or its git state changed
+  for `scratchRegenIdleHours` (2) and nothing has it open. A linked worktree fully merged into its remote-tracking upstream, clean, idle
+  `scratchWorktreeIdleHours` (6), is removed with `git worktree remove` (never `--force`). Both go through the single deletion path,
+  with plan and result receipts, and stop once the disk is at `cleanToPercent`. `0` turns either rule off.
+
 ## 0.17.2 (2026-11-07)
 
 - `tagged-caches` discovery gave every root an equal slice of the entry budget, and every linked worktree is a root, so a code
