@@ -313,6 +313,7 @@ def offload_pass(dry_run: bool = False, limit_bytes: int | None = None, only: st
         return {"skipped": cause, "moved": [], "kept": [], "errors": []}
     statuses = job_statuses(cfg)
     returned = bring_back_live(cfg, statuses, dry_run)
+    orphans = prune_orphans(cfg, statuses, dry_run) if not only else {"pruned": [], "prunedBytes": 0, "kept": [], "keptCount": 0, "errors": []}
     free = shutil.disk_usage(mount_of(root)).free
     floor = int(cfg["minFreeGB"] * 1024 ** 3)
     table = core.reap_process_table()
@@ -353,8 +354,102 @@ def offload_pass(dry_run: bool = False, limit_bytes: int | None = None, only: st
             planned_bytes += item["bytes"]
         except (host.HostError, core.ReapRefused, OSError) as error:
             errors.append(f"{item['path']}: {error}")
+    errors = orphans["errors"] + errors
     return {"root": str(root), "dryRun": dry_run, "movedBytes": planned_bytes, "moved": moved, "returned": returned, "kept": kept[:60],
-            "keptCount": len(kept), "errors": errors, "disk": host.disk_state()}
+            "keptCount": len(kept), "errors": errors, "disk": host.disk_state(),
+            "orphans": {k: orphans[k] for k in ("pruned", "prunedBytes", "kept", "keptCount")}}
+
+
+def mirrors_of(cfg: dict):
+    """(mirror folder on the overflow volume, the home path it was moved from, the owner folder that must hold it or None, source) for
+    every moved folder the configured sources can have left there, at the depth that source moves."""
+    root, home = cfg["root"] / "home", host.reap_home()
+    for source in cfg["sources"]:
+        base = host.expand(source["path"])
+        try:
+            mirror = root / base.relative_to(home)
+        except ValueError:
+            continue
+        if not mirror.is_dir() or mirror.is_symlink():
+            continue
+        if not source.get("children"):
+            yield mirror, base, base.parent, source
+            continue
+        for child in sorted(mirror.iterdir()):
+            if child.is_symlink() or not child.is_dir() or child.name.startswith(".offload-"):
+                continue
+            if source.get("keepFolder"):
+                for inner in sorted(child.iterdir()):
+                    if not inner.is_symlink() and inner.is_dir() and not inner.name.startswith(".offload-"):
+                        yield inner, base / child.name / inner.name, base / child.name, source
+            else:
+                yield child, base / child.name, None, source  # the moved child was its own owner: its link going is its expiry
+
+
+def kept_by_marker(path: Path) -> str | None:
+    """The first preserving retention marker (`.ut-retention-*` other than disposable) in a tree, `walk-incomplete` when the
+    bounded walk could not see all of it, else None. Names only; nothing is opened."""
+    start, entries, stack = time.time(), 0, [str(path)]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    entries += 1
+                    if entry.name.startswith(core.REAP_MARKER_PREFIX) and entry.name != core.REAP_MARKER_PREFIX + "disposable":
+                        return entry.name
+                    if entry.is_dir(follow_symlinks=False):
+                        stack.append(entry.path)
+        except OSError:
+            return "walk-incomplete"
+        if entries > WALK_ENTRIES or time.time() - start > WALK_SECONDS:
+            return "walk-incomplete"
+    return None
+
+
+def prune_orphans(cfg: dict, statuses: dict, dry_run: bool) -> dict:
+    """Moved folders whose home owner is gone (the reaper expired the scratch or job folder that held the link) are orphans: no
+    path in home reaches them and no rule would ever look at them again, so the overflow volume only grew. Such a folder goes
+    unless it holds a preserving retention marker, its job is live, or a process holds it. A folder whose owner is still there
+    but whose link is missing is kept and reported: that is not the reaper's doing."""
+    pruned, kept, errors, freed = [], [], [], 0
+    table = None
+    for mirror, original, owner, source in mirrors_of(cfg):
+        if os.path.lexists(original):
+            continue  # still linked (or restored): not an orphan
+        if owner is not None and owner.exists():
+            kept.append({"path": str(mirror), "why": "owner-present-link-missing"})
+            continue
+        job = job_of(owner.name if owner is not None and source.get("keepFolder") else original.name) if source.get("jobs") else None
+        if job and statuses.get(job) in LIVE:
+            kept.append({"path": str(mirror), "why": f"job-live:{job}"})
+            continue
+        marker = kept_by_marker(mirror)
+        if marker:
+            kept.append({"path": str(mirror), "why": f"retention:{marker}"})
+            continue
+        stats = tree_stats(mirror)
+        try:
+            table = table or core.reap_process_table()
+            core.reap_holders(str(mirror), str(mirror), table)
+        except core.ReapRefused as refused:
+            kept.append({"path": str(mirror), "why": str(refused)})
+            continue
+        if dry_run:
+            pruned.append({"path": str(mirror), "from": str(original), "bytes": stats["bytes"], "pruned": False})
+            continue
+        holding = mirror.parent / f".offload-{mirror.name}.pruning"
+        try:
+            core.reap_receipt({"kind": "offload-prune-plan", "path": str(mirror), "from": str(original), "bytes": stats["bytes"]})
+            os.rename(mirror, holding)
+            shutil.rmtree(holding)
+            core.reap_receipt({"kind": "offload-prune-done", "path": str(mirror), "from": str(original), "bytes": stats["bytes"]})
+        except (OSError, core.ReapRefused) as error:
+            errors.append(f"{mirror}: {error}")
+            continue
+        freed += stats["bytes"]
+        pruned.append({"path": str(mirror), "from": str(original), "bytes": stats["bytes"], "pruned": True})
+    return {"pruned": pruned, "prunedBytes": freed, "kept": kept[:60], "keptCount": len(kept), "errors": errors}
 
 
 def goal_met(planned_bytes: int) -> bool:

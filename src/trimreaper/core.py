@@ -36,7 +36,7 @@ from .host import (  # noqa: F401  (the engine reads these as module globals)
     REAP_CLI, REAP_OWNER_DIRS, VERSION, HostError, actor_of, db, disk_level, disk_state, iso, job_meta, job_wait, live_all,
     load_policy, log_event, meta_json, now, reap_agent_scratch_root, reap_archive_root, reap_cache_root, reap_clone_bases,
     reap_home, reap_queue_state, reap_receipt_dir, reap_release_evidence_root, reap_release_marks, reap_release_root, require,
-    row, rows, txn, whole_title, reap_output_ownership,
+    row, rows, txn, whole_title, reap_output_ownership, reap_offload_root,
 )
 
 # The names an embedding host must define before the engine runs (checked by tests/test_embedding.py).
@@ -2039,7 +2039,7 @@ def reap_item_retention(item: dict, prove: bool = True) -> str:
     if reap_marked_evidence_item(item):
         return REAP_DISPOSABLE
     if item.get("class") in ("job-cache-subdir", "job-derived-output") and item.get("owner") \
-            and reap_inside(item["path"], reap_canon(reap_cache_root() / item["owner"])):
+            and reap_inside(item.get("link") or item["path"], reap_canon(reap_cache_root() / item["owner"])):
         parent = reap_cache_retention(str(reap_cache_root() / item["owner"]))
         if parent not in ("unmarked", REAP_DISPOSABLE):
             if parent == "evidence" and reap_evidence_marker_void(item["owner"]):
@@ -4926,6 +4926,15 @@ def reap_job_items(job: dict, clones: list, audit_dirs: bool = True) -> tuple[li
                     item = {"path": reap_canon(entry.path), "root": reap_canon(cache), "owner": job["id"], "jobs": [job["id"]],
                             "class": "job-cache-subdir", "kind": "cache-subdir", "ownership": "job-cache-dir"}
                     items.append({**item, "retention": reap_item_retention(item)})
+                elif not reap_protected(entry.name) and entry.is_symlink():
+                    # Offloaded to the overflow volume: the same folder under the same rules, reached through its link. Before
+                    # 0.18.2 such folders were never listed, so they never expired and the overflow volume only grew.
+                    link = os.path.join(reap_canon(cache), entry.name)
+                    moved = reap_offloaded_mirror(link)
+                    if moved:
+                        item = {"path": moved, "root": os.path.dirname(moved), "link": link, "owner": job["id"], "jobs": [job["id"]],
+                                "class": "job-cache-subdir", "kind": "cache-subdir", "ownership": "job-cache-dir-offloaded"}
+                        items.append({**item, "retention": reap_item_retention(item)})
     except FileNotFoundError:
         pass
     except OSError:
@@ -5234,9 +5243,17 @@ def reap_output_control_agent(pid: str, command: str, table: dict, item: dict) -
         reap_inside_folded(reap_canon(cwd[0]), item[key]) for key in ("source", "path"))
 
 
+# Classes whose `root` is a shared collection of unrelated folders, not an owner: a process working in one agent-scratch
+# folder says nothing about its siblings, so the holder scope is the item itself (a sibling's dev server pinned all 66
+# idle scratch folders on 2026-11-10). A job's cache folder and a checkout stay scoped to their owner root.
+REAP_SELF_HELD_CLASSES = ("job-clone-root", "agent-scratch")
+
+
 def reap_item_holders(item: dict, table: dict | None) -> None:
     if item["class"] != "job-derived-output":
-        reap_holders(item["path"], item["path"] if item["class"] == "job-clone-root" else item["root"], table)
+        reap_holders(item["path"], item["path"] if item["class"] in REAP_SELF_HELD_CLASSES else item["root"], table)
+        if item.get("link"):
+            reap_holders(item["link"], item["link"], table)  # an offloaded folder is also reached, and named, by its link
         return
     if table is None:
         code, out = reap_probe(["lsof", "-n", "-P", "-Fp", "--", item["path"]], 30)
@@ -5262,6 +5279,31 @@ def reap_item_holders(item: dict, table: dict | None) -> None:
 
 
 def reap_item(item: dict, mode: str = "delete", ctx: dict | None = None) -> dict:
+    result = reap_item_routed(item, mode, ctx)
+    if item.get("link") and result.get("outcome") == "deleted":
+        reap_unlink_offloaded(item, result)
+    return result
+
+
+def reap_unlink_offloaded(item: dict, result: dict) -> None:
+    """The overflow copy is gone: its link in home now dangles. Remove the link only, and only while it still names exactly the
+    removed folder; anything else (a restored real folder, a link that changed) stays and the result says why."""
+    link = item["link"]
+    try:
+        info = os.lstat(link)
+        if not stat.S_ISLNK(info.st_mode) or os.path.realpath(link) != item["path"] or os.path.lexists(item["path"]):
+            result["linkKept"] = "link-changed-or-target-present"
+            return
+        os.unlink(link)
+        result["linkRemoved"] = link
+        reap_receipt({"phase": "link", "path": link, "to": item["path"], "outcome": "unlinked", "class": item.get("class")})
+    except FileNotFoundError:
+        result["linkRemoved"] = link
+    except OSError as error:
+        result["linkKept"] = f"{error.__class__.__name__}:{getattr(error, 'errno', '')}"
+
+
+def reap_item_routed(item: dict, mode: str = "delete", ctx: dict | None = None) -> dict:
     result = reap_item_strict(item, mode, ctx)
     if item.get("class") not in ("job-clone-regenerable", "job-cache-subdir") \
             or os.path.basename(str(item.get("path"))) not in REAP_OUTPUT_KINDS \
@@ -5361,6 +5403,46 @@ def reap_output_job_order(jobs: list[dict], clones: list) -> list[dict]:
 
 # ---- the single deletion path -----------------------------------------------------------------------------------
 
+def reap_overflow_home() -> str | None:
+    """The canonical `<offload.root>/home` of the operator's overflow volume, or None (not configured, not mounted, or not a
+    folder strictly below a mounted volume under /Volumes). An embedding host without `reap_offload_root` has no overflow."""
+    lookup = globals().get("reap_offload_root")
+    try:
+        configured = lookup() if callable(lookup) else None
+    except (HostError, OSError, ValueError):
+        return None
+    if not configured or not os.path.isdir(configured):
+        return None
+    home = reap_canon(configured)
+    parts = Path(home).parts  # ('/', 'Volumes', <volume>, <overflow folder>, 'home') at the least
+    if len(parts) < 5 or reap_fold(parts[1]) != "volumes" or any(reap_inside_folded(system, home) for system in REAP_SYSTEM_ROOTS):
+        return None
+    return home
+
+
+def reap_offloaded_mirror(link: str) -> str | None:
+    """The canonical overflow copy a home link points to, or None. Only the exact mirror counts: the link is a symlink whose
+    target resolves to `<overflow home>/<the link's home-relative path>` and is a real folder there. Anything else (a link
+    elsewhere, a link into the overflow under another name, a link to a link) is not an offloaded folder."""
+    overflow = reap_overflow_home()
+    if not overflow:
+        return None
+    try:
+        if not stat.S_ISLNK(os.lstat(link).st_mode):
+            return None
+        home = reap_canon(reap_home())
+        parent = os.path.dirname(link)
+        if reap_canon(parent) != parent or not reap_inside(parent, home) or parent == home:
+            return None
+        expected = os.path.join(overflow, os.path.relpath(link, home))
+        moved = reap_canon(link)
+        if moved != expected or not stat.S_ISDIR(os.lstat(moved).st_mode):
+            return None
+    except (OSError, ValueError, HostError):
+        return None
+    return moved
+
+
 def reap_vet_root(root: str) -> None:
     """An allowed root (a parent of clones, the cache root, the releases root) is never the home directory, a
     system root, or anything enclosing or inside one. Comparisons fold case, so `/users` cannot slip past `/Users`."""
@@ -5376,8 +5458,11 @@ def reap_vet_root(root: str) -> None:
     for system in REAP_SYSTEM_ROOTS + REAP_SYSTEM_PARENTS:
         if reap_inside_folded(system, root) or reap_inside_folded(reap_canon(system), root):
             raise ReapRefused("allowed-root-encloses-system-root")
+    overflow = reap_overflow_home()
     for system in REAP_SYSTEM_ROOTS:
         if reap_inside_folded(root, system) or reap_inside_folded(root, reap_canon(system)):
+            if overflow and root != overflow and reap_inside_folded(root, overflow):
+                continue  # a home folder moved to the operator's overflow volume (/Volumes/...): vetted like home below
             raise ReapRefused("allowed-root-inside-system-root")
     try:
         reap_root = reap_canon(reap_home())  # the home the host reaps below (a test or second instance moves it)
@@ -5430,6 +5515,13 @@ def reap_boundary(item: dict) -> str:
             raise ReapRefused("outside-allowed-roots")
         reap_vet_root(scratch_root)
         kind = reap_kind(rel)
+    elif cls == "job-cache-subdir" and item.get("ownership") == "job-cache-dir-offloaded":
+        link, cache = item.get("link") or "", reap_canon(reap_cache_root())
+        if os.path.dirname(link) != os.path.join(cache, owner) or os.path.basename(link) != os.path.basename(path) \
+                or os.path.basename(root) != owner or len(rel) != 1 or reap_protected(rel[0]) or reap_offloaded_mirror(link) != path:
+            raise ReapRefused("outside-allowed-roots:offloaded")
+        reap_vet_root(parent)  # the overflow mirror of the cache root: allowed only below the configured overflow home
+        kind = "cache-subdir"
     elif cls == "job-cache-subdir":
         if parent != reap_canon(reap_cache_root()) or os.path.basename(root) != owner or len(rel) != 1 or reap_protected(rel[0]):
             raise ReapRefused("outside-allowed-roots")

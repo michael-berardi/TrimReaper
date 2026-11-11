@@ -169,3 +169,11 @@ errors)` reaps one job the moment its worker closes.
 The retention marker prefix `.ut-retention-` comes from UltraTerm, where the engine started, and stays as it is so existing
 markers keep working. Archives are written with manifest kind `trimreaper-archive`; manifests written before 0.14.0 carry an
 older kind, which the engine still reads.
+
+## Overflow volume
+
+The optional host callback `reap_offload_root()` returns `<offload.root>/home` (the overflow volume's mirror of the reap home) or
+None. With it, roots strictly below that folder pass the allowed-root check (it must sit below a mounted volume in /Volumes), and
+a job-cache link whose target is exactly its mirror there is listed as that job's cache folder, expired under the same rules, and
+unlinked once its folder is gone. Without it (the default for an embedding host) nothing on an external volume is ever an item.
+The standalone host reads it from the `offload` key of its own config.

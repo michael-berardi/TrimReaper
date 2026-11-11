@@ -343,6 +343,15 @@ def reap_archive_root() -> Path:
     return configured("archiveRoot")
 
 
+def reap_offload_root() -> Path | None:
+    """The overflow volume's mirror of the reap home (`<offload.root>/home`), or None when offload is not configured. The
+    engine treats folders below it as home folders that moved: their retention rules still apply there."""
+    cfg = config().get("offload")
+    if not isinstance(cfg, dict) or not isinstance(cfg.get("root"), str):
+        return None
+    return expand(cfg["root"]) / "home"
+
+
 def reap_agent_scratch_root() -> Path:
     return configured("scratchRoot") or disabled_root("scratch")
 

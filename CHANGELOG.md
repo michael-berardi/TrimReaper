@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.18.2 (2026-11-11)
+
+- An agent-scratch folder is held only by a process inside it (cwd, open handle, or a command line naming it). The holder scope
+  was the whole scratch root, so one dev server in one folder pinned every idle sibling (66 folders on 2026-11-10).
+- Offloaded job-cache folders expire. A link `<cacheRoot>/J-NNNN/<name>` whose target is exactly its mirror under
+  `<offload.root>/home` is listed as that job's cache folder, judged by the same retention rules (job-folder markers included),
+  removed on the overflow volume through the guarded path, and then its link is unlinked. Before, links were never listed, so
+  offloaded folders never expired and the overflow volume only grew.
+- Roots strictly below the configured overflow home (`<offload.root>/home`, a folder below a mounted volume in /Volumes) pass
+  the allowed-root check. Expired archives whose archive root was offloaded were refused as `allowed-root-inside-system-root`
+  on every pass. Any other /Volumes path is still refused. Embedding hosts opt in by defining `reap_offload_root`.
+- `offload run` prunes orphans first: a moved folder whose home owner is gone (the reaper expired the folder that held the
+  link) goes unless it holds a preserving `.ut-retention-*` marker, its job is live, or a process holds it. A folder whose owner
+  is still at home but whose link is missing is kept and reported. Receipts `offload-prune-plan`/`offload-prune-done`.
+
 ## 0.18.1 (2026-11-09)
 
 - A merged scratch worktree is now removed under the same discipline as a whole clone. The protected-name scan runs before any
