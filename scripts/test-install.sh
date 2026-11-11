@@ -18,7 +18,8 @@ set -- dist/release/trimreaper-*-py3-none-any.whl
 WHEEL=${1##*/}
 v=${WHEEL#trimreaper-}; VERSION=${v%-py3-none-any.whl}
 
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/trimreaper-test.XXXXXX")
+# The work dir lives in the checkout: Docker Desktop shares /Users but not $TMPDIR (/var/folders).
+WORK=$(mktemp -d "$PWD/.test-install.XXXXXX")
 SERVER_PID=""
 cleanup() {
   if [ -n "$SERVER_PID" ]; then kill "$SERVER_PID" 2>/dev/null || true; wait "$SERVER_PID" 2>/dev/null || true; fi
