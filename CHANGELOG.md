@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- One-step installers. `scripts/install.sh` (macOS) downloads the release wheel, verifies its SHA-256 before
+  anything is installed, and installs it into a private venv in `~/.trimreaper` with the `trimreaper` command in
+  `~/.local/bin`; re-running upgrades in place, no sudo, no shell profile edits. TrimReaper supports macOS only
+  (launchd scheduling, APFS dedupe and compression, macOS ACL protection), so `install.sh` refuses on Linux and
+  `scripts/install.ps1` refuses on Windows and under PowerShell 7 on Linux, each naming why and installing nothing.
+  `scripts/build-release.sh` builds the release assets (wheel, both installers, SHA256SUMS) deterministically, and
+  `scripts/test-install.sh` tests the installers on macOS, in a Linux container and under PowerShell 7 on Linux.
+
 ## 0.18.3 (2026-11-11)
 
 - `reap_note_epoch` reads the colon UTC offset form `YYYY-MM-DDTHH:MM:SS+ZZ:ZZ` as well as the legacy `+ZZZZ`, so an embedding

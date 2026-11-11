@@ -16,8 +16,35 @@ It is the reaper engine of UltraTerm, released on its own so any agent setup can
 
 ## Install
 
+One step on macOS, the only platform TrimReaper supports (substitute the GitHub owner of this repository, as in
+the pipx route below):
+
+```sh
+curl -fsSL https://github.com/your-github-username/TrimReaper/releases/latest/download/install.sh | sh
+```
+
+Windows:
+
+```powershell
+irm https://github.com/your-github-username/TrimReaper/releases/latest/download/install.ps1 | iex
+```
+
+TrimReaper runs on macOS only: its scheduler uses launchd, its dedupe and log compression use APFS, and its ACL
+delete protection is macOS-only. So `install.sh` refuses on Linux and `install.ps1` refuses on Windows (and under
+PowerShell 7 on Linux), each with one sentence naming that, and nothing is installed there.
+
+The macOS installer downloads the release wheel, checks its SHA-256 before anything is installed, and installs it
+into a private venv in `~/.trimreaper`. The `trimreaper` command goes to `~/.local/bin`; when that folder is not on
+your PATH the installer prints the one line to add. No sudo, no shell profile edits. Re-run the same line to
+upgrade; `TRIMREAPER_VERSION=0.18.3` pins a release. Installer overrides: `TRIMREAPER_HOME` (install folder) and
+`TRIMREAPER_BIN_DIR` (command folder), for the installer command only: TrimReaper itself reads `TRIMREAPER_HOME` at
+runtime as the folder it may clean. To remove it, delete `~/.trimreaper` and `~/.local/bin/trimreaper`.
+
 Requires macOS, Python 3.10 or newer, and `git`, `lsof` and `ps`. The `python3` that ships with macOS is 3.9; a
-newer one comes from [python.org](https://www.python.org/downloads/) or Homebrew (`brew install python`).
+newer one comes from [python.org](https://www.python.org/downloads/) or Homebrew (`brew install python`). The
+installer names what is missing and stops.
+
+Manual route:
 
 ```sh
 pipx install "git+https://github.com/your-github-username/TrimReaper@v0.18.3"
