@@ -19,6 +19,7 @@ GONE = ["node_modules", ".astro", ".next", ".turbo", "target", ".open-next"]
 
 class ScratchBase(Home):
     config_extra = {"scratchRoot": "~/.cache/agent-scratch"}
+    core_disk_percent = 90  # above cleanAtPercent (pressure) and cleanToPercent (the goal is not met); the real disk must not decide
 
     def setUp(self):
         super().setUp()

@@ -132,6 +132,11 @@ class DeadOwnerAcknowledge(unittest.TestCase):
         self.interrupted_run(child.pid, at="2020-01-01T00:00:00+0000")  # the owner wrote its note years before this process existed
         self.assertEqual(core.reap_owner_pid_state(self.journal()[-1]), "reused")
 
+    def test_a_journal_with_a_colon_offset_note_time_proves_pid_reuse(self):
+        child = self.sleeper()
+        self.interrupted_run(child.pid, at="2020-01-01T00:00:00+00:00")  # the host's iso() colon form, no recorded start
+        self.assertEqual(core.reap_owner_pid_state(self.journal()[-1]), "reused")
+
     def test_unknown_owner_state_and_unreadable_receipts_keep_the_block(self):
         self.interrupted_run(self.dead_pid())
         with mock.patch.object(core, "reap_run_receipt_records", return_value=None):
@@ -152,6 +157,30 @@ class DeadOwnerAcknowledge(unittest.TestCase):
         with self.assertRaisesRegex(core.ReapRefused, "cleanup-handoff-incomplete"):
             with core.reap_cleanup_owner("clean"):
                 self.fail("a deliberate stop was auto-acknowledged")
+
+
+class NoteEpochOffsetForms(unittest.TestCase):
+    """reap_note_epoch reads the host's colon UTC offset (+ZZ:ZZ) exactly like the engine's legacy +ZZZZ; malformed text stays None."""
+
+    def test_colon_and_legacy_negative_offsets_are_the_same_instant(self):
+        colon = core.reap_note_epoch("2026-11-11T04:50:04-03:00")
+        self.assertIsNotNone(colon)
+        self.assertEqual(colon, core.reap_note_epoch("2026-11-11T04:50:04-0300"))
+
+    def test_colon_and_legacy_positive_half_hour_offsets_are_the_same_instant(self):
+        colon = core.reap_note_epoch("2026-11-11T04:50:04+05:30")
+        self.assertIsNotNone(colon)
+        self.assertEqual(colon, core.reap_note_epoch("2026-11-11T04:50:04+0530"))
+
+    def test_malformed_offsets_still_return_none(self):
+        for text in ("2026-11-11T04:50:04-03:0:0",  # a second colon
+                     "2026-11-11T04:50:04-0::00",   # a second colon inside a 25-char text
+                     "2026-11-11T04:50:04-03:0",    # short minutes
+                     "2026-11-11T04:50:04-3:00",    # short hours
+                     "2026-11-11T04:50:0403:00",    # no sign
+                     "2026-11-11T04:50:04 03:00",   # no sign, colon present
+                     "2026-11-11T04:50:04-03:0a"):  # non-digit minutes
+            self.assertIsNone(core.reap_note_epoch(text), text)
 
 
 if __name__ == "__main__":

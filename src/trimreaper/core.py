@@ -5957,8 +5957,11 @@ def reap_pid_start(pid: int) -> float | None:
 
 
 def reap_note_epoch(value) -> float | None:
-    """Epoch seconds of an owner note's `YYYY-MM-DDTHH:MM:SS+ZZZZ` time (the engine's iso()); None when it does not parse."""
+    """Epoch seconds of an owner note's `YYYY-MM-DDTHH:MM:SS+ZZZZ` (the engine's iso()) or `YYYY-MM-DDTHH:MM:SS+ZZ:ZZ`
+    (an embedding host's iso()) time; None when it does not parse."""
     text = str(value)
+    if len(text) == 25 and text[22] == ":":
+        text = text[:22] + text[23:]  # the host's colon offset form, read as the legacy +ZZZZ below
     if len(text) != 24 or text[19] not in "+-" or not text[20:].isdigit():
         return None
     try:

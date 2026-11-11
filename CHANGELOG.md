@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.18.3 (2026-11-11)
+
+- `reap_note_epoch` reads the colon UTC offset form `YYYY-MM-DDTHH:MM:SS+ZZ:ZZ` as well as the legacy `+ZZZZ`, so an embedding
+  host whose iso() emits the canonical colon form (as UltraTerm's now does, for python 3.9 `fromisoformat`) round-trips through
+  the engine. A colon-offset owner note with no recorded `pidStart` parsed as None, so a cleanup-owner pid reused by a later
+  process could not be proven dead and the unfinished handoff blocked every clean until a person acknowledged it. Malformed
+  times still return None; the legacy form is unchanged.
+- Tests: the engine's disk reading is faked where a test needs a known level — the scratch-regeneration classes see a disk
+  above the clean watermark, the steady tick/gate classes a disk below it, and the ladder classes their own fixture bytes.
+  On a machine whose real disk sat at or above the warn watermark, five steady-state tests failed and the scratch tests
+  silently depended on the real disk being full; both directions are now hermetic.
+
 ## 0.18.2 (2026-11-11)
 
 - An agent-scratch folder is held only by a process inside it (cwd, open handle, or a command line naming it). The holder scope

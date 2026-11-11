@@ -28,6 +28,7 @@ class Ladder(Home):
         super().setUp()
         self.base_used = 0
         for patch in (mock.patch.object(clean, "disk_state", self.fake_disk),
+                      mock.patch.object(core, "disk_state", self.fake_disk),
                       mock.patch.object(clean, "clean_running", return_value=set()),
                       mock.patch.object(clean, "reap_process_table", return_value={"files": [], "commands": []})):
             patch.start()

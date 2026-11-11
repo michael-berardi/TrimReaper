@@ -24,6 +24,7 @@ class Home(unittest.TestCase):
     """Everything happens below a temporary directory: the reap home, its clones, the remotes and the state."""
 
     config_extra: dict = {}
+    core_disk_percent = None  # a class that needs a known ENGINE disk level sets this; the real disk must never leak into a tick
 
     def setUp(self):
         self.tmp = Path(os.path.realpath(tempfile.mkdtemp(prefix="trimreaper-test-")))
@@ -41,6 +42,15 @@ class Home(unittest.TestCase):
         # The clean pass never reaches this machine's tools, caches or disk level from a test: none by default, fakes per test.
         for patch in (mock.patch.object(clean, "CLEAN_TOOLS", ()), mock.patch.object(clean, "CLEAN_FOLDERS", ()),
                       mock.patch.object(clean, "disk_state", lambda: {"path": str(self.tmp), "usedPercent": 50, "freeBytes": 10 ** 12})):
+            patch.start()
+            self.addCleanup(patch.stop)
+        # The engine's tick reads the same machine's disk: on a host at or above the warn watermark the real level
+        # leaks extra pressure actions into tests that expect a steady tick (J-3763). Ladder fakes the engine disk
+        # with its own fixture bytes instead of this fixed reading.
+        if self.core_disk_percent is not None:
+            percent = self.core_disk_percent
+            patch = mock.patch.object(core, "disk_state",
+                                      lambda: {"path": str(self.tmp), "usedPercent": percent, "freeBytes": 10 ** 12})
             patch.start()
             self.addCleanup(patch.stop)
         self.addCleanup(self.remove_tmp)

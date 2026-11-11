@@ -249,6 +249,7 @@ class ProtectedCopiesAndArchives(Home):
 
 
 class MoreGates(Home):
+    core_disk_percent = 50  # tests that want pressure set their own warn watermark; the real host disk must not leak in
     def test_a_tracked_env_template_goes_with_its_expired_clone(self):
         repo = self.clone("app-j0180", ignored=("node_modules/",), tracked={"README.md": "hi\n", ".env.example": "KEY=\n"})
         self.assertIn(".env.example", self.git(repo, "ls-files"))

@@ -434,6 +434,7 @@ class ScratchAndEvidence(ScratchHome):
 
 
 class Tick(Home):
+    core_disk_percent = 50  # a steady tick: the real host disk must not add pressure actions
     def test_one_tick_reaps_every_due_job(self):
         repo = self.clone("app-j0040")
         self.put(repo, "node_modules/pkg/index.js")
