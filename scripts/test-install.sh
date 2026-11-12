@@ -115,8 +115,22 @@ docker run --rm -v "$WORK/base:/rel:ro" ubuntu:24.04 /bin/sh -c '
   echo "ok: Linux refusal (dash, bash, busybox ash), nothing installed"' \
   || fail "the Linux container refusal test failed"
 
+# mcr.microsoft.com/powershell publishes no arm64 Linux image (amd64 and 32-bit arm only), so the
+# PowerShell 7 tests run in a small local image: ubuntu:24.04 plus Microsoft's official tarball.
+PS_VERSION=7.4.6
+PWSH_IMAGE="pwsh-install-test:$PS_VERSION"
+if ! docker image inspect "$PWSH_IMAGE" >/dev/null 2>&1; then
+  docker build -q -t "$PWSH_IMAGE" - >/dev/null <<DOCKERFILE || fail "cannot build the PowerShell $PS_VERSION test image"
+FROM ubuntu:24.04
+RUN apt-get update -qq && apt-get install -y -qq ca-certificates curl libicu74 >/dev/null \\
+ && case "\$(uname -m)" in aarch64) a=arm64 ;; x86_64) a=x64 ;; *) echo "unsupported CPU \$(uname -m)" >&2; exit 1 ;; esac \\
+ && curl -fsSL --retry 3 -o /tmp/ps.tgz "https://github.com/PowerShell/PowerShell/releases/download/v$PS_VERSION/powershell-$PS_VERSION-linux-\$a.tar.gz" \\
+ && mkdir -p /opt/powershell && tar -xzf /tmp/ps.tgz -C /opt/powershell && chmod +x /opt/powershell/pwsh \\
+ && ln -s /opt/powershell/pwsh /usr/bin/pwsh && rm /tmp/ps.tgz
+DOCKERFILE
+fi
 # --- PowerShell 7 on Linux container: install.ps1 refuses (exit non-zero), installs nothing ---
-docker run --rm -v "$WORK/base:/rel:ro" mcr.microsoft.com/powershell pwsh -NoProfile -Command '
+docker run --rm -v "$WORK/base:/rel:ro" "$PWSH_IMAGE" pwsh -NoProfile -Command '
   & pwsh -NoProfile -File /rel/good/install.ps1
   if ($LASTEXITCODE -eq 0) { Write-Host "FAIL: install.ps1 exited 0"; exit 1 }
   if (Test-Path (Join-Path $HOME ".trimreaper")) { Write-Host "FAIL: left ~/.trimreaper"; exit 1 }
@@ -127,7 +141,7 @@ grep -q "macOS only" "$WORK/ps1.log" || { cat "$WORK/ps1.log"; fail "the ps1 ref
 cat "$WORK/ps1.log"
 
 # --- PSScriptAnalyzer when it installs quickly; otherwise skipped ---
-if docker run --rm -v "$WORK/base:/rel:ro" mcr.microsoft.com/powershell pwsh -NoProfile -Command '
+if docker run --rm -v "$WORK/base:/rel:ro" "$PWSH_IMAGE" pwsh -NoProfile -Command '
   Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -ErrorAction Stop
   $r = Invoke-ScriptAnalyzer -Path /rel/good/install.ps1
   if ($r) { $r | Format-Table | Out-String | Write-Host; exit 1 }
