@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `install.ps1` (the macOS-only refusal script) no longer sets `$ErrorActionPreference` at top level, so it cannot leave the user's PowerShell session in Stop mode when run with `irm | iex`.
+
 ## 0.19.1 (2026-11-11)
 
 - `install.sh` installs the wheel with `--no-index --no-deps`, so pip can never fetch anything from PyPI during an install
