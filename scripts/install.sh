@@ -6,7 +6,7 @@
 # private venv inside ~/.trimreaper, and puts `trimreaper` in ~/.local/bin. No sudo, no shell profile edits.
 # Re-running upgrades in place.
 # Environment: TRIMREAPER_HOME (install folder, default ~/.trimreaper), TRIMREAPER_BIN_DIR (default ~/.local/bin),
-# TRIMREAPER_VERSION (pin a release, e.g. 0.18.3), TRIMREAPER_RELEASE_BASE (override the download base, used by tests).
+# TRIMREAPER_VERSION (pin a release, e.g. 0.19.0), TRIMREAPER_RELEASE_BASE (override the download base, used by tests).
 set -eu
 
 REPO="michael-berardi/TrimReaper"

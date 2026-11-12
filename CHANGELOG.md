@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.19.0 (2026-11-11)
 
 - One-step installers. `scripts/install.sh` (macOS) downloads the release wheel, verifies its SHA-256 before
   anything is installed, and installs it into a private venv in `~/.trimreaper` with the `trimreaper` command in

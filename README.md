@@ -36,7 +36,7 @@ PowerShell 7 on Linux), each with one sentence naming that, and nothing is insta
 The macOS installer downloads the release wheel, checks its SHA-256 before anything is installed, and installs it
 into a private venv in `~/.trimreaper`. The `trimreaper` command goes to `~/.local/bin`; when that folder is not on
 your PATH the installer prints the one line to add. No sudo, no shell profile edits. Re-run the same line to
-upgrade; `TRIMREAPER_VERSION=0.18.3` pins a release. Installer overrides: `TRIMREAPER_HOME` (install folder) and
+upgrade; `TRIMREAPER_VERSION=0.19.0` pins a release. Installer overrides: `TRIMREAPER_HOME` (install folder) and
 `TRIMREAPER_BIN_DIR` (command folder), for the installer command only: TrimReaper itself reads `TRIMREAPER_HOME` at
 runtime as the folder it may clean. To remove it, delete `~/.trimreaper` and `~/.local/bin/trimreaper`.
 
@@ -47,7 +47,7 @@ installer names what is missing and stops.
 Manual route:
 
 ```sh
-pipx install "git+https://github.com/your-github-username/TrimReaper@v0.18.3"
+pipx install "git+https://github.com/your-github-username/TrimReaper@v0.19.0"
 trimreaper --version
 ```
 
