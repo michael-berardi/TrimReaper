@@ -6,7 +6,7 @@
 # private venv inside ~/.trimreaper, and puts `trimreaper` in ~/.local/bin. No sudo, no shell profile edits.
 # Re-running upgrades in place.
 # Environment: TRIMREAPER_HOME (install folder, default ~/.trimreaper), TRIMREAPER_BIN_DIR (default ~/.local/bin),
-# TRIMREAPER_VERSION (pin a release, e.g. 0.19.0), TRIMREAPER_RELEASE_BASE (override the download base, used by tests).
+# TRIMREAPER_VERSION (pin a release, e.g. 0.19.1), TRIMREAPER_RELEASE_BASE (override the download base, used by tests).
 set -eu
 
 REPO="michael-berardi/TrimReaper"
@@ -22,6 +22,7 @@ say() { printf '%s\n' "$*"; }
 die() { printf 'trimreaper install: %s\n' "$*" >&2; exit 1; }
 
 main() {
+MARKER="# trimreaper-installer: written by scripts/install.sh, safe to replace on upgrade"
 SYS=$(uname -s)
 [ "$SYS" = "Darwin" ] || die "TrimReaper supports macOS only (its scheduler needs launchd and its dedupe and compression need APFS), so nothing was installed on $SYS; on a Mac run this same script."
 
@@ -60,7 +61,7 @@ mkdir -p "$HOME_DIR" "$BIN_DIR" || die "cannot create $HOME_DIR or $BIN_DIR"
 NEW="$HOME_DIR/venv.new.$$"
 rm -rf "$NEW"
 python3 -m venv "$NEW" || die "cannot create the private venv (python3 -m venv failed); nothing was changed"
-"$NEW/bin/python" -m pip install --quiet --disable-pip-version-check --no-cache-dir "$TMP/$WHEEL" \
+"$NEW/bin/python" -m pip install --quiet --disable-pip-version-check --no-cache-dir --no-index --no-deps "$TMP/$WHEEL" \
   || { rm -rf "$NEW"; die "the wheel did not install into the venv; nothing was changed"; }
 # The venv is moved into place below, so the check runs it the way the shim will: bin/python -m trimreaper.
 got=$("$NEW/bin/python" -m trimreaper --version 2>&1 </dev/null) || { rm -rf "$NEW"; die "the installed tool does not run: $got"; }
@@ -75,8 +76,21 @@ fi
 rm -rf "$OLD"
 
 # The shim calls the venv's python directly (no console-script shebang), so the moved venv keeps working.
+# A `trimreaper` this installer did not write is never overwritten. Ours carries the marker line; a shim written by
+# 0.19.0 has no marker but execs the venv python in this tool home, which also counts as ours.
+if [ -e "$BIN_DIR/trimreaper" ] || [ -L "$BIN_DIR/trimreaper" ]; then
+  if [ -f "$BIN_DIR/trimreaper" ] && [ ! -L "$BIN_DIR/trimreaper" ] \
+     && { grep -qF "$MARKER" "$BIN_DIR/trimreaper" 2>/dev/null \
+          || grep -qxF "exec \"$HOME_DIR/venv/bin/python\" -m trimreaper \"\$@\"" "$BIN_DIR/trimreaper" 2>/dev/null; }; then
+    :
+  else
+    say "TrimReaper $VERSION is installed in $HOME_DIR, but $BIN_DIR/trimreaper is not ours, so it was left alone. Run it with: $HOME_DIR/venv/bin/python -m trimreaper"
+    return 0
+  fi
+fi
 cat > "$BIN_DIR/trimreaper.tmp.$$" <<SHIM
 #!/bin/sh
+$MARKER
 exec "$HOME_DIR/venv/bin/python" -m trimreaper "\$@"
 SHIM
 chmod 755 "$BIN_DIR/trimreaper.tmp.$$"

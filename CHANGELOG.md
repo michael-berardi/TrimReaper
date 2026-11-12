@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.19.1 (2026-11-11)
+
+- `install.sh` installs the wheel with `--no-index --no-deps`, so pip can never fetch anything from PyPI during an install
+  (the package has no dependencies). It also never overwrites a `trimreaper` in the bin folder that it did not write:
+  its shim now carries a marker line, and a shim written by 0.19.0 that points into the tool home counts as its own.
+  If another `trimreaper` is there, the install finishes and says the command was left alone.
+
 ## 0.19.0 (2026-11-11)
 
 - One-step installers. `scripts/install.sh` (macOS) downloads the release wheel, verifies its SHA-256 before

@@ -72,6 +72,27 @@ grep -q "checksum mismatch" "$WORK/bad.log" || { cat "$WORK/bad.log"; fail "no c
 [ ! -e "$TH/.local/bin/trimreaper" ] || fail "a corrupted install left a shim"
 say "ok: macOS corrupted wheel refused, nothing installed"
 
+# --- macOS: pip never reaches for an index or dependencies ---
+grep -q -- '--no-index --no-deps' scripts/install.sh || fail "install.sh pip install lacks --no-index --no-deps"
+say "ok: pip install uses --no-index --no-deps"
+
+# --- macOS: a trimreaper we did not write is never overwritten; our marker and a 0.19.0 shim are replaced ---
+TH="$WORK/home5"; mkdir -p "$TH/.local/bin"
+printf '#!/bin/sh\necho users-own-tool\n' > "$TH/.local/bin/trimreaper"; chmod 755 "$TH/.local/bin/trimreaper"
+HOME="$TH" TRIMREAPER_RELEASE_BASE="$GOOD" sh scripts/install.sh >"$WORK/own.log" 2>&1 \
+  || { cat "$WORK/own.log"; fail "install failed next to a foreign trimreaper"; }
+[ "$("$TH/.local/bin/trimreaper")" = "users-own-tool" ] || fail "a foreign trimreaper was overwritten"
+grep -q "left alone" "$WORK/own.log" || { cat "$WORK/own.log"; fail "the foreign trimreaper was not mentioned"; }
+rm "$TH/.local/bin/trimreaper"
+HOME="$TH" TRIMREAPER_RELEASE_BASE="$GOOD" sh scripts/install.sh >/dev/null 2>&1 || fail "fresh install failed"
+grep -q "trimreaper-installer" "$TH/.local/bin/trimreaper" || fail "the shim has no marker"
+printf '#!/bin/sh\nexec "%s/.trimreaper/venv/bin/python" -m trimreaper "$@"\n' "$TH" > "$TH/.local/bin/trimreaper"
+HOME="$TH" TRIMREAPER_RELEASE_BASE="$GOOD" sh scripts/install.sh >/dev/null 2>&1 || fail "upgrade over a 0.19.0 shim failed"
+grep -q "trimreaper-installer" "$TH/.local/bin/trimreaper" || fail "a 0.19.0 shim was not treated as ours"
+got=$(HOME="$TH" "$TH/.local/bin/trimreaper" --version) || fail "the upgraded command does not run"
+[ "$got" = "trimreaper $VERSION" ] || fail "version after shim upgrade is '$got'"
+say "ok: foreign trimreaper kept; marked and 0.19.0 shims upgraded"
+
 # --- macOS: a missing prerequisite is named (a PATH with no python3 at all) ---
 FARM="$WORK/farm"; mkdir -p "$FARM"
 for d in /usr/bin /bin; do
