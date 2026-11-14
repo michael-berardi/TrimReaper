@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.19.3 (2026-11-14)
+
+- `offload` with `keepFolder` no longer moves a subfolder while the kept folder is in use through a sibling that an earlier
+  pass already moved. That sibling is now a link; the scan used to skip it, and a process working inside it was seen at its
+  real path on the overflow volume, not under the kept folder. Links whose target is under the overflow root are now
+  checked for a working directory or open file too, and a link that cannot be resolved keeps the folder.
+- The kept folder is checked again just before the original is swapped for a link, so a sibling that changes during a long
+  copy stops the move (nothing is removed; the error names the cause).
+- One scan bound (time and entries) now covers all siblings of a kept folder instead of resetting for each, and siblings
+  the pass already measured as candidates are not walked twice. A bound hit still keeps.
+- A command line only counts as naming a folder at a path boundary: `.../J-00012/x` no longer holds `.../J-0001`.
+
 ## 0.19.2 (2026-11-14)
 
 - `offload` with `keepFolder` no longer moves a subfolder while its kept folder is active. A cold subfolder stays when a

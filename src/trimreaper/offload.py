@@ -166,49 +166,74 @@ def changed_entry(info: os.stat_result) -> float:
     return max(info.st_mtime, info.st_ctime)
 
 
-def recent_change(path: str, cutoff: float) -> tuple[float | None, bool]:
-    """(newest change time, complete) of a tree, stopping at the first change after `cutoff`; never follows links."""
-    start, entries, stack = time.time(), 0, [path]
+def recent_change(path: str, cutoff: float, scan: dict | None = None) -> tuple[float | None, bool]:
+    """(newest change time, complete) of a tree, stopping at the first change after `cutoff`; never follows links.
+    `scan` carries one clock and one entry count shared by every tree of a kept folder; a bound hit is incomplete."""
+    scan = scan if scan is not None else {}
+    scan.setdefault("start", time.time())
+    scan.setdefault("entries", 0)
+    stack = [path]
     while stack:
         current = stack.pop()
         try:
             info = os.lstat(current)
             if changed_entry(info) > cutoff:
                 return changed_entry(info), True
-            entries += 1
+            scan["entries"] += 1
             if stat.S_ISDIR(info.st_mode):
                 with os.scandir(current) as it:
                     stack.extend(entry.path for entry in it)
         except OSError:
             return None, False
-        if entries > WALK_ENTRIES or time.time() - start > WALK_SECONDS:
+        if scan["entries"] > WALK_ENTRIES or time.time() - scan["start"] > WALK_SECONDS:
             return None, False
     return None, True
 
 
-def parent_active(item: dict, quiet: float, table: dict, now: float) -> str | None:
+def parent_active(item: dict, quiet: float, table: dict, now: float, shared: dict | None = None) -> str | None:
     """With keepFolder the kept folder is used as a whole: a cold subfolder stays while a sibling changed within
-    `quiet` or a process has its cwd or a file open anywhere under the kept folder."""
+    `quiet` or a process has its cwd or a file open anywhere under the kept folder, including inside a sibling an earlier
+    pass moved to the overflow volume (now a link, whose process paths are the real ones there). `shared` holds one scan
+    budget and the sibling results for every item of the folder; None scans afresh."""
     parent = item.get("parent")
     if parent is None:
         return None
-    cache = item["siblings"]
+    shared = item["siblings"] if shared is None else shared
+    found, scan, peers = shared.setdefault("found", {}), shared.setdefault("scan", {}), shared.get("peers", {})
     try:
         names = sorted(os.listdir(parent))
     except OSError as error:
         return f"parent-active: unreadable {error.__class__.__name__}"
+    linked = []
     for name in names:
-        if name == item["path"].name or name.startswith(".offload-") or os.path.islink(parent / name):
+        if name == item["path"].name or name.startswith(".offload-"):
             continue
-        if name not in cache:
-            cache[name] = recent_change(str(parent / name), now - quiet)
-        newest, complete = cache[name]
+        if os.path.islink(parent / name):
+            linked.append(name)
+            continue
+        if name not in found:
+            seen = peers.get(name, {}).get("stats")
+            if seen and seen["complete"] and seen["newest"] <= now - quiet:
+                found[name] = (None, True)  # the pass already walked this sibling as a candidate
+            else:
+                found[name] = recent_change(str(parent / name), now - quiet, scan)
+        newest, complete = found[name]
         if newest is not None:
             return f"parent-active: {name} changed {max(0, int((now - newest) // 60))} min ago"
         if not complete:
             return f"parent-active: {name} scan incomplete"
+    watched = [str(parent)]
+    root = item.get("root")
+    for name in linked:
+        try:
+            target = os.path.realpath(parent / name, strict=True)
+        except OSError as error:
+            return f"parent-active: {name} link cannot be resolved ({error.__class__.__name__})"
+        if root is not None and core.reap_inside(target, os.path.realpath(root)):
+            watched.append(target)
     try:
-        core.reap_holders(str(parent), str(parent), table)
+        for place in watched:
+            core.reap_holders(place, place, table)
     except core.ReapRefused as refused:
         return f"parent-active: {refused}"
     return None
@@ -222,7 +247,7 @@ def candidates(cfg: dict) -> list[dict]:
         if base.is_symlink() or not base.is_dir():
             continue
         quiet = max(source.get("quietMinutes", 0), cfg["quietMinutes"]) * 60
-        common = {"quiet": quiet, "jobs": bool(source.get("jobs")), "minBytes": int(source.get("minMB", 0)) * 1024 * 1024}
+        common = {"quiet": quiet, "root": cfg["root"], "jobs": bool(source.get("jobs")), "minBytes": int(source.get("minMB", 0)) * 1024 * 1024}
         if not source.get("children"):
             items.append({"path": base, "owner": base.name, **common})
         elif not source.get("keepFolder"):
@@ -234,9 +259,11 @@ def candidates(cfg: dict) -> list[dict]:
                 if folder.is_symlink() or not folder.is_dir():
                     continue
                 heal_file_links(folder, cfg)
-                shared = {}
-                items += [{"path": p, "owner": folder.name, "parent": folder, "siblings": shared, **common}
-                          for p in sorted(folder.iterdir()) if p.is_dir() and not p.is_symlink()]
+                shared = {"peers": {}}
+                made = [{"path": p, "owner": folder.name, "parent": folder, "siblings": shared, **common}
+                        for p in sorted(folder.iterdir()) if p.is_dir() and not p.is_symlink()]
+                shared["peers"].update({m["path"].name: m for m in made})
+                items += made
     out = []
     for item in items:
         try:
@@ -306,6 +333,7 @@ def refusal(item: dict, stats: dict, table: dict, now: float, statuses: dict) ->
         return f"changed-within-{int(quiet // 60)}min"
     if stats["bytes"] < item["minBytes"]:
         return "below-minimum-size"
+    item["settled"] = quiet
     active = parent_active(item, quiet, table, now)
     if active:
         return active
@@ -350,6 +378,10 @@ def move_one(item: dict, dry_run: bool) -> dict:
     if tree_stats(path)["newest"] > item["stats"]["newest"]:
         shutil.rmtree(partial, ignore_errors=True)
         raise host.HostError(f"{path} changed during the copy; nothing was removed")
+    active = parent_active(item, item.get("settled", item["quiet"]), core.reap_process_table(), time.time(), {})
+    if active:  # the copy can take minutes: look at the kept folder again before the original is swapped
+        shutil.rmtree(partial, ignore_errors=True)
+        raise host.HostError(f"{path} was not moved, the kept folder became active during the copy ({active})")
     if dest.exists():
         shutil.rmtree(dest)
     os.rename(partial, dest)

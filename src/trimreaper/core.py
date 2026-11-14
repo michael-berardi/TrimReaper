@@ -1149,7 +1149,7 @@ def reap_holders(path: str, root: str, table: dict | None = None) -> None:
         if reap_inside(reap_fold(reap_private_alias(name)), folded):
             hits.append(f"{'cwd' if fd == 'cwd' else 'open-handle'}:{pid}({command})")
     for pid, command in table["commands"]:
-        if folded in reap_fold(command):
+        if re.search(re.escape(folded.rstrip("/")) + r"""(?=$|[/\s'"])""", reap_fold(command)):
             hits.append(f"command-line:{pid}({os.path.basename(command.split()[0]) if command.split() else '?'})")
     if hits:
         raise ReapRefused("in-use:" + ";".join(hits[:4]))
