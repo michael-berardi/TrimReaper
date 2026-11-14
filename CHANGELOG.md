@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.19.4 (2026-11-14)
+
+- The in-use check now sees a temp folder that a running process names by its short path. A process names its temp folder
+  the way it was given it (`/var/folders/...`, `/tmp/...`), and the check compared only the resolved `/private/...` form
+  against command lines, so a folder a live program still passed to its helper looked unused and the leftovers pass removed
+  it (2026-11-14: a terminal session's generated config folder; every restart of that session then failed at start). Both
+  spellings are looked for, and the match must start at a path boundary as well as end at one.
+
 ## 0.19.3 (2026-11-14)
 
 - `offload` with `keepFolder` no longer moves a subfolder while the kept folder is in use through a sibling that an earlier

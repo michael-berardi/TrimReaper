@@ -381,6 +381,21 @@ class HolderBoundaries(Base):
             with self.assertRaisesRegex(core.ReapRefused, "command-line:5"):
                 core.reap_holders(root, root, self.table(commands=[("5", command)]))
 
+    def test_command_line_naming_a_temp_folder_by_its_short_spelling_is_a_hit(self):
+        """A process names its temp folder as it was given it (/var/..., /tmp/...); the scan resolves to /private/...: both count."""
+        root = "/private/var/folders/ab/T/tool-AbC123"
+        with self.assertRaisesRegex(core.ReapRefused, "command-line:7"):
+            core.reap_holders(root, root, self.table(commands=[("7", "node tool --patch /var/folders/ab/T/tool-AbC123/overlay.yml")]))
+        with self.assertRaisesRegex(core.ReapRefused, "command-line:8"):
+            core.reap_holders("/tmp/work-9", "/tmp/work-9", self.table(commands=[("8", "node tool --dir=/private/tmp/work-9")]))
+        with self.assertRaisesRegex(core.ReapRefused, "command-line:9"):
+            core.reap_holders(root, root, self.table(commands=[("9", "node tool --patch=/private/var/folders/ab/T/tool-AbC123")]))
+
+    def test_command_line_match_starts_at_a_path_boundary(self):
+        root = "/private/var/folders/ab/T/tool-AbC123"
+        core.reap_holders(root, root, self.table(commands=[("5", "node tool /var/folders/ab/T/tool-AbC1234/overlay.yml"),
+                                                           ("6", "node tool /data/var/folders/ab/T/tool-AbC123/f")]))
+
     def test_cwd_and_open_files_match_whole_path_segments(self):
         root = "/jobs/J-0001"
         files = [("5", "zsh", "cwd", "/jobs/J-00012"), ("6", "vim", "3", "/jobs/J-0001-old/f"), ("7", "vim", "4", "/jobs/J-00010")]

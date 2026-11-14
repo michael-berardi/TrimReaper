@@ -1148,8 +1148,14 @@ def reap_holders(path: str, root: str, table: dict | None = None) -> None:
     for pid, command, fd, name in table["files"]:
         if reap_inside(reap_fold(reap_private_alias(name)), folded):
             hits.append(f"{'cwd' if fd == 'cwd' else 'open-handle'}:{pid}({command})")
+    # A command line names a temp folder the way the process was given it (`/var/folders/...`, `/tmp/...`), never the `/private`
+    # form this scan resolves to, so both spellings of the root are looked for. The match starts at a path boundary too, so
+    # `/var/x` is not found inside `/data/var/x` (and not a second time inside `/private/var/x`).
+    plain = folded.rstrip("/")
+    spellings = {plain, plain[len("/private"):] if plain.startswith("/private/") else reap_fold(reap_private_alias(plain))}
     for pid, command in table["commands"]:
-        if re.search(re.escape(folded.rstrip("/")) + r"""(?=$|[/\s'"])""", reap_fold(command)):
+        text = reap_fold(command)
+        if any(re.search(r"""(?:^|(?<=[\s='":]))""" + re.escape(spelling) + r"""(?=$|[/\s'",;:])""", text) for spelling in spellings):
             hits.append(f"command-line:{pid}({os.path.basename(command.split()[0]) if command.split() else '?'})")
     if hits:
         raise ReapRefused("in-use:" + ";".join(hits[:4]))
