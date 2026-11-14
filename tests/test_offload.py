@@ -143,9 +143,19 @@ class KeepFolder(Base):
         self.write_config({"offload": {"root": str(self.root), "minFreeGB": 0, "quietMinutes": 10 ** 6,
                                        "jobStatusCommand": ["python3", str(self.script)],
                                        "sources": [{"path": "~/jobs", "children": True, "jobs": True, "keepFolder": True}]}})
+        self.age_everything()
+        # ctime cannot be set back; the change test reads the mtime in the fixture
+        patch = mock.patch.object(offload, "changed_entry", side_effect=lambda info: info.st_mtime)
+        patch.start()
+        self.addCleanup(patch.stop)
 
     def fake_stats(self, path):
         return {"entries": 2, "bytes": 8192, "newest": self.quiet_since, "complete": True}
+
+    def age_everything(self):
+        past = time.time() - 3600
+        for path in [self.base, *self.base.rglob("*")]:
+            os.utime(path, (past, past), follow_symlinks=False)
 
     def test_job_folder_stays_a_real_directory(self):
         out = offload.offload_pass(everything=True)
@@ -185,3 +195,56 @@ class KeepFolder(Base):
         self.assertEqual(len(out["returned"]), 2)
         self.assertFalse((self.base / "J-0001" / "wt").is_symlink())
         self.assertEqual(offload.status()["offloaded"], 0)
+
+
+class ParentActive(KeepFolder):
+    def setUp(self):
+        super().setUp()
+        self.no_holders = mock.patch.object(offload.core, "reap_holders", return_value=None)
+
+    def fake_stats(self, path):
+        newest = max(p.lstat().st_mtime for p in [Path(path), *Path(path).rglob("*")])
+        return {"entries": 2, "bytes": 8192, "newest": newest, "complete": True}
+
+    def moved_and_kept(self):
+        with self.no_holders:
+            out = offload.offload_pass(everything=True)
+        return out, {k["path"]: k["why"] for k in out["kept"]}
+
+    def test_cold_subfolder_beside_recent_sibling_is_kept_with_cause(self):
+        recent = time.time() - 120
+        os.utime(self.base / "J-0001" / "notes" / "f", (recent, recent))
+        out, kept = self.moved_and_kept()
+        self.assertEqual(out["errors"], [])
+        self.assertFalse((self.base / "J-0001" / "wt").is_symlink())
+        self.assertRegex(kept[str(self.base / "J-0001" / "wt")], r"^parent-active: notes changed [12] min ago$")
+        self.assertFalse((self.base / "J-0001" / "notes").is_symlink())
+
+    def test_recent_loose_file_sibling_keeps_it(self):
+        (self.base / "J-0001" / "coordination.jsonl").write_text("new")
+        os.utime(self.base / "J-0001" / "coordination.jsonl", None)
+        _, kept = self.moved_and_kept()
+        self.assertIn("parent-active: coordination.jsonl changed 0 min ago", kept[str(self.base / "J-0001" / "wt")])
+
+    def test_fully_quiet_parent_still_moves(self):
+        out, _ = self.moved_and_kept()
+        self.assertEqual(out["errors"], [])
+        self.assertTrue((self.base / "J-0001" / "wt").is_symlink())
+        self.assertTrue((self.base / "J-0001" / "notes").is_symlink())
+
+    def test_process_cwd_under_the_parent_keeps_it(self):
+        from trimreaper import core
+        parent = str(self.base / "J-0001")
+        def holders(path, root, table=None):
+            if root == parent:
+                raise core.ReapRefused("in-use:cwd:42(zsh)")
+        with mock.patch.object(offload.core, "reap_holders", side_effect=holders):
+            out = offload.offload_pass(everything=True)
+        kept = {k["path"]: k["why"] for k in out["kept"]}
+        self.assertEqual(kept[str(self.base / "J-0001" / "wt")], "parent-active: in-use:cwd:42(zsh)")
+        self.assertFalse((self.base / "J-0001" / "wt").is_symlink())
+
+    def test_plain_children_source_has_no_parent_check(self):
+        self.write_config({"offload": {"root": str(self.root), "minFreeGB": 0, "quietMinutes": 1,
+                                       "sources": [{"path": "~/jobs", "children": True}]}})
+        self.assertTrue(all("parent" not in item for item in offload.candidates(offload.settings())))

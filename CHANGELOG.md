@@ -1,7 +1,13 @@
 # Changelog
 
-## Unreleased
+## 0.19.2 (2026-11-14)
 
+- `offload` with `keepFolder` no longer moves a subfolder while its kept folder is active. A cold subfolder stays when a
+  sibling entry in the kept folder changed within the quiet time (the scan stops at the first recent change), or when a
+  process has its working directory or a file open under the kept folder. `kept` names the cause, e.g.
+  `parent-active: wt changed 12 min ago`, so `offload status` and `--dry-run` explain it. Before, a release folder whose
+  `wt` was being built could lose its sibling checkout to a symlink and the packaging step refused it.
+  Sources without `keepFolder` behave as before.
 - `install.ps1` (the macOS-only refusal script) no longer sets `$ErrorActionPreference` at top level, so it cannot leave the user's PowerShell session in Stop mode when run with `irm | iex`.
 
 ## 0.19.1 (2026-11-11)

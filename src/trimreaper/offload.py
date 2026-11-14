@@ -16,7 +16,8 @@ Configuration (config.json, key `offload`):
      "jobStatusCommand": ["/path/to/tool", "list-jobs"],
      "sources": [{"path": "~/.cache/jobs", "children": true, "jobs": true}]}
 `children: true` moves each direct child separately; otherwise the source folder itself moves. `keepFolder: true` (with
-`children`) keeps every child a real directory holding real files and moves only that child's subfolders, so a tool that
+`children`) keeps every child a real directory holding real files and moves only that child's subfolders (and none of them while a sibling in that child changed within the quiet time or a process
+has its working directory or a file open under it: `parent-active` in `kept`), so a tool that
 refuses symlinks (a job store reading `J-0042/coordination.jsonl`) still works; links made by an earlier version are split
 or copied back the same way. `jobs: true` reads a job
 number (J-0042) from each child's name and asks `jobStatusCommand`, which prints JSON: {"J-0042": "done"} or
@@ -161,6 +162,58 @@ def tree_stats(path: Path) -> dict:
     return {"entries": entries, "bytes": size, "newest": newest, "complete": complete}
 
 
+def changed_entry(info: os.stat_result) -> float:
+    return max(info.st_mtime, info.st_ctime)
+
+
+def recent_change(path: str, cutoff: float) -> tuple[float | None, bool]:
+    """(newest change time, complete) of a tree, stopping at the first change after `cutoff`; never follows links."""
+    start, entries, stack = time.time(), 0, [path]
+    while stack:
+        current = stack.pop()
+        try:
+            info = os.lstat(current)
+            if changed_entry(info) > cutoff:
+                return changed_entry(info), True
+            entries += 1
+            if stat.S_ISDIR(info.st_mode):
+                with os.scandir(current) as it:
+                    stack.extend(entry.path for entry in it)
+        except OSError:
+            return None, False
+        if entries > WALK_ENTRIES or time.time() - start > WALK_SECONDS:
+            return None, False
+    return None, True
+
+
+def parent_active(item: dict, quiet: float, table: dict, now: float) -> str | None:
+    """With keepFolder the kept folder is used as a whole: a cold subfolder stays while a sibling changed within
+    `quiet` or a process has its cwd or a file open anywhere under the kept folder."""
+    parent = item.get("parent")
+    if parent is None:
+        return None
+    cache = item["siblings"]
+    try:
+        names = sorted(os.listdir(parent))
+    except OSError as error:
+        return f"parent-active: unreadable {error.__class__.__name__}"
+    for name in names:
+        if name == item["path"].name or name.startswith(".offload-") or os.path.islink(parent / name):
+            continue
+        if name not in cache:
+            cache[name] = recent_change(str(parent / name), now - quiet)
+        newest, complete = cache[name]
+        if newest is not None:
+            return f"parent-active: {name} changed {max(0, int((now - newest) // 60))} min ago"
+        if not complete:
+            return f"parent-active: {name} scan incomplete"
+    try:
+        core.reap_holders(str(parent), str(parent), table)
+    except core.ReapRefused as refused:
+        return f"parent-active: {refused}"
+    return None
+
+
 def candidates(cfg: dict) -> list[dict]:
     home = host.reap_home()
     items = []
@@ -181,7 +234,9 @@ def candidates(cfg: dict) -> list[dict]:
                 if folder.is_symlink() or not folder.is_dir():
                     continue
                 heal_file_links(folder, cfg)
-                items += [{"path": p, "owner": folder.name, **common} for p in sorted(folder.iterdir()) if p.is_dir() and not p.is_symlink()]
+                shared = {}
+                items += [{"path": p, "owner": folder.name, "parent": folder, "siblings": shared, **common}
+                          for p in sorted(folder.iterdir()) if p.is_dir() and not p.is_symlink()]
     out = []
     for item in items:
         try:
@@ -251,6 +306,9 @@ def refusal(item: dict, stats: dict, table: dict, now: float, statuses: dict) ->
         return f"changed-within-{int(quiet // 60)}min"
     if stats["bytes"] < item["minBytes"]:
         return "below-minimum-size"
+    active = parent_active(item, quiet, table, now)
+    if active:
+        return active
     try:
         core.reap_holders(str(path), str(path), table)
     except core.ReapRefused as refused:
