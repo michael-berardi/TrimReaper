@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+from unittest.mock import patch
 from pathlib import Path
 
 from helpers import Home
@@ -76,6 +77,25 @@ class Server(Home):
                            {"jsonrpc": "2.0", "id": 3, "method": "ping"})
         self.assertEqual([r["error"]["code"] for r in replies[:3]], [-32602, -32602, -32600])
         self.assertEqual(replies[3], {"jsonrpc": "2.0", "id": 3, "result": {}})
+
+    def test_falsey_non_object_params_and_arguments_are_rejected(self):
+        for value in (None, False, 0, "", []):
+            with self.subTest(value=value), patch.object(mcp, "call") as call:
+                replies = self.rpc(
+                    {"jsonrpc": "2.0", "id": 1, "method": "ping", "params": value},
+                    {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                     "params": {"name": "clean", "arguments": value}},
+                    {"jsonrpc": "2.0", "id": 3, "method": "ping"})
+                self.assertEqual([r.get("error", {}).get("code") for r in replies[:2]], [-32602, -32602])
+                call.assert_not_called()
+                self.assertEqual(replies[2]["result"], {})
+
+    def test_omitted_arguments_still_use_defaults(self):
+        with patch.object(mcp, "call", return_value={}) as call:
+            reply = self.rpc({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                              "params": {"name": "job_list"}})[0]
+            self.assertFalse(reply["result"]["isError"])
+            call.assert_called_once_with("job_list", {})
 
     def test_the_cli_serves_it_over_stdio(self):
         src = str(Path(mcp.__file__).parents[1])

@@ -58,8 +58,7 @@ finishes, in case it is resumed. A **build queue** is any tool that takes a per-
 
 ## The escalation ladder and the steady pass
 
-`trimreaper clean` stops at its low watermark. When the routine rules cannot reach it, `clean_pass` climbs six rungs (README, "the
-escalation ladder"), re-planning with each rung's windows, and stops at the first rung that reaches the goal. The rungs change
+`trimreaper clean` stops at its low watermark. When the routine rules cannot reach it, `clean_pass` climbs six rungs ([cleanup reference](USAGE.md#when-the-routine-rules-are-not-enough-the-escalation-ladder)), re-planning with each rung's windows, and stops at the first rung that reaches the goal. The rungs change
 **windows** (how long a repository, a worktree or a finished job has been quiet) and, for regenerable output only, which git
 proofs are needed (`ignored` and `untracked`, not `clean`, `pushed` and a stash-free repository, because output git ignores and
 tracks nothing of is not unsaved work). They never change what protects work or secrets. On every rung:
@@ -88,7 +87,8 @@ pin ends: a done, failed or cancelled job never pins, and while a rung runs an i
 `cleanEscalatePinnedHours` after a verified interruption clock; a parked, blocked, queued, approved or running job always does.
 
 The steady pass (`cleanSteady*`) is the same machinery with one rung: repository output idle three days and job artifacts finished
-two days, and nothing else: no tool cleaner, no worktree, no temp folder.
+two days. It also runs deduplication, configured log compression and tagged-cache cleanup in the job cache,
+agent scratch and user temp folder. It does not run tool cleaners or remove worktrees or ordinary temp folders.
 
 **Refused removals.** A folder the filesystem will not release is kept with its cause and remembered for a day (`meta` keys
 `clean:refused:*`, dropped when stale), unless it becomes a different object. Before removal, an agent-leftover folder holding an

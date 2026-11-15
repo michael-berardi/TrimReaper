@@ -151,7 +151,7 @@ def handle(message: dict) -> dict | None:
         return {"jsonrpc": "2.0", "id": ident, "result": value}
     def failure(code, text):
         return {"jsonrpc": "2.0", "id": ident, "error": {"code": code, "message": text}}
-    params = message.get("params") or {}
+    params = message.get("params", {})
     if not isinstance(params, dict):
         return failure(-32602, "params must be an object")
     if method == "initialize":
@@ -167,7 +167,7 @@ def handle(message: dict) -> dict | None:
     if method == "tools/list":
         return answer({"tools": TOOLS})
     if method == "tools/call":
-        name, args = params.get("name"), params.get("arguments") or {}
+        name, args = params.get("name"), params.get("arguments", {})
         if not isinstance(name, str) or name not in {tool["name"] for tool in TOOLS}:
             return failure(-32602, f"unknown tool: {name}")
         if not isinstance(args, dict):
