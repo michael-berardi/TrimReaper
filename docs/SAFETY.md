@@ -372,3 +372,34 @@ deleted by hand, is not released automatically, so that history stays in the mai
 (`refs/trimreaper/thin/<archive-id>`) is removed by hand. A mirror push publishes these refs; exclude `refs/trimreaper/*` from
 mirrors. A clean, pushed linked worktree is removed only while its main repository is idle (no index lock, rebase, merge,
 cherry-pick, revert, bisect or sequencer state), so its worktree entry is always forgotten with it.
+
+## Offload: a folder in use stays on the internal disk (0.19.8)
+
+`offload` moves a cold folder to an external drive and leaves a symlink. "Cold" used to mean three things: no job that
+owns it is live, nothing inside changed for `quietMinutes`, and no process has it open right now. A release has pauses
+longer than that: on 2026-11-15 a release's worktree, its build folders and its finished artifacts moved to the drive an
+hour after its tests passed, and the packaging step that came next refused to build from another volume. A pause is not
+the end of the work, so the folder itself is now read for signs of work, with no marker for anyone to remember:
+
+- **Git work in progress** (`git-dirty`, `git-unpushed`). Every git repository or worktree inside the folder (up to 50)
+  is checked with the cleaner's fenced git probes, which take no locks and never rewrite the index. It stays if it has
+  uncommitted or untracked changes (ignored build output does not count), if its checked-out branch has commits its
+  upstream lacks, or if that branch has no upstream on a remote (never pushed, or its remote branch was deleted). A detached
+  HEAD stays unless a remote holds it. A repository whose state cannot be proved (a git error, unsafe metadata) stays
+  too: `git-dirty:unproven:<cause>`. A clean, fully pushed worktree may still move.
+- **Recent reads** (`read-within-Nmin`). A file read within the quiet time counts as use, not only one written. This
+  needs the volume to record access times: TrimReaper reads the volume's mount options and trusts access times unless it
+  is mounted `noatime`. Where it cannot, only changes count, as before, and every moved and kept entry says so
+  (`reads: not-recorded: ...`). macOS records a read only when the file was written since its last recorded read, so
+  this catches the first read of fresh output (a packaging step picking up built files), not every repeated read. Reads
+  inside `.git` are ignored, because TrimReaper's own git probes make them. With `keepFolder`, a recent read in a sibling
+  keeps the subfolder too (`parent-active: <sibling> read <n> min ago`).
+- **Release artifacts** (`release-artifacts:<names>`). A folder that reads as a release workspace and holds built output
+  awaiting publication does not move, and with `keepFolder` none of its subfolders moves either. A folder reads as a
+  release workspace when its name matches `releaseNamePattern` (default: starts with `rel` or `release` followed by a
+  separator or digit, or looks like `v1.2`) or when it holds a `releaseMarkers` entry (default `wt`, a worktree). Built
+  output is a non-empty `releaseArtifacts` child (default `out`, `dist`, `release`, `unz`), or one already moved. An
+  `out` folder on its own, in a folder that is not a release workspace, is not protected. All three settings are lists or
+  patterns in the `offload` configuration, not paths in the code; `releaseArtifacts: []` turns the rule off.
+
+The checks run in that order after the job and quiet-time checks, and the first one that applies is the reason in `kept`.

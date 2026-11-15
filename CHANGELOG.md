@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.19.8 (2026-11-15)
+
+- Offload no longer moves a folder that is in use for work. An hour without writes and no process holding the folder
+  open counted as idle, so a pause between two steps of a release was enough: a release's worktree, its build folders and
+  its artifacts awaiting publication moved to the external drive after its tests passed, and the next step refused to build
+  from another volume. The folder is now read for signs of work, with no marker to remember. A git repository or worktree
+  inside it with uncommitted changes, unpushed commits on its branch, or a branch with no remote upstream stays
+  (`git-dirty`, `git-unpushed`). A file read within the quiet time counts as use where the volume records access times
+  (`read-within-<n>min`). Where it does not, the receipt says only changes counted. A release workspace holding built
+  output (`out`, `dist`, `release`, `unz`) stays with all its subfolders (`release-artifacts`); the names are
+  configurable (`releaseArtifacts`, `releaseMarkers`, `releaseNamePattern`). A clean, fully pushed, idle worktree still moves.
+
 ## 0.19.7 (2026-11-15)
 
 - Browser builds that an installed Playwright still needs are kept. When two projects on different Playwright versions

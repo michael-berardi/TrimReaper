@@ -187,6 +187,26 @@ git checkout ut-archive/<n>   # manifest.json: repositories[].bundle.refs maps e
 tar -xzf <archive>/files.tar.gz
 ```
 
+## Moving cold folders to an external drive (offload)
+
+`trimreaper offload run` moves cold folders from the configured sources to an external drive and leaves a symlink, so
+every path still works; `trimreaper offload restore <path>` brings one back and `--dry-run` only plans. A folder moves
+only when nothing is using it. Each folder that stays is listed under `kept` with its reason:
+
+| Reason | Why the folder stayed |
+|---|---|
+| `job-live:<job>` / `job-unknown:<job>` | its job is still running, or the job list does not know it |
+| `changed-within-<n>min` | something inside was written within the quiet time |
+| `read-within-<n>min` | something inside was read within the quiet time (only where the drive records reads; otherwise the entry carries `reads: not-recorded: ...`) |
+| `git-dirty:<detail>` | a git repository or worktree inside has uncommitted or untracked changes, or its state cannot be proved |
+| `git-unpushed:<detail>` | its checked-out branch has commits the upstream lacks, or has no upstream on a remote |
+| `release-artifacts:<names>` | a release workspace holding built output (`out`, `dist`, `release`, `unz`) waiting to be published |
+| `parent-active: ...` | with `keepFolder`: another entry in the same folder is in use |
+| `in-use:...` | a process has it open |
+
+A clean, fully pushed, idle worktree still moves. See [docs/SAFETY.md](SAFETY.md#offload-a-folder-in-use-stays-on-the-internal-disk-0198)
+for the details and [docs/CONFIGURATION.md](CONFIGURATION.md) for `releaseArtifacts`, `releaseMarkers` and `releaseNamePattern`.
+
 ## Receipts and one owner at a time
 
 Each removal writes a plan record before it starts and a result record after it ends, to

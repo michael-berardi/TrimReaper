@@ -8,6 +8,8 @@ from helpers import Home
 from trimreaper import core, host, offload
 
 PRODUCTION_CHANGED = offload.changed_entry  # KeepFolder patches the module name; the real rule is kept here
+REAL_TREE_STATS = offload.tree_stats  # Base patches the module name; InUse walks for real
+REAL_READS = getattr(offload, "reads_recorded", None)  # InUse patches the module name
 
 
 class Base(Home):
@@ -365,6 +367,168 @@ class ParentActive(KeepFolder):
         self.assertFalse((self.base / "J-0001" / "wt").is_symlink())
         self.assertTrue(any("kept folder became active during the copy" in e and "coordination.jsonl changed" in e for e in out["errors"]), out["errors"])
         self.assertEqual(list((self.base / "J-0001").glob(".offload-*")), [])
+
+
+class InUse(Base):
+    """A folder in use for work stays even after an hour of quiet: work in progress in git, a recent read, release artifacts.
+    A clean, pushed, idle worktree still moves."""
+    def setUp(self):
+        super().setUp()
+        self.app = self.clone("app")
+        self.base = self.home / "scratch"
+        self.rel = self.base / "rel-0001"
+        self.rel.mkdir(parents=True)
+        self.wt = self.rel / "wt"
+        self.git(self.app, "worktree", "add", "-q", "-b", "rel-1", str(self.wt))
+        self.git(self.wt, "push", "-q", "-u", "origin", "rel-1")
+        self.put(self.wt, "target/big.bin")  # ignored build output: not work in progress
+        self.config({})
+        # ctime cannot be set back; the walk reads the mtime as the change time in the fixture
+        patch = mock.patch.object(offload, "changed_entry", side_effect=lambda info: info.st_mtime)
+        patch.start()
+        self.addCleanup(patch.stop)
+        reads = mock.patch.object(offload, "reads_recorded", return_value=None, create=True)
+        reads.start()
+        self.addCleanup(reads.stop)
+
+    def config(self, extra):
+        self.write_config({"offload": {"root": str(self.root), "minFreeGB": 0, "quietMinutes": 60, **extra,
+                                       "sources": [{"path": "~/scratch", "children": True, "keepFolder": True}]}})
+
+    def fake_stats(self, path):
+        stats = REAL_TREE_STATS(path)
+        stats["newest"] = max(p.lstat().st_mtime for p in [Path(path), *Path(path).rglob("*")])
+        return stats
+
+    def run_pass(self):
+        self.age(self.base, 1)
+        with mock.patch.object(offload.core, "reap_holders", return_value=None):
+            out = offload.offload_pass(everything=True)
+        return out, {Path(k["path"]).relative_to(self.base).as_posix(): k["why"] for k in out["kept"]}
+
+    def test_clean_pushed_idle_worktree_still_moves(self):
+        out, kept = self.run_pass()
+        self.assertEqual(out["errors"], [])
+        self.assertEqual(kept, {})
+        self.assertTrue(self.wt.is_symlink())
+        self.assertEqual((self.wt / "README.md").read_text(), "hello\n")
+
+    def test_uncommitted_change_keeps_the_worktree(self):
+        (self.wt / "README.md").write_text("half done\n")
+        out, kept = self.run_pass()
+        self.assertFalse(self.wt.is_symlink())
+        self.assertEqual(kept["rel-0001/wt"], "git-dirty:M")
+
+    def test_untracked_file_keeps_the_worktree(self):
+        self.put(self.wt, "notes/new.txt")
+        _, kept = self.run_pass()
+        self.assertFalse(self.wt.is_symlink())
+        self.assertTrue(kept["rel-0001/wt"].startswith("git-dirty:"), kept)
+
+    def test_unpushed_commit_keeps_the_worktree(self):
+        (self.wt / "VERSION").write_text("1.2.3\n")
+        self.git(self.wt, "add", "VERSION")
+        self.git(self.wt, "commit", "-q", "-m", "bump")
+        _, kept = self.run_pass()
+        self.assertFalse(self.wt.is_symlink())
+        self.assertEqual(kept["rel-0001/wt"], "git-unpushed:1:rel-1")
+
+    def test_branch_without_upstream_keeps_the_worktree(self):
+        self.git(self.wt, "checkout", "-q", "-b", "local-only")
+        _, kept = self.run_pass()
+        self.assertFalse(self.wt.is_symlink())
+        self.assertEqual(kept["rel-0001/wt"], "git-unpushed:no-upstream:local-only")
+
+    def test_branch_whose_upstream_was_deleted_keeps_the_worktree(self):
+        self.git(self.wt, "push", "-q", "origin", "--delete", "rel-1")
+        self.git(self.wt, "fetch", "-q", "--prune", "origin")
+        _, kept = self.run_pass()
+        self.assertFalse(self.wt.is_symlink())
+        self.assertEqual(kept["rel-0001/wt"], "git-unpushed:no-upstream:rel-1")
+
+    def test_repository_nested_in_a_moving_folder_is_checked(self):
+        self.write_config({"offload": {"root": str(self.root), "minFreeGB": 0, "quietMinutes": 60,
+                                       "sources": [{"path": "~/scratch", "children": True}]}})
+        (self.wt / "README.md").write_text("half done\n")
+        _, kept = self.run_pass()
+        self.assertFalse(self.rel.is_symlink())
+        self.assertEqual(kept["rel-0001"], "git-dirty:M (wt)")
+
+    def pass_after_read(self, path):
+        self.age(self.base, 1)
+        os.utime(path, (time.time() - 120, time.time() - 86400))  # read two minutes ago, last written a day ago
+        with mock.patch.object(offload.core, "reap_holders", return_value=None):
+            out = offload.offload_pass(everything=True)
+        return out, {Path(k["path"]).relative_to(self.base).as_posix(): k["why"] for k in out["kept"]}
+
+    def test_file_read_within_the_quiet_time_keeps_the_folder(self):
+        _, kept = self.pass_after_read(self.wt / "README.md")
+        self.assertFalse(self.wt.is_symlink())
+        self.assertEqual(kept["rel-0001/wt"], "read-within-60min")
+
+    def test_volume_without_access_times_falls_back_and_says_so(self):
+        with mock.patch.object(offload, "reads_recorded", return_value="the volume is mounted noatime", create=True):
+            out, _ = self.pass_after_read(self.wt / "README.md")
+        self.assertTrue(self.wt.is_symlink())
+        self.assertEqual(out["moved"][0].get("reads"), "not-recorded: the volume is mounted noatime; only changes count as use")
+
+    def test_sibling_read_within_the_quiet_time_keeps_the_kept_folder(self):
+        notes = self.put(self.rel, "notes/log.txt")
+        _, kept = self.pass_after_read(notes)
+        self.assertFalse(self.wt.is_symlink())
+        self.assertRegex(kept["rel-0001/wt"], r"^parent-active: notes read [12] min ago$")
+        self.assertEqual(kept["rel-0001/notes"], "read-within-60min")
+
+    def test_release_artifacts_keep_the_release_folder(self):
+        self.put(self.rel, "out/app-1.2.3.dmg")
+        self.put(self.rel, "unz/App/bin")
+        self.put(self.rel, "crate/lib.rs")
+        out, kept = self.run_pass()
+        self.assertEqual(out["moved"], [])
+        self.assertEqual(kept, {name: "release-artifacts:out,unz" for name in ("rel-0001/wt", "rel-0001/out", "rel-0001/unz", "rel-0001/crate")})
+
+    def test_artifacts_beside_a_worktree_keep_a_folder_of_any_name(self):
+        other = self.base / "build-7"
+        self.put(other, "wt/a")
+        self.put(other, "dist/pkg.tar")
+        _, kept = self.run_pass()
+        self.assertEqual(kept["build-7/dist"], "release-artifacts:dist")
+        self.assertFalse((other / "dist").is_symlink())
+
+    def test_artifact_name_alone_does_not_hold_an_unrelated_folder(self):
+        self.put(self.base / "misc", "out/x")
+        self.put(self.rel, "out")  # an empty folder holds nothing: a file named like an artifact is not one
+        out, kept = self.run_pass()
+        self.assertEqual(kept, {})
+        self.assertTrue((self.base / "misc" / "out").is_symlink())
+
+    def test_release_artifact_rule_is_configured(self):
+        self.put(self.rel, "out/app.dmg")
+        self.put(self.rel, "pkg/app.pkg")
+        self.config({"releaseArtifacts": ["pkg"]})
+        _, kept = self.run_pass()
+        self.assertEqual(kept["rel-0001/wt"], "release-artifacts:pkg")
+        self.config({"releaseArtifacts": []})
+        out, kept = self.run_pass()
+        self.assertEqual(kept, {})
+        self.assertTrue(self.wt.is_symlink())
+
+    def test_bad_release_settings_are_named(self):
+        self.config({"releaseNamePattern": "("})
+        with self.assertRaisesRegex(host.HostError, "releaseNamePattern"):
+            host.config()
+        self.config({"releaseArtifacts": "out"})
+        with self.assertRaisesRegex(host.HostError, "releaseArtifacts"):
+            host.config()
+
+    def test_mount_options_decide_whether_reads_are_recorded(self):
+        self.assertIsNotNone(REAL_READS, "offload has no access-time check")
+        for options, verdict in (({"apfs", "local"}, None), ({"apfs", "noatime"}, "the volume is mounted noatime"), (None, "unknown (no mount entry for the volume)")):
+            offload._MOUNTS.clear()
+            table = [("/nonexistent-volume", {"noatime"})] + ([(str(self.tmp), options)] if options is not None else [])
+            with mock.patch.object(offload, "mount_table", return_value=table):
+                self.assertEqual(REAL_READS(self.tmp / "home"), verdict)
+        offload._MOUNTS.clear()
 
 
 class HolderBoundaries(Base):

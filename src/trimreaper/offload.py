@@ -8,6 +8,15 @@ There is no fixed age. A folder is judged by whether anything is using it:
   - a folder of a finished job (done, failed, cancelled) moves as soon as no process has it open;
   - a folder of a job that is still live never moves, and a moved one is copied back once its job is live again;
   - any other folder moves when no process has it open and nothing in it changed for `quietMinutes`.
+Whatever its job says, a folder in use for work stays, judged from the folder itself and not from a marker someone must
+remember to leave:
+  - a git repository or worktree inside it with uncommitted changes (`git-dirty`), or whose checked-out branch has commits
+    its upstream lacks or has no upstream on a remote (`git-unpushed`); a clean, fully pushed one may move;
+  - a file inside it that was read within the quiet time (`read-within-Nmin`), where the volume records access times;
+    where it does not, only changes count and the receipt says so (`reads`);
+  - release artifacts: a folder named like a release (`releaseNamePattern`) or holding a `releaseMarkers` entry (`wt`)
+    that holds a non-empty `releaseArtifacts` child (`out`, `dist`, `release`, `unz`): neither it nor, with keepFolder,
+    any of its children moves (`release-artifacts`).
 The biggest qualifying folders go first, and the pass stops once the disk is back under `cleanToPercent`
 (`--all` ignores that goal and moves everything that qualifies).
 
@@ -48,12 +57,22 @@ README = ("This folder is TrimReaper's overflow: cold folders moved off the Mac'
           "Bring one back with `trimreaper offload restore <original path>`.\n")
 
 
+RELEASE_ARTIFACTS = ["out", "dist", "release", "unz"]  # children holding built release output awaiting publication
+RELEASE_MARKERS = ["wt"]  # a sibling that marks a folder as a release workspace (its worktree)
+RELEASE_NAME = r"(?i)^(rel|release)([-_.\d]|$)|^v\d+\.\d+"  # folder names that read as a release
+MAX_REPOS = 50  # more git repositories than this inside one folder cannot all be proved idle in a pass: it stays
+SETTING_KEYS = {"root", "minFreeGB", "quietMinutes", "jobStatusCommand", "sources", "releaseArtifacts", "releaseMarkers", "releaseNamePattern"}
+
+
 def settings() -> dict | None:
     cfg = host.config().get("offload")
     if not cfg:
         return None
     return {"root": host.expand(cfg["root"]), "minFreeGB": cfg.get("minFreeGB", 20), "quietMinutes": cfg.get("quietMinutes", 60),
-            "jobStatusCommand": cfg.get("jobStatusCommand"), "sources": cfg.get("sources", [])}
+            "jobStatusCommand": cfg.get("jobStatusCommand"), "sources": cfg.get("sources", []),
+            "release": {"artifacts": [n.lower() for n in cfg.get("releaseArtifacts", RELEASE_ARTIFACTS)],
+                        "markers": [n.lower() for n in cfg.get("releaseMarkers", RELEASE_MARKERS)],
+                        "pattern": re.compile(cfg.get("releaseNamePattern", RELEASE_NAME))}}
 
 
 def job_statuses(cfg: dict) -> dict:
@@ -87,8 +106,18 @@ def job_of(name: str) -> str | None:
 
 def check(cfg: dict, path: Path) -> None:
     """Config shape, named failures."""
-    if not isinstance(cfg, dict) or set(cfg) - {"root", "minFreeGB", "quietMinutes", "jobStatusCommand", "sources"}:
-        raise host.HostError(f"{path}: offload takes root, minFreeGB, quietMinutes, jobStatusCommand and sources only")
+    if not isinstance(cfg, dict) or set(cfg) - SETTING_KEYS:
+        raise host.HostError(f"{path}: offload takes root, minFreeGB, quietMinutes, jobStatusCommand, sources, releaseArtifacts, "
+                             "releaseMarkers and releaseNamePattern only")
+    for key in ("releaseArtifacts", "releaseMarkers"):
+        names = cfg.get(key, [])
+        if not isinstance(names, list) or not all(isinstance(n, str) and n and "/" not in n for n in names):
+            raise host.HostError(f"{path}: offload.{key} must be a list of folder names")
+    pattern = cfg.get("releaseNamePattern", RELEASE_NAME)
+    try:
+        re.compile(pattern)
+    except (re.error, TypeError) as error:
+        raise host.HostError(f"{path}: offload.releaseNamePattern must be a regular expression ({error})")
     command = cfg.get("jobStatusCommand")
     if command is not None and (not isinstance(command, list) or not command or not all(isinstance(c, str) for c in command)):
         raise host.HostError(f"{path}: offload.jobStatusCommand must be a command as a list of strings")
@@ -140,54 +169,181 @@ def volume_ready(root: Path) -> str | None:
 
 
 def tree_stats(path: Path) -> dict:
-    """Entries, bytes and newest change (mtime/ctime) of a tree; never follows links. `complete` False when a bound hit."""
-    start, entries, size, newest = time.time(), 0, 0, 0.0
-    stack, complete = [str(path)], True
+    """Entries, bytes, newest change (mtime/ctime), newest read (atime of a regular file outside `.git` metadata, which
+    this tool's own git probes read) and the git repositories (folders holding a `.git` entry) of a tree; never follows
+    links. `complete` False when a bound hit."""
+    start, entries, size, newest, read = time.time(), 0, 0, 0.0, 0.0
+    stack, complete, repos = [(str(path), False)], True, []
     while stack:
-        current = stack.pop()
+        current, metadata = stack.pop()
         try:
             info = os.lstat(current)
-            newest = max(newest, info.st_mtime, info.st_ctime)
+            newest = max(newest, changed_entry(info))
             entries += 1
             if stat.S_ISREG(info.st_mode):
                 size += info.st_blocks * 512
+                if not metadata:
+                    read = max(read, info.st_atime)
             elif stat.S_ISDIR(info.st_mode):
                 with os.scandir(current) as it:
-                    stack.extend(entry.path for entry in it)
+                    for entry in it:
+                        git = core.reap_is_git(entry.name)
+                        if git and not metadata:
+                            repos.append(current)
+                        stack.append((entry.path, metadata or git))
         except OSError:
             complete = False
         if entries > WALK_ENTRIES or time.time() - start > WALK_SECONDS:
             complete = False
             break
-    return {"entries": entries, "bytes": size, "newest": newest, "complete": complete}
+    return {"entries": entries, "bytes": size, "newest": newest, "read": read, "repos": repos, "complete": complete}
 
 
 def changed_entry(info: os.stat_result) -> float:
     return max(info.st_mtime, info.st_ctime)
 
 
-def recent_change(path: str, cutoff: float, scan: dict | None = None) -> tuple[float | None, bool]:
+def recent_change(path: str, cutoff: float, scan: dict | None = None, reads: bool = False) -> tuple[float | None, bool]:
     """(newest change time, complete) of a tree, stopping at the first change after `cutoff`; never follows links.
-    `scan` carries one clock and one entry count shared by every tree of a kept folder; a bound hit is incomplete."""
+    With `reads`, a read (atime) of a regular file outside `.git` metadata after `cutoff` counts too and comes back
+    negative (-time), so the caller can name it. `scan` carries one clock and one entry count shared by every tree of a
+    kept folder; a bound hit is incomplete."""
     scan = scan if scan is not None else {}
     scan.setdefault("start", time.time())
     scan.setdefault("entries", 0)
-    stack = [path]
+    stack = [(path, False)]
     while stack:
-        current = stack.pop()
+        current, metadata = stack.pop()
         try:
             info = os.lstat(current)
             if changed_entry(info) > cutoff:
                 return changed_entry(info), True
+            if reads and not metadata and stat.S_ISREG(info.st_mode) and info.st_atime > cutoff:
+                return -info.st_atime, True
             scan["entries"] += 1
             if stat.S_ISDIR(info.st_mode):
                 with os.scandir(current) as it:
-                    stack.extend(entry.path for entry in it)
+                    stack.extend((entry.path, metadata or core.reap_is_git(entry.name)) for entry in it)
         except OSError:
             return None, False
         if scan["entries"] > WALK_ENTRIES or time.time() - scan["start"] > WALK_SECONDS:
             return None, False
     return None, True
+
+
+_MOUNTS: dict = {}
+
+
+def mount_table() -> list[tuple[str, set]]:
+    """(mount point, options) of every mounted volume, from `mount`; empty when it cannot be read."""
+    try:
+        result = subprocess.run(["mount"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    rows = []
+    for line in result.stdout.splitlines() if result.returncode == 0 else []:
+        match = re.match(r"^.+? on (.+?) (?:type \S+ )?\(([^()]*)\)$", line)
+        if match:
+            rows.append((match.group(1), {o.strip().lower() for o in match.group(2).split(",")}))
+    return rows
+
+
+def reads_recorded(path: Path) -> str | None:
+    """None when the volume holding `path` records file access times, else why not. Read from the mount options of the
+    volume with the same device (`noatime` turns them off; macOS APFS otherwise records the first read after each write)."""
+    try:
+        device = os.lstat(path).st_dev
+    except OSError as error:
+        return f"unknown ({error.__class__.__name__})"
+    if device not in _MOUNTS:
+        verdict = "unknown (no mount entry for the volume)"
+        for point, options in mount_table():
+            try:
+                if os.stat(point).st_dev != device:
+                    continue
+            except OSError:
+                continue
+            verdict = "the volume is mounted noatime" if "noatime" in options else None
+            break
+        _MOUNTS[device] = verdict
+    return _MOUNTS[device]
+
+
+def git_in_use(repo: str) -> str | None:
+    """None when a repository or worktree is clean with its checked-out branch fully on its remote upstream; else
+    `git-dirty:...` (uncommitted changes, or cleanliness that cannot be proved) or `git-unpushed:...`. Uses the
+    cleaner's fenced git probes (core.reap_git*), which never take optional locks or rewrite the index."""
+    try:
+        with core.reap_git_session(repo):
+            code, out = core.reap_git_clean_closed(repo, protected_ok=True)
+            if code:
+                return f"git-dirty:unproven:status-exit-{code}"
+            if out.strip():
+                return "git-dirty:" + ",".join(sorted({line[:2].strip() or "?" for line in out.splitlines()}))
+            code, branch = core.reap_git(repo, "symbolic-ref", "-q", "HEAD")
+            if code == 0:
+                name = branch.strip().removeprefix("refs/heads/")
+                code, upstream = core.reap_git(repo, "rev-parse", "--symbolic-full-name", f"{name}@{{upstream}}")
+                upstream = upstream.strip()
+                if code != 0 or not upstream.startswith("refs/remotes/"):
+                    return f"git-unpushed:no-upstream:{name}"
+                code, ahead = core.reap_git(repo, "rev-list", "--count", "HEAD", "--not", upstream)
+                if code != 0 or not ahead.strip().isdigit():
+                    return f"git-unpushed:unproven:rev-list-exit-{code}"
+                if int(ahead):
+                    return f"git-unpushed:{int(ahead)}:{name}"
+            code, ahead = core.reap_git(repo, "rev-list", "--count", "HEAD", "--not", "--remotes")
+            if code != 0 or not ahead.strip().isdigit():
+                return f"git-unpushed:unproven:rev-list-exit-{code}"
+            if int(ahead):
+                return f"git-unpushed:{int(ahead)}:detached"
+    except core.ReapRefused as refused:
+        return f"git-dirty:unproven:{refused}"
+    return None
+
+
+def git_refusal(path: Path, stats: dict) -> str | None:
+    """The first repository at or under `path` that is work in progress, named with its place in the folder."""
+    repos = stats.get("repos")
+    if repos is None:  # stats from elsewhere: look for repositories now
+        repos = [str(path)] if os.path.lexists(path / ".git") else []
+    if len(repos) > MAX_REPOS:
+        return f"git-dirty:unproven:{len(repos)}-repositories"
+    for repo in sorted(repos):
+        why = git_in_use(repo)
+        if why:
+            place = os.path.relpath(repo, path)
+            return why if place == "." else f"{why} ({place})"
+    return None
+
+
+def release_refusal(folder: Path, rules: dict | None) -> str | None:
+    """`release-artifacts:<names>` when `folder` reads as a release workspace (its name matches the pattern, or it holds a
+    marker such as `wt`) and holds a non-empty artifact child (`out`, `dist`, `release`, `unz`) or one already moved."""
+    if not rules or not rules["artifacts"]:
+        return None
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return None
+    folded = {name.lower(): name for name in names}
+    held = []
+    for key in rules["artifacts"]:
+        child = folder / folded[key] if key in folded else None
+        if child is None:
+            continue
+        try:
+            if child.is_symlink():
+                held.append(folded[key])
+            elif child.is_dir():
+                with os.scandir(child) as it:
+                    if any(True for _ in it):
+                        held.append(folded[key])
+        except OSError:
+            held.append(folded[key])
+    if held and (rules["pattern"].search(folder.name) or any(m in folded for m in rules["markers"])):
+        return "release-artifacts:" + ",".join(sorted(held))
+    return None
 
 
 def parent_active(item: dict, quiet: float, table: dict, now: float, shared: dict | None = None) -> str | None:
@@ -204,7 +360,7 @@ def parent_active(item: dict, quiet: float, table: dict, now: float, shared: dic
         names = sorted(os.listdir(parent))
     except OSError as error:
         return f"parent-active: unreadable {error.__class__.__name__}"
-    linked = []
+    linked, reads = [], item.get("reads") == "recorded"
     for name in names:
         if name == item["path"].name or name.startswith(".offload-"):
             continue
@@ -213,11 +369,13 @@ def parent_active(item: dict, quiet: float, table: dict, now: float, shared: dic
             continue
         if name not in found:
             seen = peers.get(name, {}).get("stats")
-            if seen and seen["complete"] and seen["newest"] <= now - quiet:
+            if seen and seen["complete"] and seen["newest"] <= now - quiet and (not reads or seen.get("read", 0) <= now - quiet):
                 found[name] = (None, True)  # the pass already walked this sibling as a candidate
             else:
-                found[name] = recent_change(str(parent / name), now - quiet, scan)
+                found[name] = recent_change(str(parent / name), now - quiet, scan, reads)
         newest, complete = found[name]
+        if newest is not None and newest < 0:
+            return f"parent-active: {name} read {max(0, int((now + newest) // 60))} min ago"
         if newest is not None:
             return f"parent-active: {name} changed {max(0, int((now - newest) // 60))} min ago"
         if not complete:
@@ -247,7 +405,8 @@ def candidates(cfg: dict) -> list[dict]:
         if base.is_symlink() or not base.is_dir():
             continue
         quiet = max(source.get("quietMinutes", 0), cfg["quietMinutes"]) * 60
-        common = {"quiet": quiet, "root": cfg["root"], "jobs": bool(source.get("jobs")), "minBytes": int(source.get("minMB", 0)) * 1024 * 1024}
+        common = {"quiet": quiet, "root": cfg["root"], "jobs": bool(source.get("jobs")), "minBytes": int(source.get("minMB", 0)) * 1024 * 1024,
+                  "release": cfg.get("release")}
         if not source.get("children"):
             items.append({"path": base, "owner": base.name, **common})
         elif not source.get("keepFolder"):
@@ -320,6 +479,10 @@ def refusal(item: dict, stats: dict, table: dict, now: float, statuses: dict) ->
         return "not-a-folder"
     if core.reap_protected(path.name):
         return "protected"
+    for folder in ([item["parent"]] if item.get("parent") is not None else []) + [path]:
+        held = release_refusal(folder, item.get("release"))
+        if held:
+            return held
     if not stats["complete"]:
         return "walk-incomplete"
     job = job_of(item["owner"]) if item["jobs"] else None
@@ -331,8 +494,13 @@ def refusal(item: dict, stats: dict, table: dict, now: float, statuses: dict) ->
     quiet = SETTLE_SECONDS if state in FINISHED else item["quiet"]
     if now - stats["newest"] < quiet:
         return f"changed-within-{int(quiet // 60)}min"
+    if item.get("reads") == "recorded" and now - stats.get("read", 0) < quiet:
+        return f"read-within-{int(quiet // 60)}min"
     if stats["bytes"] < item["minBytes"]:
         return "below-minimum-size"
+    in_use = git_refusal(path, stats)
+    if in_use:
+        return in_use
     item["settled"] = quiet
     active = parent_active(item, quiet, table, now)
     if active:
@@ -368,9 +536,9 @@ def signature(path: Path) -> list:
 def move_one(item: dict, dry_run: bool) -> dict:
     path, dest = item["path"], item["dest"]
     if dry_run:
-        return {"path": str(path), "to": str(dest), "bytes": item["bytes"], "moved": False}
+        return {"path": str(path), "to": str(dest), "bytes": item["bytes"], "moved": False, "reads": item.get("reads")}
     partial = dest.parent / f".offload-{dest.name}.partial"
-    core.reap_receipt({"kind": "offload-plan", "path": str(path), "to": str(dest), "bytes": item["bytes"]})
+    core.reap_receipt({"kind": "offload-plan", "path": str(path), "to": str(dest), "bytes": item["bytes"], "reads": item.get("reads")})
     copy_tree(path, partial)
     if signature(path) != signature(partial):
         shutil.rmtree(partial, ignore_errors=True)
@@ -389,8 +557,8 @@ def move_one(item: dict, dry_run: bool) -> dict:
     os.rename(path, holding)
     os.symlink(dest, path)
     shutil.rmtree(holding)
-    core.reap_receipt({"kind": "offload-done", "path": str(path), "to": str(dest), "bytes": item["bytes"]})
-    return {"path": str(path), "to": str(dest), "bytes": item["bytes"], "moved": True}
+    core.reap_receipt({"kind": "offload-done", "path": str(path), "to": str(dest), "bytes": item["bytes"], "reads": item.get("reads")})
+    return {"path": str(path), "to": str(dest), "bytes": item["bytes"], "moved": True, "reads": item.get("reads")}
 
 
 def offload_pass(dry_run: bool = False, limit_bytes: int | None = None, only: str | None = None, everything: bool = False) -> dict:
@@ -421,14 +589,20 @@ def offload_pass(dry_run: bool = False, limit_bytes: int | None = None, only: st
     for item in items:
         if only and str(item["path"]) != str(Path(only)):
             continue
-        item["stats"] = tree_stats(item["path"]) if item["path"].is_dir() and not item["path"].is_symlink() else {"complete": True, "newest": now, "bytes": 0, "entries": 0}
+        real = item["path"].is_dir() and not item["path"].is_symlink()
+        item["stats"] = tree_stats(item["path"]) if real else {"complete": True, "newest": now, "bytes": 0, "entries": 0}
         item["bytes"] = item["stats"]["bytes"]
+        off = reads_recorded(item["path"]) if real else None
+        item["reads"] = "recorded" if off is None else f"not-recorded: {off}; only changes count as use"
         sized.append(item)
     for item in sorted(sized, key=lambda i: -i["bytes"]):
         why = refusal(item, item["stats"], table, now, statuses)
         if why:
             if why != "already-offloaded":
-                kept.append({"path": str(item["path"]), "why": why, "bytes": item["bytes"]})
+                entry = {"path": str(item["path"]), "why": why, "bytes": item["bytes"]}
+                if item["reads"] != "recorded":
+                    entry["reads"] = item["reads"]  # the quiet judgement could not see reads on this volume
+                kept.append(entry)
             continue
         if free - planned_bytes - item["bytes"] < floor:
             kept.append({"path": str(item["path"]), "why": "overflow-volume-would-drop-below-minFreeGB", "bytes": item["bytes"]})
