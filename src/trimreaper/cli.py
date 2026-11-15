@@ -178,8 +178,15 @@ def cmd_clean(args) -> dict:
         policy["cleanAtPercent"] = args.clean_at_percent
     if getattr(args, "clean_to_percent", None) is not None:
         policy["cleanToPercent"] = args.clean_to_percent
-    return clean.clean_pass(args.dry_run, args.deep, only, report=not args.no_report, policy=policy,
-                            escalate=False if getattr(args, "no_escalate", False) else None, steady=bool(getattr(args, "steady", False)))
+    out = clean.clean_pass(args.dry_run, args.deep, only, report=not args.no_report, policy=policy,
+                           escalate=False if getattr(args, "no_escalate", False) else None, steady=bool(getattr(args, "steady", False)))
+    if getattr(args, "trim_vm", False):   # the guided VM steps run only when asked for, and only for a VM that was stopped
+        if args.dry_run:
+            out["vmTrim"] = clean.clean_vm_trim(True)
+        else:
+            with core.reap_cleanup_owner("clean"):
+                out["vmTrim"] = clean.clean_vm_trim(False)
+    return out
 
 
 def cmd_offload(args) -> dict:
@@ -384,6 +391,8 @@ def parser() -> argparse.ArgumentParser:
     tidy.add_argument("--clean-to-percent", "--low-watermark", type=float, help="stop at this measured occupancy (default 60)")
     tidy.add_argument("--no-escalate", action="store_true", help="routine rules only: do not climb the ladder when the goal is unmet")
     tidy.add_argument("--steady", action="store_true", help="the quiet pass: only long-idle repository output and old finished-job artifacts, whatever the disk level")
+    tidy.add_argument("--trim-vm", action="store_true", help="also run the guided steps that shrink a stopped Colima VM's disk file "
+                      "(start, prune unused images, volumes and build cache, fstrim, stop)")
     tidy.set_defaults(func=cmd_clean)
 
     move = sub.add_parser("offload", help="move cold folders to the external overflow volume (config key `offload`), leaving symlinks")

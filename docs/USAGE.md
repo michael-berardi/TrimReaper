@@ -14,6 +14,7 @@ trimreaper clean --deep      # also the Go module cache, unused Docker images an
 trimreaper clean --high-watermark 75 --low-watermark 60
 trimreaper clean --no-escalate   # the routine rules only, never the ladder
 trimreaper clean --steady        # the quiet pass: long-idle repository output and old finished-job artifacts, whatever the disk level
+trimreaper clean --trim-vm       # also shrink a stopped Colima VM's disk file (the guided steps in the report)
 ```
 
 | What | How |
@@ -29,6 +30,12 @@ trimreaper clean --steady        # the quiet pass: long-idle repository output a
 | Browser code-sign clones (macOS) | A browser copies its app bundle into your per-user `X` folder at every launch and removes it on quit; a killed browser (automation, a crash) leaves one behind each time. Each abandoned copy goes after an hour when no process has it open |
 | Go module cache, unused Docker images, unavailable simulators | Only with `--deep` (`xcrun simctl delete unavailable` also deletes the app data of simulators the selected Xcode cannot run) |
 | Superseded Playwright browser builds | Older builds only, when a newer build of the same browser is installed, no installed Playwright still needs the old one, it is at least an hour old and no process uses it |
+| Old releases of self-updating tools (`cli-releases`) | Side-by-side releases in `~/.local/share/<tool>/releases/<version>/` (or `$XDG_DATA_HOME`). The newest `cliReleasesKeep` (3) versions stay, by semantic version order, and so does every version that a process uses (working directory, open file, command line), that a link points into (the tool's own `current`, a command in `~/.local/bin` or Homebrew's `bin`, a Homebrew Cellar link), or that a settings file or wrapper names as `<tool>/releases/<version>`. Settings are read in `~/.<name>` and `~/.config/<name>` for the tool's name and each name after one of its hyphens (`acme-cli` also reads `~/.cli`), two levels deep, settings-like files only, never `.env*` and never backups (`*.bak`, `*.orig`, `*.before-*`). A settings file that cannot be read keeps every version. A release changed within the hour stays. Folders that are not versions are never touched |
+| Build output in coordinator jobs (`coordinator-outputs`) | Rust `target` and `*-target`, `node_modules`, `dist` and `.cloudflare` inside `coordinatorRoots/J-NNNN/` (default `~/.cache/ut-coordinator`), up to eight levels down. The job's status comes from `coordinatorJobCommand <job>` (default `ut-coordinator job-get`, JSON): `done`, `failed` or `cancelled` once the output is an hour unchanged; `parked` or `blocked` only when the job reported nothing for 24 hours and its project is untouched as long. Any other status, or no answer, keeps it. Never inside `notes`, `reports`, `evidence` or `handoffs`. Each folder must be what its name says: a target Cargo wrote, or a `node_modules`, `dist` or `.cloudflare` beside its manifest (`package.json`, a Wrangler file), and a `dist` without a release artifact. In a git checkout git must ignore it and track nothing in it; a checkout whose git link is broken still allows only these names. Nothing may hold the project |
+| Release scratch (`release-scratch`) | In each `rel-*` folder of `releaseScratchRoots` (default `~/.cache/agent-scratch`): the `src-tauri/target` of a release worktree whose HEAD is on `origin/main` (git ignores the target and tracks nothing in it), `unz` folders, and staged `out*` folders except the newest two across all release folders (links are never followed). Each must be an hour unchanged, carry no retention marker, and nothing may use its release folder |
+| Temp build caches (`temp-build-caches`) | Node's `node-compile-cache` version folders, `*-publish-check.*` and `oss-leaks-*` folders in the shared and per-user temp folders, once an hour unchanged and unused |
+| uv, npm and cargo-xwin caches over a size | `uv cache prune` as before, but `uv cache clean` once the cache is 2 GB or more; npm's cache is left alone under 256 MB; `cargo-xwin`'s downloaded SDK (`~/Library/Caches/cargo-xwin`, `~/.cache/cargo-xwin` or `$XWIN_CACHE_DIR`) goes folder by folder once it is 512 MB or more. Each only while its tool is not running |
+| A Colima VM's disk file | Reported with its occupied size and the steps that shrink it (`trimSuggested` from 4 GB). `trimreaper clean --trim-vm` runs them only for a VM that is stopped: `colima start`, then inside the VM `docker image prune -a -f`, `docker volume prune -a -f` (unused volumes and their data), `docker builder prune -a -f` and `sudo fstrim -v /mnt/lima-colima` (the step that returns the freed blocks to the Mac), then `colima stop`, whatever a step returned. A running VM is never touched |
 | Local models (Hugging Face, Ollama, LM Studio), Docker's disk image, local snapshots | Reported with their size. Never removed |
 
 Worktrees are found through `git worktree list` in every repository in `cloneBases`, and in the folders where agent tools
@@ -37,6 +44,8 @@ keep their own: `~/.codex/worktrees` (or `$CODEX_HOME/worktrees`), `~/.cursor/wo
 `<repo>/.claude/worktrees` sit inside the repository and are found through it. `worktreeHomes` replaces the list.
 
 Cleanup sizes candidates, tries the largest first and stops when measured occupancy reaches the low watermark.
+`byRule` lists, for each rule, how many candidates it found and their size (`candidateBytes`) and what it kept, so
+`trimreaper clean --dry-run` shows what each rule would reclaim.
 `goalMet` and `remainingBytes` report the actual result; unknown disk measurements produce `null`, not success.
 Protected or active data may prevent reaching the goal. Missing or unreadable candidates are skipped with a named reason;
 independent candidates continue. A folder the filesystem refuses to release (an ACL that denies delete, immutable flags, another

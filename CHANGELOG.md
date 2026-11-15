@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.20.0 (2026-11-15)
+
+- New clean targets for space that had to be reclaimed by hand (a disk at 88% brought to 70%). Each goes through the guarded
+  removal and its own proofs; `clean --dry-run` lists what each rule would reclaim in `byRule`.
+  - `cli-releases`: side-by-side releases of self-updating tools in `~/.local/share/<tool>/releases/<version>/`. The newest
+    three stay (`cliReleasesKeep`), and so does every version a process uses (working directory, open file, command line),
+    a link points into (the tool's `current`, a bin folder's command, a Homebrew Cellar keg) or a settings file or wrapper
+    names. A settings file that cannot be read keeps every version.
+  - `coordinator-outputs`: Rust `target`/`*-target`, `node_modules`, `dist` and `.cloudflare` inside coordinator job folders
+    (`coordinatorRoots`, default `~/.cache/ut-coordinator`), once the job is done, failed or cancelled (asked through
+    `coordinatorJobCommand`, default `ut-coordinator job-get`), or parked or blocked and untouched for 24 hours. Never notes,
+    reports, evidence, handoffs or sources; in a git checkout only folders git ignores and tracks nothing of.
+  - `release-scratch`: in `rel-*` release folders (`releaseScratchRoots`, default `~/.cache/agent-scratch`), the
+    `src-tauri/target` of a release worktree whose HEAD is on `origin/main`, `unz` folders and staged `out*` folders but
+    the newest two, when nothing uses the release folder.
+  - `temp-build-caches`: `node-compile-cache` (was a day, now an hour), `*-publish-check.*` and `oss-leaks-*` in the temp
+    folders after an hour unused. They are no longer part of `agent-leftovers`.
+- Package caches have size thresholds: `uv cache clean` from 2 GB (the routine `uv cache prune` below), npm's cache is left
+  alone under 256 MB, and the new `cargo-xwin` target removes cargo-xwin's downloaded SDK from 512 MB. Each only while its
+  tool is not running.
+- The report lists each Colima VM's disk file with its occupied size and the steps that shrink it. `clean --trim-vm` runs
+  them for a VM that was stopped: start, prune unused images, volumes and build cache, `fstrim` the data disk inside the VM
+  (the step that returns the space to the Mac), stop. A running VM is never touched.
+
 ## 0.19.8 (2026-11-15)
 
 - Offload no longer moves a folder that is in use for work. An hour without writes and no process holding the folder

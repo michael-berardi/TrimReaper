@@ -107,6 +107,13 @@ DEFAULT_POLICY = {
     # The budget one agent-scratch folder's idle walk may spend: how many entries it may list, how many bytes it may see
     # and how long it may take. A folder that outgrows its budget is kept, and the receipt names the budget the walk spent.
     # A byte budget of 0 is no byte bound at all: bytes bound no work, so the entry budget is what limits the walk.
+    # Reclaim rules (clean targets cli-releases, coordinator-outputs, release-scratch): how many side-by-side releases of a
+    # self-updating tool stay (0 = the rule is off), where coordinator job folders live and how to ask a job's status, and
+    # where release scratch folders (rel-*) live. Folders are relative to home unless absolute or ~-prefixed.
+    "cliReleasesKeep": 3,
+    "coordinatorRoots": ["~/.cache/ut-coordinator"],
+    "coordinatorJobCommand": ["ut-coordinator", "job-get"],
+    "releaseScratchRoots": ["~/.cache/agent-scratch"],
     "agentScratchIdleMaxEntries": 200000,
     "agentScratchIdleMaxBytes": 0,
     "agentScratchIdleMaxSeconds": 10,
@@ -234,6 +241,15 @@ def check_policy(policy: dict) -> None:
         value = merged[key]
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             raise HostError(f"policy {key} must be a whole number of days (0 = never), not {json.dumps(value)}")
+    value = merged["cliReleasesKeep"]
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise HostError(f"policy cliReleasesKeep must be a whole number (0 = off), not {json.dumps(value)}")
+    for key in ("coordinatorRoots", "releaseScratchRoots"):
+        if not isinstance(merged[key], list) or not all(isinstance(r, str) and r.strip() for r in merged[key]):
+            raise HostError(f"policy {key} must be a list of folder paths, not {json.dumps(merged[key])}")
+    value = merged["coordinatorJobCommand"]
+    if not isinstance(value, list) or not value or not all(isinstance(part, str) and part for part in value):
+        raise HostError(f"policy coordinatorJobCommand must be a command as a non-empty list of strings, not {json.dumps(value)}")
     value = merged["agentScratchIdleMaxEntries"]
     if not isinstance(value, int) or isinstance(value, bool) or value < 1:
         raise HostError(f"policy agentScratchIdleMaxEntries must be a whole number of at least 1, not {json.dumps(value)}")

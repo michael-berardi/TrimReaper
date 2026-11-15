@@ -158,16 +158,22 @@ class Debris(Home):
         old = self.put(self.sessions, "session-old/nested/log").parent.parent
         recent = self.put(self.sessions, "session-recent/nested/log").parent.parent
         paths = [self.put(self.buildtmp, name + "/data").parent for name in
-                 ("app-verify-abc", "ultraterm-release.123", "ultraterm-publish-check.123", "app-rust-target-123")]
+                 ("app-verify-abc", "ultraterm-release.123", "app-rust-target-123")]
+        publish = self.put(self.buildtmp, "app-publish-check.123/data").parent   # temp-build-caches' own since 0.20.0
         unrelated = self.put(self.buildtmp, "unrelated/data").parent
         for path in [old, recent, unrelated, *paths]:
             self.age(path, 1)
         os.utime(recent / "nested/log", None)
+        self.age(publish, 1)
         planned = self.run_target("agent-leftovers", True)
-        self.assertEqual(planned["summary"]["candidates"], 5, planned)
+        self.assertEqual(planned["summary"]["candidates"], 4, planned)
+        self.assertNotIn("app-publish-check.123", [os.path.basename(i["path"]) for i in planned["items"]])
         self.assertTrue(old.exists())
         out = self.run_target("agent-leftovers")
-        self.assertEqual(out["summary"]["done"], 5, out)
+        self.assertEqual(out["summary"]["done"], 4, out)
+        self.assertTrue(publish.exists())
+        self.assertEqual(self.run_target("temp-build-caches")["summary"]["done"], 1)
+        self.assertFalse(publish.exists())
         self.assertFalse(old.exists())
         self.assertTrue(recent.exists())
         self.assertTrue(unrelated.exists())
@@ -179,10 +185,11 @@ class Debris(Home):
         fresh = self.put(cache, "v2/data").parent
         self.age(old, 2)
         os.utime(cache, None)
+        self.assertEqual(self.run_target("agent-leftovers", True)["items"], [])   # temp-build-caches' own since 0.20.0
         with mock.patch.object(clean, "reap_process_table", return_value={"files": [("123", "node", "7r", str(old / "data"))], "commands": []}):
-            self.run_target("agent-leftovers")
+            self.run_target("temp-build-caches")
         self.assertTrue(old.exists())
-        self.run_target("agent-leftovers")
+        self.run_target("temp-build-caches")
         self.assertFalse(old.exists())
         self.assertTrue(fresh.exists())
         self.assertTrue(cache.exists())

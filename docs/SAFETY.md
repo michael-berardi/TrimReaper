@@ -403,3 +403,36 @@ the end of the work, so the folder itself is now read for signs of work, with no
   patterns in the `offload` configuration, not paths in the code; `releaseArtifacts: []` turns the rule off.
 
 The checks run in that order after the job and quiet-time checks, and the first one that applies is the reason in `kept`.
+
+## Reclaim rules (0.20.0)
+
+On 2026-11-15 a disk at 88% came down to 70% by hand, from space no rule reached: 54 side-by-side releases of one
+self-updating tool, build output in finished coordinator jobs, release scratch, temp build caches, package caches and a VM
+disk file. Each now has a rule. All of them go through the guarded removal of `trimreaper clean` (fence, plan and result
+receipts, a last look with fresh probes) and keep a folder at the first proof that fails:
+
+- **`cli-releases`.** Only folders named as a semantic version directly in `<tool>/releases/`. The newest `cliReleasesKeep`
+  stay without being looked at. Every other version stays while a process has its working directory or an open file in it
+  or names it on a command line, while a link resolves into it (the tool's `current`, a bin folder's command, a Homebrew
+  Cellar keg), or while a settings file or wrapper names `<tool>/releases/<version>`. The search reads only small
+  settings-like files and never opens `.env*`. A file or folder it cannot read, or more than 5000 entries, keeps every
+  version (`references-unproved`). A version changed within the hour, carrying a retention marker or holding a protected
+  name stays. The last look ranks the versions and searches the references again.
+- **`coordinator-outputs`.** Only the names `target`, `*-target`, `node_modules`, `dist` and `.cloudflare`, never in or
+  below `notes`, `reports`, `evidence` or `handoffs`, and only when the folder is what its name says (a target Cargo wrote,
+  a manifest beside the others, no release artifact in `dist`). The job's own status decides: finished (`done`, `failed`,
+  `cancelled`) and an hour quiet, or `parked`/`blocked` with no job activity, no project change and no output change for
+  24 hours. Everything else, an unknown job and a command that fails keep it (`job-status-unknown`). In a git checkout git
+  must ignore the folder and track nothing in it. A checkout whose git link is broken (its repository is gone) falls back
+  to the name and manifest proofs alone. A process holding anything in the project keeps it.
+- **`release-scratch`.** A release worktree's `src-tauri/target` goes only when the worktree's HEAD is an ancestor of
+  `origin/main` (else `origin/master`; neither keeps it), git ignores the target and tracks nothing in it, and Cargo wrote
+  it. `unz` folders, and staged `out*` folders other than the newest two across all release folders, go after an hour
+  unchanged. Links are never followed or removed. A process using anything in the release folder keeps all of it.
+- **`temp-build-caches`.** Fixed names only, in the two temp folders, owned by this user, an hour unchanged, unused.
+- **Package caches.** Run by their own tools, only while the tool is not running, and only above a size: `uv cache clean`
+  from 2 GB (below it the routine `uv cache prune`), npm from 256 MB, cargo-xwin's folder from 512 MB.
+- **VM disk.** Reported, never touched by a pass. `--trim-vm` runs the guided steps only for a Colima VM that Colima
+  reports `Stopped` and whose host agent is not running, starts it, prunes, trims and stops it again even when a step
+  fails, and records the exit codes and the disk file's size before and after in a receipt. `docker volume prune -a`
+  deletes unused volumes with their data; run the flag only when that is acceptable.

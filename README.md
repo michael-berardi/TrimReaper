@@ -19,7 +19,7 @@ curl -fsSL https://github.com/michael-berardi/TrimReaper/releases/latest/downloa
 
 The installer verifies the release wheel's SHA-256, installs into `~/.trimreaper`, and
 puts the command in `~/.local/bin`. It needs no sudo and changes no shell profiles.
-Follow its PATH hint if needed. Re-run to upgrade; set `TRIMREAPER_VERSION=0.19.8` on the
+Follow its PATH hint if needed. Re-run to upgrade; set `TRIMREAPER_VERSION=0.20.0` on the
 installer process to pin a release. Linux and Windows are not supported.
 
 Installer overrides: `TRIMREAPER_HOME` (install directory) and `TRIMREAPER_BIN_DIR`

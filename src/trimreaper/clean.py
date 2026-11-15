@@ -147,11 +147,13 @@ def clean_cargo_roots() -> list[str]:
 
 # A tool cache is cleaned by its own tool. `busy`: process names that keep it as it is. `deep` runs only when asked for.
 CLEAN_TOOLS = (
-    {"name": "npm", "argv": ["npm", "cache", "clean", "--force"], "busy": ("npm",), "where": clean_env_dir("npm_config_cache", ".npm", "_cacache")},
+    {"name": "npm", "argv": ["npm", "cache", "clean", "--force"], "busy": ("npm", "npx"), "where": clean_env_dir("npm_config_cache", ".npm", "_cacache"),
+     "minBytes": 256 << 20},
     {"name": "pnpm", "argv": ["pnpm", "store", "prune"], "busy": ("pnpm",), "where": clean_asked("pnpm", "store", "path")},
     {"name": "yarn", "argv": ["yarn", "cache", "clean"], "busy": ("yarn",), "where": clean_asked("yarn", "cache", "dir"), "ready": clean_yarn_classic},
     {"name": "bun", "argv": ["bun", "pm", "cache", "rm"], "busy": ("bun",), "where": clean_env_dir("BUN_INSTALL_CACHE_DIR", ".bun/install/cache")},
-    {"name": "uv", "argv": ["uv", "cache", "prune"], "busy": ("uv",), "where": clean_asked("uv", "cache", "dir")},
+    {"name": "uv", "argv": ["uv", "cache", "prune"], "busy": ("uv", "uvx"), "where": clean_asked("uv", "cache", "dir"),
+     "argvLarge": ["uv", "cache", "clean"], "largeBytes": 2 << 30},
     {"name": "pip", "argv": ["pip3", "cache", "purge"], "busy": ("pip", "pip3"), "where": clean_asked("pip3", "cache", "dir")},
     {"name": "go", "argv": ["go", "clean", "-cache", "-testcache", "-fuzzcache"], "busy": ("go",), "where": clean_asked("go", "env", "GOCACHE")},
     {"name": "homebrew", "argv": ["brew", "cleanup", "--prune=all"], "busy": ("brew",), "where": clean_asked("brew", "--cache")},
@@ -165,10 +167,14 @@ CLEAN_FOLDERS = (
     {"name": "cargo-registry", "busy": ("cargo", "rustc", "rust-analyzer", "clippy-driver"), "roots": clean_cargo_roots},
     {"name": "xcode-derived-data", "busy": ("xcode", "xcodebuild", "swift-frontend", "sourcekit-lsp"),
      "roots": lambda: [clean_home("Library", "Developer", "Xcode", "DerivedData")]},
+    # cargo-xwin's downloaded Windows SDK and CRT: regenerable, refetched by the next `cargo xwin build`; only when it is this big.
+    {"name": "cargo-xwin", "busy": ("cargo", "cargo-xwin", "xwin", "rustc", "clang-cl", "lld-link"), "minBytes": 512 << 20,
+     "roots": lambda: [os.path.expanduser(os.environ["XWIN_CACHE_DIR"])] if os.environ.get("XWIN_CACHE_DIR")
+     else [clean_home("Library", "Caches", "cargo-xwin"), clean_home(".cache", "cargo-xwin")]},
 )
 CLEAN_WORKTREES = "worktrees"
 CLEAN_EXTRA_NAMES = ("rust-build-output", "project-dependencies", "agent-leftovers", "browser-clones", "playwright", "finished-jobs", "dedupe-clones",
-                     "compress-logs", "tagged-caches")
+                     "compress-logs", "tagged-caches", "cli-releases", "coordinator-outputs", "release-scratch", "temp-build-caches")
 CLEAN_RUST_BUSY = ("cargo", "rustc", "rust-analyzer", "clippy", "clippy-driver", "cargo-clippy")
 CLEAN_NAMES = tuple(t["name"] for t in CLEAN_TOOLS) + tuple(f["name"] for f in CLEAN_FOLDERS) + (CLEAN_WORKTREES,) + CLEAN_EXTRA_NAMES
 
@@ -184,7 +190,9 @@ CLEAN_STEADY_NAMES = ("rust-build-output", "project-dependencies", "finished-job
 CLEAN_POLICY = {"cleanEscalate": True, "cleanEscalateRepoHours": 2, "cleanEscalateWorktreeHours": 24, "cleanEscalateJobHours": 24,
                 "cleanEscalatePinnedHours": 24, "cleanSteadyHours": 6, "cleanSteadyRepoDays": 3, "cleanSteadyJobHours": 48,
                 "worktreeIdleDays": 7, "projectIdleHours": 48, "taggedCacheIdleHours": 6,
-                "cleanEmergencyPercent": 90, "cleanEmergencyHours": 6}   # the fallbacks of a host whose policy predates a key
+                "cleanEmergencyPercent": 90, "cleanEmergencyHours": 6,
+                "cliReleasesKeep": 3, "coordinatorRoots": [".cache/ut-coordinator"], "coordinatorJobCommand": ["ut-coordinator", "job-get"],
+                "releaseScratchRoots": [".cache/agent-scratch"]}   # the fallbacks of a host whose policy predates a key
 CLEAN_OUTPUT_PROOF = ("clean", "pushed", "ignored", "untracked")
 CLEAN_IGNORED_PROOF = ("ignored", "untracked")      # regenerable output needs git to ignore it and track none of it, not a clean tree
 CLEAN_REFUSED_SECONDS = 86400    # a removal the filesystem refused is not retried for this long, unless the folder changed
@@ -214,7 +222,8 @@ def clean_profile(policy: dict, rung: int | str) -> dict:
         raise HostError(f"policy taggedCacheIdleHours must be 0 (off) or a number of hours, not {json.dumps(tagged)}")
     profile = {"rung": rung, "name": rung if isinstance(rung, str) else CLEAN_RUNGS[rung], "worktreeHours": days * 24, "projectHours": hours,
                "taggedHours": tagged,
-               "temp": dict(CLEAN_TEMP_IDLE_HOURS), "outputProof": CLEAN_OUTPUT_PROOF, "wide": False, "archive": False, "job": None, "tools": True}
+               "temp": dict(CLEAN_TEMP_IDLE_HOURS), "outputProof": CLEAN_OUTPUT_PROOF, "wide": False, "archive": False, "job": None, "tools": True,
+               "reclaim": clean_reclaim_settings(policy)}
     if rung == CLEAN_STEADY:
         steady = clean_setting(policy, "cleanSteadyRepoDays") * 24
         profile.update(projectHours=max(hours, steady) if hours else 0, tools=False,
@@ -1574,6 +1583,8 @@ def clean_extra_gates(entry: dict, table: dict | None = None) -> None:
     path, kind = entry["path"], entry["name"]
     if kind == "tagged-caches":  # its own window: a job folder's evidence window (clean_scratch_debris_gates) does not apply to a cache
         return clean_tagged_gates(entry, table)
+    if kind in CLEAN_RECLAIM_NAMES:   # each with its own windows and proofs (the reclaim rules), not a job folder's evidence window
+        return clean_reclaim_gates(entry, table)
     if not clean_job_idle_scope(path, entry):
         clean_scratch_debris_gates(entry, table)
     if kind == "project-dependencies":
@@ -1637,6 +1648,15 @@ def clean_extra_entries(only: set, errors: list, idle_hours: int = 48, rung: dic
         hours = rung["taggedHours"] if rung else CLEAN_POLICY["taggedCacheIdleHours"]
         for path, root in clean_tagged_find(errors, bool(rung and rung["name"] == CLEAN_STEADY)) if hours else ():
             add("tagged-caches", path, root, idleHours=hours)
+    reclaim = rung["reclaim"] if rung and rung.get("reclaim") else clean_reclaim_settings(None)
+    if "cli-releases" in only:
+        clean_cli_release_entries(errors, reclaim["cliReleasesKeep"], add)
+    if "coordinator-outputs" in only:
+        clean_coord_entries(errors, reclaim, add)
+    if "release-scratch" in only:
+        clean_release_scratch_entries(errors, reclaim, add)
+    if "temp-build-caches" in only:
+        clean_temp_build_entries(errors, add)
     if "agent-leftovers" in only:
         for root, sessions in clean_leftover_roots():
             try:
@@ -1646,7 +1666,9 @@ def clean_extra_entries(only: set, errors: list, idle_hours: int = 48, rung: dic
                 errors.append({"clean": "agent-leftovers", "path": clean_tilde(root), "error": clean_os_refusal(error)})
                 continue
             for child in clean_scan(root, "agent-leftovers", errors):
-                matches = sessions or bool(re.fullmatch(r"(?:.+-verify-.+|ultraterm-release\..+|ultraterm-publish-check\..+|.*-rust-target.*)", child.name))
+                matches = sessions or bool(re.fullmatch(r"(?:.+-verify-.+|ultraterm-release\..+|.*-rust-target.*)", child.name))
+                if not sessions and CLEAN_TEMP_BUILD.match(child.name):
+                    continue   # temp-build-caches' own, with its one-hour window
                 if matches and clean_directory(child, "agent-leftovers", errors) and not reap_protected(child.name):
                     add("agent-leftovers", child.path, root)
         seen = {e["path"] for e in entries}
@@ -1657,17 +1679,8 @@ def clean_extra_entries(only: set, errors: list, idle_hours: int = 48, rung: dic
                 if child.path in seen or os.path.realpath(child.path) == sessions_root or CLEAN_TEMP_SYSTEM.match(child.name) \
                         or reap_protected(child.name) or not clean_directory(child, "agent-leftovers", errors):
                     continue
-                if child.name == "node-compile-cache":
-                    try:
-                        if child.stat(follow_symlinks=False).st_uid != os.getuid():
-                            continue
-                    except OSError as error:
-                        errors.append({"clean": "agent-leftovers", "path": clean_tilde(child.path), "error": clean_os_refusal(error)})
-                        continue
-                    for version in clean_scan(child.path, "agent-leftovers", errors):
-                        if not reap_protected(version.name) and clean_directory(version, "agent-leftovers", errors):
-                            add("agent-leftovers", version.path, child.path, idleHours=24)
-                    continue
+                if child.name == "node-compile-cache" or CLEAN_TEMP_BUILD.match(child.name):
+                    continue   # temp-build-caches' own, with its one-hour window
                 try:
                     if child.stat(follow_symlinks=False).st_uid != os.getuid():
                         continue
@@ -1688,6 +1701,8 @@ def clean_extra_entries(only: set, errors: list, idle_hours: int = 48, rung: dic
                 add("playwright", path, root, browser=browser, build=build)
     table = reap_process_table() if entries else None
     for entry in entries:
+        if "keep" in entry:   # kept at discovery (the newest releases or outputs, an unproved reference search): nothing to probe
+            continue
         try:
             with ExitStack() as stack:
                 if entry["name"] in ("rust-build-output", "project-dependencies", "tagged-caches"):
@@ -1698,6 +1713,615 @@ def clean_extra_entries(only: set, errors: list, idle_hours: int = 48, rung: dic
         except (ReapRefused, OSError) as error:
             entry["keep"] = str(error) if isinstance(error, ReapRefused) else clean_os_refusal(error)
     return entries
+
+
+# ---- reclaim rules (0.20.0) ----------------------------------------------------------------------------------------------------------
+# Space that a manual reclaim found and no rule reached: superseded side-by-side releases of self-updating command-line tools, build
+# output inside finished coordinator jobs, release scratch, temp build caches. Each goes through the guarded removal (fence, receipt,
+# last look) behind the usual proofs: retention markers and protected names (clean_folder_gates), no process holding it (open files,
+# working directories and command lines), an age threshold, and git ignore/untracked proofs wherever a repository is involved.
+CLEAN_RECLAIM_NAMES = ("cli-releases", "coordinator-outputs", "release-scratch", "temp-build-caches")
+CLEAN_SEMVER = re.compile(r"v?(\d{1,9})\.(\d{1,9})\.(\d{1,9})(?:-([0-9A-Za-z.-]{1,64}))?(?:\+[0-9A-Za-z.-]{1,64})?")
+CLEAN_RELEASES_QUIET_HOURS = 1        # a release installed less than this long ago may still be unpacking
+CLEAN_REF_FILE_BYTES = 1 << 20        # a settings file or wrapper larger than this is not read (and names nothing)
+CLEAN_REF_FILES = 5000                # files and links one tool's reference search may look at; more proves nothing
+CLEAN_REF_SUFFIXES = (".json", ".jsonc", ".json5", ".toml", ".yaml", ".yml", ".ini", ".conf", ".cfg", ".sh", ".zsh", ".bash", ".plist")
+CLEAN_REF_SKIP = frozenset({"sessions", "logs", "log", "cache", "caches", "tmp", "history", "node_modules", ".git", "releases"})
+CLEAN_REF_NEVER_HOMES = frozenset({"local", "config", "cache", "share", "ssh", "gnupg", "trash", "git", "npm", "cargo"})
+CLEAN_BREW_PREFIXES = ("/opt/homebrew", "/usr/local")
+CLEAN_COORD_OUTPUT = re.compile(r"^(?:target|.+-target|node_modules|dist|\.cloudflare)$")
+CLEAN_COORD_NEVER = frozenset({"notes", "reports", "evidence", "handoffs", "handoff", ".git"})   # never entered, never a candidate's ancestor
+CLEAN_COORD_FINISHED = ("done", "failed", "cancelled")
+CLEAN_COORD_IDLE = ("parked", "blocked")
+CLEAN_COORD_IDLE_HOURS = 24           # a parked or blocked job's output goes once its folder is untouched this long
+CLEAN_COORD_QUIET_HOURS = 1           # a finished job's output: nothing in it changed this long
+CLEAN_COORD_DEPTH = 8
+CLEAN_COORD_ENTRIES = 2_000_000
+CLEAN_COORD_STATUS_SECONDS = 20
+CLEAN_COORD_MANIFESTS = {"node_modules": ("package.json",), "dist": ("package.json", "vite.config.ts", "vite.config.js", "tsconfig.json"),
+                         ".cloudflare": ("package.json", "wrangler.toml", "wrangler.json", "wrangler.jsonc")}
+CLEAN_RELEASE_SCRATCH = re.compile(r"^rel(?:ease)?[-_.].+")
+CLEAN_RELEASE_OUT = re.compile(r"^out(?:\d+|[-_.].+)?$")
+CLEAN_RELEASE_UNZ = re.compile(r"^unz(?:\d+|[-_.].+)?$")
+CLEAN_RELEASE_OUTS_KEEP = 2           # staged release outputs: the newest this many stay
+CLEAN_RELEASE_QUIET_HOURS = 1
+CLEAN_TEMP_BUILD = re.compile(r"^(?:.+-publish-check\..+|oss-leaks-.+)$")
+CLEAN_TEMP_BUILD_HOURS = 1
+
+
+def clean_reclaim_settings(policy: dict | None) -> dict:
+    policy = policy or {}
+    return {key: clean_setting(policy, key) for key in ("cliReleasesKeep", "coordinatorRoots", "coordinatorJobCommand", "releaseScratchRoots")}
+
+
+def clean_semver(name: str):
+    """A sortable key for a semantic version folder name (`1.2.3`, `v1.2.3-rc.1`), else None. A prerelease sorts before its release."""
+    match = CLEAN_SEMVER.fullmatch(name)
+    if not match:
+        return None
+    pre = tuple((0, int(p), "") if p.isdigit() else (1, 0, p) for p in (match[4] or "").split(".") if p)
+    return (int(match[1]), int(match[2]), int(match[3]), 0 if match[4] else 1, pre)
+
+
+def clean_expand(path: str) -> str:
+    """A configured folder: absolute, `~`-prefixed, or relative to the home folder."""
+    if path == "~" or path[:2] == "~" + os.sep:
+        return clean_home(path[2:])
+    return path if os.path.isabs(path) else clean_home(path)
+
+
+def clean_release_homes(errors: list) -> list[tuple[str, str]]:
+    """(tool, releases folder) for every `<data home>/<tool>/releases/` ($XDG_DATA_HOME, else `.local/share` in the home folder)."""
+    base = os.environ.get("XDG_DATA_HOME")
+    base = os.path.expanduser(base) if base else clean_home(".local", "share")
+    if not os.path.isdir(base) or os.path.islink(base):
+        return []
+    found = []
+    for tool in clean_scan(base, "cli-releases", errors):
+        releases = os.path.join(tool.path, "releases")
+        if not reap_protected(tool.name) and clean_directory(tool, "cli-releases", errors) and os.path.isdir(releases) \
+                and not os.path.islink(releases):
+            found.append((tool.name, reap_canon(releases)))
+    return sorted(found)
+
+
+def clean_release_versions(releases: str) -> list[tuple[tuple, str]]:
+    """The semantic-version release folders, newest first. Other names (a `current` link, `tmp`) are never candidates."""
+    found = []
+    with os.scandir(releases) as scan:
+        for entry in scan:
+            key = clean_semver(entry.name)
+            if key is not None and entry.is_dir(follow_symlinks=False) and not entry.is_symlink():
+                found.append((key, entry.name))
+    return sorted(found, reverse=True)
+
+
+def clean_release_refs(tool: str, releases: str, versions: list[str]) -> dict:
+    """{version: where it is referenced} for the versions something other than a process still points at: a link (the tool's own
+    `current`, a command in a bin folder, a Homebrew Cellar link) that resolves into the release, or a settings file or wrapper
+    script that names `<tool>/releases/<version>`. Looked at: the tool's own folder, its settings folders in the home folder (`.<name>` and
+    `.config/<name>` for the tool's name and for each name after one of its hyphens: `acme-cli` also reads `.cli`), two levels
+    deep, settings-like names only; the bin folders (`.local/bin`, Homebrew's); and each Homebrew Cellar keg's top, `bin` and
+    `libexec`. A file that cannot be read, or more than CLEAN_REF_FILES entries, proves nothing: ReapRefused, and every version stays."""
+    names = sorted(versions, key=len, reverse=True)
+    if not names:
+        return {}
+    named = re.compile(re.escape(tool) + r"/releases/(" + "|".join(map(re.escape, names)) + r")(?=$|[/\s\"'`;:,)\]}<>|&\\])")
+    used, budget = {}, [CLEAN_REF_FILES]
+    def note(version: str, source: str) -> None:
+        used.setdefault(version, clean_tilde(source))
+    def link(path: str) -> None:
+        target = os.path.realpath(path)
+        if target != releases and reap_inside(target, releases):
+            note(os.path.relpath(target, releases).split(os.sep)[0], path)
+    def read(path: str, info) -> None:
+        if info.st_size > CLEAN_REF_FILE_BYTES or info.st_uid not in (os.getuid(), 0):
+            return
+        try:
+            with open(path, "rb") as handle:
+                text = handle.read(CLEAN_REF_FILE_BYTES).decode("utf-8", "replace")
+        except PermissionError:
+            raise ReapRefused("references-unproved:unreadable:" + clean_tilde(path)[:120])
+        for match in named.finditer(text):
+            note(match[1], path)
+    def visit(folder: str, depth: int, suffixes, read_files: bool = True) -> None:
+        try:
+            entries = list(os.scandir(folder))
+        except FileNotFoundError:
+            return
+        except PermissionError:
+            raise ReapRefused("references-unproved:unreadable:" + clean_tilde(folder)[:120])
+        for entry in entries:
+            budget[0] -= 1
+            if budget[0] < 0:
+                raise ReapRefused(f"references-unproved:more-than-{CLEAN_REF_FILES}-entries")
+            if reap_protected(entry.name) or entry.name.endswith((".bak", ".orig")) or ".before-" in entry.name:
+                continue   # secrets are never opened; backups name what was, not what is
+            try:
+                if entry.is_symlink():
+                    link(entry.path)
+                elif entry.is_file(follow_symlinks=False):
+                    if read_files and (suffixes is None or entry.name.endswith(suffixes)):
+                        read(entry.path, entry.stat(follow_symlinks=False))
+                elif entry.is_dir(follow_symlinks=False) and depth > 0 and entry.name.lower() not in CLEAN_REF_SKIP:
+                    visit(entry.path, depth - 1, suffixes, read_files)
+            except FileNotFoundError:
+                continue
+    visit(os.path.dirname(releases), 0, None)
+    homes = {tool, *("-".join(tool.split("-")[i:]) for i in range(1, tool.count("-") + 1))}
+    for name in sorted(h for h in homes if h and h.lower() not in CLEAN_REF_NEVER_HOMES):
+        for folder in (clean_home("." + name), clean_home(".config", name)):
+            if os.path.isdir(folder) and not os.path.islink(folder):
+                visit(folder, 2, CLEAN_REF_SUFFIXES)
+    for folder in (clean_home(".local", "bin"), *(os.path.join(p, "bin") for p in CLEAN_BREW_PREFIXES)):
+        visit(folder, 0, None)
+    for prefix in CLEAN_BREW_PREFIXES:
+        cellar = os.path.join(prefix, "Cellar")
+        if not os.path.isdir(cellar):
+            continue
+        for formula in os.scandir(cellar):
+            if not formula.is_dir(follow_symlinks=False):
+                continue
+            for keg in os.scandir(formula.path):
+                if keg.is_dir(follow_symlinks=False):
+                    visit(keg.path, 0, None, read_files=False)
+                    visit(os.path.join(keg.path, "bin"), 0, None)
+                    visit(os.path.join(keg.path, "libexec"), 0, None, read_files=False)
+    return used
+
+
+def clean_cli_release_gates(entry: dict, table: dict | None) -> None:
+    """Fresh at removal: still past the newest `keep`, referenced by nothing, an hour old, held by no process."""
+    path, root, version = entry["path"], entry["root"], entry["version"]
+    if os.path.islink(path) or reap_canon(path) != path or os.path.dirname(path) != root:
+        raise ReapRefused("outside-root")
+    keep = entry["keepNewest"]
+    if not keep:
+        raise ReapRefused("off:cliReleasesKeep=0")
+    if table is None:   # the plan ranked and searched once per tool; the last look does both again
+        versions = clean_release_versions(root)
+        if version in [name for _, name in versions[:keep]] or version not in [name for _, name in versions]:
+            raise ReapRefused(f"newest-{keep}")
+        refs = clean_release_refs(entry["tool"], root, [name for _, name in versions])
+        if version in refs:
+            raise ReapRefused("referenced-by:" + refs[version])
+    info = os.lstat(path)
+    if info.st_uid != os.getuid():
+        raise ReapRefused("not-owned-by-user")
+    if max(info.st_mtime, reap_scratch_changed(info)) > now() - CLEAN_RELEASES_QUIET_HOURS * 3600:
+        raise ReapRefused(f"recent:less-than-{CLEAN_RELEASES_QUIET_HOURS}h")
+    clean_once(("folder", path), lambda: clean_folder_gates(path), table is None)
+    reap_holders(path, path, table)
+
+
+def clean_cli_release_entries(errors: list, keep: int, add) -> None:
+    for tool, releases in clean_release_homes(errors):
+        try:
+            versions = clean_release_versions(releases)
+        except OSError as error:
+            errors.append({"clean": "cli-releases", "path": clean_tilde(releases), "error": clean_os_refusal(error)})
+            continue
+        if not keep or len(versions) <= keep:
+            continue
+        try:
+            refs, unproved = clean_release_refs(tool, releases, [name for _, name in versions]), None
+        except (ReapRefused, OSError) as error:
+            refs, unproved = {}, str(error) if isinstance(error, ReapRefused) else "references-unproved:" + clean_os_refusal(error)
+        newest = [name for _, name in versions[:keep]]
+        for _, name in versions[keep:]:
+            extra = {"tool": tool, "version": name, "keepNewest": keep, "newest": newest}
+            if unproved:
+                extra["keep"] = unproved
+            elif name in refs:
+                extra["keep"] = "referenced-by:" + refs[name]
+            add("cli-releases", os.path.join(releases, name), releases, **extra)
+
+
+def clean_coord_status(command: list, job: str, fresh: bool) -> tuple[str | None, float | None, str | None]:
+    """(status, newest activity time, why unknown) of one coordinator job, from `<command> <job>` printing JSON (`{"job": {...}}` or
+    the job itself). Asked once per pass; the removal's last look asks again. Anything but a clean answer is unknown, and keeps."""
+    key = ("coord-status", job)
+    known = None if fresh else clean_memo_get(key)
+    if known is not None:
+        return tuple(known)
+    argv = [os.path.expanduser(part) if not index else part for index, part in enumerate(command)] + [job]
+    program = argv[0] if os.path.isabs(argv[0]) else shutil.which(argv[0])
+    found: tuple = (None, None, "job-status-unknown:command-missing")
+    if program:
+        code, out = clean_run([program, *argv[1:]], CLEAN_COORD_STATUS_SECONDS)
+        try:
+            data = json.loads(out) if code == 0 else None
+        except ValueError:
+            data = None
+        record = data.get("job") if isinstance(data, dict) and isinstance(data.get("job"), dict) else data
+        status = record.get("status") if isinstance(record, dict) else None
+        if code != 0 or not isinstance(status, str) or (isinstance(record.get("id"), str) and record["id"] != job):
+            found = (None, None, f"job-status-unknown:exit-{code}")
+        else:
+            stamps = [reap_note_epoch(value) for field, value in record.items() if field.endswith(("_at", "At")) and isinstance(value, str)]
+            stamps = [s for s in stamps if s]
+            found = (status, max(stamps) if stamps else None, None)
+    if not fresh:
+        clean_memo_put(key, list(found))
+    return found
+
+
+def clean_coord_repo(path: str, job_dir: str) -> tuple[str | None, bool]:
+    """The repository or worktree enclosing `path` inside its job folder, and whether its git link is broken (a `.git` file naming a
+    git dir that is gone, or a `.git` folder without HEAD)."""
+    current = os.path.dirname(path)
+    while reap_inside(current, job_dir):
+        dot_git = os.path.join(current, ".git")
+        if os.path.lexists(dot_git):
+            if os.path.islink(dot_git):
+                return current, True
+            if os.path.isfile(dot_git):
+                gitdir = clean_pointer_target(dot_git)
+                return current, not (gitdir and os.path.isfile(os.path.join(gitdir, "HEAD")))
+            return current, not os.path.isfile(os.path.join(dot_git, "HEAD"))
+        if current == job_dir:
+            break
+        current = os.path.dirname(current)
+    return None, False
+
+
+def clean_coord_regenerable(path: str) -> str | None:
+    """Why `path` is not plainly regenerable build output of its name, or None: a Rust target Cargo wrote, a `node_modules` /
+    `dist` / `.cloudflare` beside its project's manifest, and a `dist` holding no release artifact."""
+    name, parent = os.path.basename(path), os.path.dirname(path)
+    if name == "target" or name.endswith("-target"):
+        return None if clean_tagged_cargo_target(path) else "not-a-cargo-target"
+    if not any(os.path.isfile(os.path.join(parent, m)) for m in CLEAN_COORD_MANIFESTS.get(name, ())):
+        return "no-manifest-beside"
+    if name == "dist":
+        found = clean_release_like(path)
+        if found:
+            return "release-artifact:" + found
+    return None
+
+
+def clean_coord_gates(entry: dict, table: dict | None) -> None:
+    path, job_dir, job = entry["path"], entry["root"], entry["job"]
+    if reap_canon(path) != path or path == job_dir or not reap_inside(path, job_dir):
+        raise ReapRefused("outside-root")
+    rel = os.path.relpath(path, job_dir).split(os.sep)
+    if any(part.lower() in CLEAN_COORD_NEVER or reap_protected(part) for part in rel):
+        raise ReapRefused("protected-ancestor")
+    status, active, unknown = clean_coord_status(entry["command"], job, table is None)
+    if unknown:
+        raise ReapRefused(unknown)
+    if status in CLEAN_COORD_IDLE:
+        if active and active > now() - CLEAN_COORD_IDLE_HOURS * 3600:
+            raise ReapRefused(f"job-{status}:active-within-{CLEAN_COORD_IDLE_HOURS}h")
+        quiet = CLEAN_COORD_IDLE_HOURS
+    elif status in CLEAN_COORD_FINISHED:
+        quiet = CLEAN_COORD_QUIET_HOURS
+    else:
+        raise ReapRefused("job-live:" + status[:40])
+    why = clean_coord_regenerable(path)
+    if why:
+        raise ReapRefused(why)
+    repo, broken = clean_coord_repo(path, job_dir)
+    if repo and not broken:   # in a worktree: only output git ignores and tracks nothing of
+        clean_once(("coord-git", path), lambda: reap_git_proof(repo, path, CLEAN_IGNORED_PROOF), table is None)
+    if status in CLEAN_COORD_IDLE:   # untouched: the project around the output (its files and git state), then the output itself
+        if repo and not broken:
+            idle = clean_repo_idle_hours(repo, table is None)
+            if idle < quiet:
+                raise ReapRefused(f"recent:{idle:.0f}h-of-{quiet}h")
+        elif os.lstat(os.path.dirname(path)).st_mtime > now() - quiet * 3600:
+            raise ReapRefused(f"recent:less-than-{quiet}h")
+    clean_stale_tree(path, quiet, fresh=table is None)
+    clean_once(("folder", path), lambda: clean_folder_gates(path), table is None)
+    reap_holders(repo or os.path.dirname(path), repo or os.path.dirname(path), table)
+
+
+def clean_coord_entries(errors: list, settings: dict, add) -> None:
+    """Build output inside coordinator job folders (`<root>/J-NNNN/...`): Rust `target` and `*-target`, `node_modules`, `dist` and
+    `.cloudflare`, at most CLEAN_COORD_DEPTH levels down, never inside notes, reports, evidence or handoffs, never below a match."""
+    count = 0
+    for configured_root in settings["coordinatorRoots"]:
+        root = clean_expand(configured_root)
+        if not os.path.isdir(root) or os.path.islink(root):
+            continue
+        root = reap_canon(root)
+        jobs = [e for e in clean_scan(root, "coordinator-outputs", errors) if CLEAN_JOB_FOLDER.fullmatch(e.name)
+                and clean_directory(e, "coordinator-outputs", errors)]
+        for job in sorted(jobs, key=lambda e: e.name):
+            stack = [(job.path, 0)]
+            while stack:
+                folder, depth = stack.pop()
+                # A job's own folder that cannot be listed is an error; a folder inside it that its job made unreadable (private
+                # material) is simply not entered: nothing in it becomes a candidate.
+                entries = clean_scan(folder, "coordinator-outputs", errors if not depth else [])
+                count += len(entries)
+                if count > CLEAN_COORD_ENTRIES:
+                    errors.append({"clean": "coordinator-outputs", "error": f"discovery-incomplete: more than {CLEAN_COORD_ENTRIES} entries"})
+                    return
+                for entry in entries:
+                    if reap_protected(entry.name) or entry.name.lower() in CLEAN_COORD_NEVER or entry.is_symlink() \
+                            or not clean_directory(entry, "coordinator-outputs", errors):
+                        continue
+                    if CLEAN_COORD_OUTPUT.match(entry.name):
+                        add("coordinator-outputs", entry.path, job.path, job=job.name, command=list(settings["coordinatorJobCommand"]))
+                    elif depth < CLEAN_COORD_DEPTH and entry.name not in CLEAN_JOB_OUTPUT_SKIP:
+                        stack.append((entry.path, depth + 1))
+
+
+def clean_release_merged(repo: str) -> None:
+    """The release worktree's HEAD is on the remote's main branch (origin/main, else origin/master)."""
+    with reap_git_session(repo):
+        for branch in ("refs/remotes/origin/main", "refs/remotes/origin/master"):
+            code, _ = reap_git(repo, "rev-parse", "--verify", "-q", branch)
+            if code == 0:
+                code, _ = reap_git(repo, "merge-base", "--is-ancestor", "HEAD", branch)
+                if code == 0:
+                    return
+                raise ReapRefused("release-head-not-merged" if code == 1 else f"git-error:merge-base:{code}")
+    raise ReapRefused("release-head-unproved:no-origin-main")
+
+
+def clean_release_scratch_gates(entry: dict, table: dict | None) -> None:
+    path, root = entry["path"], entry["root"]
+    if reap_canon(path) != path or path == root or not reap_inside(path, root):
+        raise ReapRefused("outside-root")
+    info = os.lstat(root)
+    if info.st_uid != os.getuid():
+        raise ReapRefused("not-owned-by-user")
+    part = entry["part"]
+    if part == "target":
+        if not clean_tagged_cargo_target(path):
+            raise ReapRefused("not-a-cargo-target")
+        clean_once(("release-merged", entry["repo"]), lambda: clean_release_merged(entry["repo"]), table is None)
+        clean_once(("release-git", path), lambda: reap_git_proof(entry["repo"], path, CLEAN_IGNORED_PROOF), table is None)
+    elif part == "out" and table is None:
+        newest = clean_release_outs(entry["scratchRoots"])[:CLEAN_RELEASE_OUTS_KEEP]
+        if path in [p for _, p in newest]:
+            raise ReapRefused(f"newest-{CLEAN_RELEASE_OUTS_KEEP}-staged-outputs")
+    clean_stale_tree(path, CLEAN_RELEASE_QUIET_HOURS, fresh=table is None)
+    clean_once(("folder", path), lambda: clean_folder_gates(path), table is None)
+    reap_holders(root, root, table)   # nothing uses the release folder: a build, a packaging step, a shell in it
+
+
+def clean_release_folders(roots: list) -> list[str]:
+    found = []
+    for configured_root in roots:
+        base = clean_expand(configured_root)
+        if not os.path.isdir(base) or os.path.islink(base):
+            continue
+        try:
+            found.extend(e.path for e in os.scandir(reap_canon(base)) if CLEAN_RELEASE_SCRATCH.match(e.name)
+                         and e.is_dir(follow_symlinks=False) and not e.is_symlink())
+        except OSError:
+            continue
+    return sorted(set(found))
+
+
+def clean_release_outs(roots: list) -> list[tuple[float, str]]:
+    """Every staged output folder (`out`, `out-2`, `out.x` ...; real folders, never links) directly in a release folder, newest first by
+    the later of its own and its entries' change times."""
+    outs = []
+    for folder in clean_release_folders(roots):
+        try:
+            children = [e for e in os.scandir(folder) if CLEAN_RELEASE_OUT.match(e.name) and e.is_dir(follow_symlinks=False) and not e.is_symlink()]
+        except OSError:
+            continue
+        for child in children:
+            try:
+                stamps = [child.stat(follow_symlinks=False).st_mtime] + [e.stat(follow_symlinks=False).st_mtime for e in os.scandir(child.path)]
+            except OSError:
+                stamps = [now()]   # unreadable: counted as new, so it is never what makes room for another
+            outs.append((max(stamps), child.path))
+    return sorted(outs, reverse=True)
+
+
+def clean_release_scratch_entries(errors: list, settings: dict, add) -> None:
+    """In each release folder (`rel-*` in the release scratch roots): the `src-tauri/target` of a release worktree, `unz` folders,
+    and staged `out*` folders but the newest CLEAN_RELEASE_OUTS_KEEP across all release folders."""
+    roots = list(settings["releaseScratchRoots"])
+    for folder in clean_release_folders(roots):
+        for child in clean_scan(folder, "release-scratch", errors):
+            if reap_protected(child.name) or child.is_symlink() or not clean_directory(child, "release-scratch", errors):
+                continue
+            target = os.path.join(child.path, "src-tauri", "target")
+            if os.path.lexists(os.path.join(child.path, ".git")) and os.path.isdir(target) and not os.path.islink(target) \
+                    and not os.path.islink(os.path.dirname(target)):
+                add("release-scratch", target, folder, part="target", repo=child.path)
+            elif CLEAN_RELEASE_UNZ.match(child.name):
+                add("release-scratch", child.path, folder, part="unz")
+    for position, (_, path) in enumerate(clean_release_outs(roots)):
+        extra = {"keep": f"newest-{CLEAN_RELEASE_OUTS_KEEP}-staged-outputs"} if position < CLEAN_RELEASE_OUTS_KEEP else {}
+        add("release-scratch", path, os.path.dirname(path), part="out", scratchRoots=roots, **extra)
+
+
+def clean_temp_build_gates(entry: dict, table: dict | None) -> None:
+    path = entry["path"]
+    if os.lstat(path).st_uid != os.getuid():
+        raise ReapRefused("not-owned-by-user")
+    clean_once(("folder", path), lambda: clean_folder_gates(path), table is None)
+    clean_stale_tree(path, entry.get("idleHours", CLEAN_TEMP_BUILD_HOURS), fresh=table is None)
+    reap_holders(path, path, table)
+
+
+def clean_temp_build_entries(errors: list, add) -> None:
+    """Node's compile cache (each version folder), `*-publish-check.*` and `oss-leaks-*` folders in the shared and per-user temp
+    folders: idle CLEAN_TEMP_BUILD_HOURS and held by no process."""
+    seen = set()
+    for root, _ in clean_temp_roots():
+        for child in clean_scan(root, "temp-build-caches", errors):
+            if child.path in seen or reap_protected(child.name) or not clean_directory(child, "temp-build-caches", errors):
+                continue
+            seen.add(child.path)
+            try:
+                if child.stat(follow_symlinks=False).st_uid != os.getuid():
+                    continue
+            except OSError as error:
+                errors.append({"clean": "temp-build-caches", "path": clean_tilde(child.path), "error": clean_os_refusal(error)})
+                continue
+            if child.name == "node-compile-cache":
+                for version in clean_scan(child.path, "temp-build-caches", errors):
+                    if not reap_protected(version.name) and clean_directory(version, "temp-build-caches", errors):
+                        add("temp-build-caches", version.path, child.path, idleHours=CLEAN_TEMP_BUILD_HOURS)
+            elif CLEAN_TEMP_BUILD.match(child.name):
+                add("temp-build-caches", child.path, root, idleHours=CLEAN_TEMP_BUILD_HOURS)
+
+
+def clean_reclaim_gates(entry: dict, table: dict | None) -> None:
+    kind = entry["name"]
+    if kind == "cli-releases":
+        return clean_cli_release_gates(entry, table)
+    if kind == "coordinator-outputs":
+        return clean_coord_gates(entry, table)
+    if kind == "release-scratch":
+        return clean_release_scratch_gates(entry, table)
+    return clean_temp_build_gates(entry, table)
+
+
+def clean_by_rule(entries: list[dict], names=()) -> dict:
+    """Per rule: what it would reclaim (candidates and their bytes) and what it keeps. Every rule in `names` is listed, with zeros
+    when it found nothing."""
+    out: dict = {name: {"candidates": 0, "candidateBytes": 0, "kept": 0, "keptBytes": 0} for name in names
+                 if name not in (CLEAN_DEDUPE_NAME, CLEAN_COMPRESS_NAME, "finished-jobs")}
+    for entry in entries:
+        rule = out.setdefault(entry["name"], {"candidates": 0, "candidateBytes": 0, "kept": 0, "keptBytes": 0})
+        if "keep" in entry:
+            rule["kept"] += 1
+            rule["keptBytes"] += entry.get("bytes") or 0
+        else:
+            rule["candidates"] += 1
+            rule["candidateBytes"] += entry.get("bytes") or 0
+    return dict(sorted(out.items(), key=lambda item: (-item[1]["candidateBytes"], item[0])))
+
+
+# ---- package caches over a size threshold ------------------------------------------------------------------------------------------
+
+def clean_tool_thresholds(entries: list[dict]) -> None:
+    """A tool's cache under its `minBytes` is left alone this pass; one at or over `largeBytes` gets the tool's full cleaner
+    (`uv cache clean`) instead of its routine one (`uv cache prune`). Sizes are the pass's own measurement."""
+    for entry in entries:
+        spec = entry.get("spec") or {}
+        if entry.get("kind") != "tool-cache" or "keep" in entry or not entry.get("sizeComplete", True):
+            continue
+        size = entry.get("bytes") or 0
+        if spec.get("minBytes") and size < spec["minBytes"]:
+            entry["keep"] = f"below-threshold:{size >> 20}MB-of-{spec['minBytes'] >> 20}MB"
+        elif spec.get("largeBytes") and spec.get("argvLarge") and size >= spec["largeBytes"]:
+            entry["argv"], entry["command"] = list(spec["argvLarge"]), " ".join(spec["argvLarge"])
+
+
+# ---- a VM disk that outgrew its data: a guided action --------------------------------------------------------------------------------
+# A Colima/Lima VM's disk file only grows: images, volumes and build cache deleted inside the VM leave their blocks allocated in the file
+# until the guest trims them. 2026-11-15: a 17 GB disk file held 0.7 GB of data; pruning inside the VM freed nothing on the Mac, the
+# guest's `fstrim` of the data disk did. The clean pass reports such a disk with the steps; `clean --trim-vm` runs them, only for a VM
+# that was stopped before (it is started, pruned, trimmed and stopped again), never for a running one.
+CLEAN_VM_TRIM_MIN_BYTES = 4 << 30     # a disk file occupying at least this much is worth the steps
+CLEAN_VM_STEP_SECONDS = 900
+
+
+def clean_colima_home() -> str:
+    base = os.environ.get("COLIMA_HOME")
+    return os.path.expanduser(base) if base else clean_home(".colima")
+
+
+def clean_vm_disks() -> list[dict]:
+    """Every Colima profile's VM with the disk files it occupies (allocated blocks, not the sparse logical size) and whether it runs."""
+    lima = os.path.join(clean_colima_home(), "_lima")
+    found = []
+    try:
+        instances = [e for e in os.scandir(lima) if e.is_dir(follow_symlinks=False) and not e.name.startswith("_")
+                     and (e.name == "colima" or e.name.startswith("colima-"))]
+    except OSError:
+        return found
+    for instance in sorted(instances, key=lambda e: e.name):
+        profile = "default" if instance.name == "colima" else instance.name[len("colima-"):]
+        disks, allocated, logical = [], 0, 0
+        for path in (os.path.join(instance.path, "disk"), os.path.join(instance.path, "diffdisk"),
+                     os.path.join(lima, "_disks", instance.name, "datadisk")):
+            try:
+                info = os.lstat(path)
+            except OSError:
+                continue
+            if stat.S_ISREG(info.st_mode):
+                disks.append(path)
+                allocated += info.st_blocks * 512
+                logical += info.st_size
+        if disks:
+            found.append({"profile": profile, "instance": instance.path, "disks": disks, "bytes": allocated, "logicalBytes": logical,
+                          "running": os.path.lexists(os.path.join(instance.path, "ha.pid"))})
+    return found
+
+
+def clean_vm_steps(profile: str) -> list[list[str]]:
+    flag = [] if profile == "default" else ["--profile", profile]
+    inside = ["colima", "ssh", *flag, "--"]
+    return [["colima", "start", *flag], [*inside, "docker", "image", "prune", "-a", "-f"], [*inside, "docker", "volume", "prune", "-a", "-f"],
+            [*inside, "docker", "builder", "prune", "-a", "-f"], [*inside, "sudo", "fstrim", "-v", "/mnt/lima-colima"], ["colima", "stop", *flag]]
+
+
+def clean_vm_status(profile: str) -> str | None:
+    """The VM's status as Colima reports it (`Stopped`, `Running` ...), or None when Colima cannot say."""
+    code, out = clean_run(["colima", "list", "--json"], 30)
+    if code != 0:
+        return None
+    for line in out.splitlines():
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(record, dict) and record.get("name") == profile and isinstance(record.get("status"), str):
+            return record["status"]
+    return None
+
+
+def clean_vm_inventory() -> list[dict]:
+    found = []
+    for vm in clean_vm_disks():
+        steps = [" ".join(step) for step in clean_vm_steps(vm["profile"])]
+        found.append({"kind": "vm-disk", "name": "colima:" + vm["profile"], "path": vm["disks"][-1], "bytes": vm["bytes"],
+                      "logicalBytes": vm["logicalBytes"], "sizeComplete": True, "running": vm["running"],
+                      "trimSuggested": vm["bytes"] >= CLEAN_VM_TRIM_MIN_BYTES,
+                      "guidedAction": {"run": "trimreaper clean --trim-vm", "steps": steps,
+                                       "note": "only for a VM that is stopped: it is started, pruned (unused images, unused volumes "
+                                               "and their data, build cache), trimmed (the step that returns the blocks to the Mac) and stopped"},
+                      "note": "the disk file keeps blocks the VM freed until the guest trims them"})
+    return found
+
+
+def clean_vm_trim(dry_run: bool) -> list[dict]:
+    """`clean --trim-vm`: the guided steps, for each Colima VM whose disk occupies CLEAN_VM_TRIM_MIN_BYTES or more and that was stopped
+    before. A VM that is running (or whose state Colima cannot give) is left alone. Once started, the VM is stopped again whatever
+    a step returned. Each run writes a receipt with the steps' exit codes and the disk's size before and after."""
+    results = []
+    for vm in clean_vm_disks():
+        out = {"name": "colima:" + vm["profile"], "bytesBefore": vm["bytes"], "steps": [" ".join(s) for s in clean_vm_steps(vm["profile"])]}
+        results.append(out)
+        if vm["bytes"] < CLEAN_VM_TRIM_MIN_BYTES:
+            out["skipped"] = f"below-threshold:{vm['bytes'] >> 20}MB-of-{CLEAN_VM_TRIM_MIN_BYTES >> 20}MB"
+            continue
+        missing = clean_installed("colima")
+        status = None if missing else clean_vm_status(vm["profile"])
+        if missing or vm["running"] or status != "Stopped":
+            out["skipped"] = missing or ("vm-not-stopped:" + (status or ("running" if vm["running"] else "unknown")))
+            continue
+        if dry_run:
+            out["skipped"] = "dry-run"
+            continue
+        entry = {"kind": "vm-disk", "name": out["name"], "path": vm["disks"][-1], "command": "; ".join(out["steps"])}
+        run_id = uuid.uuid4().hex[:12]
+        clean_receipt("plan", entry, run_id, bytes=vm["bytes"])
+        codes, steps = [], clean_vm_steps(vm["profile"])
+        try:
+            for step in steps[:-1]:
+                code, _ = clean_run(step, CLEAN_VM_STEP_SECONDS)
+                codes.append(code)
+                if code != 0:
+                    break
+        finally:
+            codes.append(clean_run(steps[-1], CLEAN_VM_STEP_SECONDS)[0])   # stopped again, as it was found
+        after = next((v["bytes"] for v in clean_vm_disks() if v["profile"] == vm["profile"]), None)
+        out.update(exitCodes=codes, bytesAfter=after, outcome="trimmed" if all(c == 0 for c in codes) and len(codes) == len(steps) else "failed")
+        clean_receipt("result", entry, run_id, outcome=out["outcome"], exitCodes=codes, bytesBefore=vm["bytes"], bytesAfter=after)
+    return results
 
 
 # ---- refusals the filesystem makes -------------------------------------------------------------------------------------------------
@@ -1805,11 +2429,19 @@ def clean_plan(only: set, deep: bool, errors: list, skipped: list, days: float, 
             except OSError as error:
                 errors.append({"clean": spec["name"], "path": clean_tilde(root), "error": clean_os_refusal(error)})
                 continue
+            small = None
+            if spec.get("minBytes"):   # a cache this small is left alone: it is cheaper to keep than to fetch again
+                size = reap_metadata_size(root, CLEAN_SIZE_SECONDS)
+                if not size["complete"] or (size["bytes"] or 0) < spec["minBytes"]:
+                    small = f"below-threshold:{(size['bytes'] or 0) >> 20}MB-of-{spec['minBytes'] >> 20}MB" if size["complete"] \
+                        else "size-incomplete:" + str(size.get("reason"))
             for child in sorted(clean_scan(root, spec["name"], errors), key=lambda c: c.name):
                 entry = {"name": spec["name"], "kind": "folder-cache", "path": child.path, "root": root, "paths": [child.path], "tier": "safe"}
                 try:
                     if not child.is_dir(follow_symlinks=False):
                         continue
+                    if small:
+                        raise ReapRefused(small)
                     if busy:
                         raise ReapRefused("in-use:" + ",".join(busy))
                     clean_folder_gates(child.path)
@@ -1885,7 +2517,7 @@ def clean_run_tool(entry: dict, run_id: str) -> None:
     clean_receipt("plan", entry, run_id)
     before = clean_free()
     try:
-        done = subprocess.run(entry["spec"]["argv"], stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
+        done = subprocess.run(entry.get("argv") or entry["spec"]["argv"], stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
                               timeout=CLEAN_TOOL_SECONDS, env={**os.environ, **CLEAN_TOOL_ENV}, cwd=clean_home())
         last = (done.stderr.strip() or done.stdout.strip()).splitlines()[-1:] or [""]
         outcome = "cleaned" if done.returncode == 0 else f"failed:exit-{done.returncode}:{last[0][:200]}"
@@ -2069,6 +2701,7 @@ def clean_inventory() -> list[dict]:
         if count:
             found.append({"kind": "snapshots", "name": "local snapshots", "count": count, "bytes": None,
                           "note": "macOS frees them when space runs low; `sudo tmutil deletelocalsnapshots /` removes them now"})
+    found.extend(clean_vm_inventory())
     for entry in found:
         entry.setdefault("paths", [entry["path"]] if "bytes" not in entry and entry.get("path") else [])
     clean_size_all([e for e in found if e["paths"]])
@@ -2264,6 +2897,7 @@ def clean_pass_run(dry_run: bool, deep: bool, only: list | None, report: bool, p
                 entry["bytes"], entry["sizeComplete"] = known or (0, True)
         clean_size_all(to_size)
         sizes.update({clean_entry_key(e): (e["bytes"], e["sizeComplete"]) for e in to_size})
+        clean_tool_thresholds(entries)
         entries.sort(key=lambda e: ("keep" in e, -e["bytes"]))
         found = [e for e in entries if "keep" not in e and clean_entry_key(e) not in candidate_keys]
         report_rung = {"rung": CLEAN_STEADY if steady else position, "name": rung["name"], "candidates": len(found),
@@ -2356,7 +2990,7 @@ def clean_pass_run(dry_run: bool, deep: bool, only: list | None, report: bool, p
                        "removedBytes": None if dry_run else removed_total, "freedBytes": freed,
                        "freedNote": ("removed more than the volume gained: other writers used the space meanwhile" if freed is not None and removed_total > 0 and freed < removed_total * 0.5
                                      else "nothing was removed; free space fell because other programs wrote" if freed is not None and freed < 0 and not removed_total else None)},
-           "rungs": reports, "topBlockers": clean_blockers(all_entries, jobs_kept),
+           "rungs": reports, "topBlockers": clean_blockers(all_entries, jobs_kept), "byRule": clean_by_rule(all_entries, sorted(chosen)),
            "items": [clean_shown(e) for e in all_entries], "skippedRepos": skipped,
            "errors": errors + [{"clean": e["name"], "path": clean_tilde(e.get("path") or ""), "error": e["outcome"], "reason": e.get("reason")} for e in failed]}
     if dedupe_out is not None:
