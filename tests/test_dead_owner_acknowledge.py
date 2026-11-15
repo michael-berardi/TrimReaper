@@ -5,6 +5,7 @@ by that report: every path is re-gated by the normal sweep. A live, unknown or u
 a person. Real flocks and child processes inside a temporary home."""
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -68,6 +69,33 @@ class DeadOwnerAcknowledge(unittest.TestCase):
         finally:
             os.close(fd)
         return run
+
+    def test_busy_lock_reports_unknown_holder_and_age_without_reading_the_journal(self):
+        self.lock.parent.mkdir(parents=True, mode=0o700)
+        parent = self.home
+        for component in host.REAP_OWNER_DIRS:
+            parent = parent / component
+            os.chmod(parent, 0o700)
+        stale = b'{"run":"0123456789ab","pid":123456,"phase":"started"}\n'
+        self.lock.write_bytes(stale)
+        os.chmod(self.lock, 0o600)
+        with self.lock.open("r+b") as holder:
+            fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            for inspect in (False, True):
+                with self.subTest(inspect=inspect), mock.patch.object(core.os, "read", side_effect=AssertionError("read busy journal")):
+                    with self.assertRaises(core.ReapRefused) as raised:
+                        with core.reap_cleanup_owner("test", inspect=inspect):
+                            self.fail("a busy lock must refuse")
+                message = str(raised.exception)
+                self.assertTrue(message.startswith("cleanup-owner-busy:"), message)
+                self.assertIn("holder unknown", message)
+                self.assertIn("age unknown", message)
+                self.assertIn("owner status cannot be inspected until the lock is released", message)
+                self.assertNotIn("123456", message)
+                self.assertNotIn("0123456789ab", message)
+                self.assertEqual(self.lock.read_bytes(), stale)
+        with core.reap_cleanup_owner("inspect", inspect=True) as status:
+            self.assertEqual(status["handoff"]["run"], "0123456789ab")
 
     def test_interrupted_run_with_a_dead_owner_is_acknowledged_by_the_next_clean_and_it_proceeds(self):
         run = self.interrupted_run(self.dead_pid())

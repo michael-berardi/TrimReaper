@@ -8,6 +8,8 @@ a change of the folder's identity or ctime invalidates it, and the removal walks
 """
 from __future__ import annotations
 
+import contextlib
+
 import json
 import os
 import time
@@ -31,7 +33,7 @@ class ScratchCursor(ScratchHome):
             self.put(self.scratch(name), "inner.txt")  # changed now: every proof is `recent-change`
 
     def meta(self, key: str):
-        with self.state() as conn:
+        with contextlib.closing(self.state()) as conn, conn:
             found = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
         return found[0] if found else None
 
@@ -121,7 +123,7 @@ class ScratchCursor(ScratchHome):
     def test_a_proof_older_than_its_lifetime_is_taken_again(self):
         self.make(("a-task",))
         self.listing()
-        with self.state() as conn:
+        with contextlib.closing(self.state()) as conn, conn:
             proofs = json.loads(self.meta("reaper:agent-scratch-proofs"))
             proofs["a-task"]["at"] -= core.AGENT_SCRATCH_PROOF_SECONDS + 10
             conn.execute("UPDATE meta SET value=? WHERE key='reaper:agent-scratch-proofs'", (json.dumps(proofs),))

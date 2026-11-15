@@ -161,7 +161,8 @@ class ScratchUnsaved(UnsavedFixtures):
         task = self.scratch("held")
         self.age(task, 9)
         process = subprocess.Popen(["sleep", "30"], cwd=worktree)
-        self.addCleanup(process.kill)
+        self.addCleanup(process.wait)
+        self.addCleanup(process.kill)  # Cleanups run in reverse: kill before reaping the child.
 
         out = self.cli("reap", "--scratch")
 

@@ -3,6 +3,8 @@
 Occupancy here follows the real bytes under the fixture home, so a rung only counts when it really freed something."""
 from __future__ import annotations
 
+import contextlib
+
 import json
 import os
 import sqlite3
@@ -366,7 +368,7 @@ def interrupt(test, job: str, hours_ago: float, waits_on: str | None = None):
     """A job the host lost the worker of: interrupted, with its own verified interruption clock."""
     stamp = time.time() - hours_ago * 3600
     meta = {"interrupted": {"at": stamp}, **({"waitingOn": {"job": waits_on}} if waits_on else {})}
-    with test.state() as conn, conn:
+    with contextlib.closing(test.state()) as conn, conn:
         conn.execute("UPDATE jobs SET status='interrupted', created_at=?, started_at=?, finished_at=?, meta=? WHERE id=?",
                      (stamp - 7200, stamp - 3600, stamp, json.dumps(meta), job))
 
@@ -416,7 +418,7 @@ class FinishedJobs(Ladder):
         self.add_job("J-4301", status="running")
         self.add_job("J-4302", status="parked")
         running, parked = self.cache("J-4301", "fixtures"), self.cache("J-4302", "fixtures")
-        with self.state() as conn, conn:
+        with contextlib.closing(self.state()) as conn, conn:
             conn.execute("UPDATE jobs SET finished_at=? WHERE id IN ('J-4301','J-4302')", (time.time() - 9 * DAY,))
         self.fill_to(99)
         self.clean_all()
@@ -444,7 +446,7 @@ class FinishedJobs(Ladder):
         self.add_job("J-4501", status="running")
         interrupt(self, "J-4501", hours_ago=3, waits_on="J-4500")
         self.add_job("J-4503", status="parked")
-        with self.state() as conn, conn:
+        with contextlib.closing(self.state()) as conn, conn:
             conn.execute("UPDATE jobs SET meta=? WHERE id='J-4503'", (json.dumps({"waitingOn": {"job": "J-4502"}}),))
         self.fill_to(99)
         self.clean_all()

@@ -6184,7 +6184,7 @@ def reap_cleanup_owner(scope: str, acknowledge: dict | None = None, inspect: boo
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError as error:
                 if error.errno in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES):
-                    raise ReapRefused("cleanup-owner-busy:another-worker-is-reaping; read its handoff and receipts before retrying")
+                    raise ReapRefused("cleanup-owner-busy:lock held; holder unknown; age unknown; owner status cannot be inspected until the lock is released; then read the handoff and receipts before retrying")
                 raise
             current = os.stat("disk-cleanup.lock", dir_fd=dfd, follow_symlinks=False)
             if (info.st_dev, info.st_ino) != (current.st_dev, current.st_ino):

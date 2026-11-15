@@ -1,6 +1,8 @@
 """The engine's escalation hooks: shorter windows for one rung, pins released by finished or long-interrupted jobs, ACLs named."""
 from __future__ import annotations
 
+import contextlib
+
 import json
 import subprocess
 import sys
@@ -71,7 +73,7 @@ class Pins(Home):
     def job(self, name, status, meta=None):
         self.add_job(name, status="running")
         stamp = time.time()
-        with self.state() as conn, conn:
+        with contextlib.closing(self.state()) as conn, conn:
             conn.execute("UPDATE jobs SET status=?, meta=?, finished_at=? WHERE id=?",
                          (status, json.dumps(meta) if meta else None, stamp if status in core.REAP_TERMINAL else None, name))
         return {"id": name, "status": status, "meta": json.dumps(meta) if meta else None}

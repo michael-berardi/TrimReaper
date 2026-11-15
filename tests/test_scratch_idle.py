@@ -1,6 +1,8 @@
 """The idle proof of an agent-scratch folder: it covers the whole tree, and the budget it spends is on the record."""
 from __future__ import annotations
 
+import contextlib
+
 import json
 import os
 import stat
@@ -555,7 +557,7 @@ class ScratchIdle(ScratchHome):
                 out = core.reap_agent_scratch(False)
                 self.assertEqual(out["deleted"], 0)
         self.assertEqual(checked, [p.name for p in tasks])
-        with self.state() as conn:
+        with contextlib.closing(self.state()) as conn, conn:
             cursor = conn.execute("SELECT value FROM meta WHERE key='reaper:agent-scratch-cursor'").fetchone()
         self.assertEqual(cursor[0], "c-task")
 
@@ -638,7 +640,7 @@ class ScratchIdle(ScratchHome):
         def cursor():
             if not (self.home / ".local" / "state" / "trimreaper" / "state.sqlite3").exists():
                 return None  # a read-only pass may not create the store at all
-            with self.state() as conn:
+            with contextlib.closing(self.state()) as conn, conn:
                 return conn.execute("SELECT value FROM meta WHERE key='reaper:agent-scratch-cursor'").fetchone()
 
         self.assertIsNone(cursor())
@@ -647,7 +649,7 @@ class ScratchIdle(ScratchHome):
         core.reap_agent_scratch_items(time.monotonic() + 10)  # the audit's own listing
         self.assertIsNone(cursor())
         self.cli("reap", "--scratch")  # the deletion pass is the one that records where the listing stopped
-        with self.state() as conn:
+        with contextlib.closing(self.state()) as conn, conn:
             self.assertEqual(conn.execute("SELECT value FROM meta WHERE key='reaper:agent-scratch-cursor'").fetchone()[0], "b-task")
 
     def test_a_listed_unmarked_item_without_a_proof_is_kept_without_a_walk(self):

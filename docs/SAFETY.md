@@ -11,7 +11,8 @@ finishes, in case it is resumed. A **build queue** is any tool that takes a per-
 
 1. **One owner.** Only one removing process holds the cleanup journal lock
    (`<reap home>/.local/state/trimreaper/cleanup/disk-cleanup.lock`). A previous run that stopped part-way blocks the next
-   until someone acknowledges it (below).
+   until someone acknowledges it (below). While the lock is held, its holder and age are unknown and owner status cannot be
+   inspected; after release, inspect `trimreaper owner status` and the handoff and receipts before retrying.
 2. **Retention.** Only the `disposable` class is ever removed. It comes from a `.ut-retention-disposable` marker on the
    folder, or is derived in a few named cases: build output in a finished job's clone, a tool cache (valid
    `CACHEDIR.TAG`), an expired clone or scratch folder. A separate `markedEvidenceExpiryDays` (5) rule also derives disposable for marked job-cache children strictly after terminal completion plus that window, only with a surviving regular, owned, non-empty `report.md`. Reports, summary/outcome, handoffs, receipts, customer, release/runtime/rollback and protected-archive material stay. A name is a class: a record in any position, a camelCase name, a retained class (customer, release, runtime, rollback, credential, secret, signing, entitlement, keychain, provisioning, certificate, token, key, cloud or OAuth material) and a key, certificate or profile extension are all retained, and a folder holding such a name anywhere below it is kept whole, because a job cache subdirectory is removed as a unit. An evidence marker on the job root may expire its bulky children but the root and marker stay. Other preserving markers still win.

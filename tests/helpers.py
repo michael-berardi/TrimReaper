@@ -89,7 +89,9 @@ class Home(unittest.TestCase):
         return json.loads(text) if text.strip() else None
 
     def state(self) -> sqlite3.Connection:
-        return sqlite3.connect(str(self.home / ".local" / "state" / "trimreaper" / "state.sqlite3"))
+        conn = sqlite3.connect(str(self.home / ".local" / "state" / "trimreaper" / "state.sqlite3"))
+        self.addCleanup(conn.close)  # Also cover callers that keep a connection until fixture teardown.
+        return conn
 
     def add_job(self, job: str, cwd: Path | None = None, status: str = "done", finished_ago: float = 3600):
         args = ["job", "add", job, "--status", "running"]

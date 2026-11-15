@@ -19,7 +19,7 @@ curl -fsSL https://github.com/michael-berardi/TrimReaper/releases/latest/downloa
 
 The installer verifies the release wheel's SHA-256, installs into `~/.trimreaper`, and
 puts the command in `~/.local/bin`. It needs no sudo and changes no shell profiles.
-Follow its PATH hint if needed. Re-run to upgrade; set `TRIMREAPER_VERSION=0.19.5` on the
+Follow its PATH hint if needed. Re-run to upgrade; set `TRIMREAPER_VERSION=0.19.6` on the
 installer process to pin a release. Linux and Windows are not supported.
 
 Installer overrides: `TRIMREAPER_HOME` (install directory) and `TRIMREAPER_BIN_DIR`
@@ -83,7 +83,7 @@ preserve folders; `disposable` permits removal subject to the other checks.
 
 Operational commands print JSON. Exit codes: `0` completed (kept folders are not errors),
 `2` refused or failed, `3` partial pass or reported errors. Help and version output are text.
-A stopped cleanup may require receipt review and [owner acknowledgment](docs/SAFETY.md#acknowledging-a-stopped-run).
+A busy cleanup lock reports that its holder and age are unknown; retry after it is released. A stopped cleanup may require receipt review and [owner acknowledgment](docs/SAFETY.md#acknowledging-a-stopped-run).
 
 ## MCP
 

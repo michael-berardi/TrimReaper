@@ -1,6 +1,8 @@
 """The MCP server: the protocol handshake, the tool list, and tools that act exactly like the CLI."""
 from __future__ import annotations
 
+import contextlib
+
 import io
 import json
 import os
@@ -42,7 +44,7 @@ class Server(Home):
         self.put(repo, "node_modules/pkg/index.js")
         self.assertFalse(self.tool("job_add", id="J-0200", cwd=str(repo))["isError"])
         self.assertFalse(self.tool("job_status", id="J-0200", status="done")["isError"])
-        with self.state() as conn:
+        with contextlib.closing(self.state()) as conn, conn:
             conn.execute("UPDATE jobs SET finished_at=finished_at-3600")
 
         dry = self.tool("reap", job="J-0200")

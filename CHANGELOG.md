@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.19.6 (2026-11-15)
+
+- A busy cleanup lock now explains that the holder and lock age cannot be verified until the lock is released. Locking and removal checks are unchanged.
+
 ## 0.19.5 (2026-11-15)
 
 - MCP rejects explicitly supplied non-object params and tool arguments, including null, false, zero, empty strings and empty arrays, instead of silently treating them as omitted. Omitted objects still use the existing defaults. No removal rules changed.
