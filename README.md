@@ -19,13 +19,15 @@ curl -fsSL https://github.com/michael-berardi/TrimReaper/releases/latest/downloa
 
 The installer verifies the release wheel's SHA-256, installs into `~/.trimreaper`, and
 puts the command in `~/.local/bin`. It needs no sudo and changes no shell profiles.
-Follow its PATH hint if needed. Re-run to upgrade; set `TRIMREAPER_VERSION=0.19.4` on the
+Follow its PATH hint if needed. Re-run to upgrade; set `TRIMREAPER_VERSION=0.19.5` on the
 installer process to pin a release. Linux and Windows are not supported.
 
 Installer overrides: `TRIMREAPER_HOME` (install directory) and `TRIMREAPER_BIN_DIR`
 (command directory). Set them only for installation: at runtime, `TRIMREAPER_HOME`
 means the home folder TrimReaper may clean. Remove the default installation by deleting
 `~/.trimreaper` and `~/.local/bin/trimreaper`.
+
+### From source
 
 From a checkout, no installation or runtime dependencies are needed:
 
@@ -107,3 +109,7 @@ Policy changes, scheduling and owner acknowledgment stay on the CLI.
 - [Embedding the engine](docs/EMBEDDING.md)
 - [Tests and contributions](CONTRIBUTING.md)
 - [Security reports](SECURITY.md) · [Changelog](CHANGELOG.md) · [MIT license](LICENSE)
+
+---
+
+Part of [Pareto Cybernetics](https://paretocybernetics.com/projects/trimreaper/): free, private, open-source tools for working with AI agents.

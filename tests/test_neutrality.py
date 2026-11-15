@@ -81,13 +81,17 @@ def _shipped_files():
     ]
 
 
+# Public repository links are installation instructions, not operator configuration.
+PUBLIC_REPO_URL = re.compile(r"https://github\.com/michael-berardi/TrimReaper(?=/|[\s)#?]|$)")
+
+
 def _scan(pattern):
     hits = []
     for filepath in _shipped_files():
         try:
             with open(filepath, "r", encoding="utf-8", errors="replace") as handle:
                 for lineno, line in enumerate(handle, 1):
-                    if pattern.search(line):
+                    if pattern.search(PUBLIC_REPO_URL.sub("", line)):
                         rel = os.path.relpath(filepath, ROOT)
                         hits.append(f"{rel}:{lineno}: {line.strip()[:120]}")
         except OSError:
@@ -96,6 +100,14 @@ def _scan(pattern):
 
 
 class NeutralityTest(unittest.TestCase):
+    def test_public_repo_url_exception_is_narrow(self):
+        base = "https://github.com/michael-berardi/TrimReaper"
+        for suffix in ("", "/releases/latest/download/install.sh", ")", "#readme"):
+            self.assertIsNone(PERSONAL.search(PUBLIC_REPO_URL.sub("", base + suffix)))
+        for value in (base + "-other", base.replace("github.com", "example.com"),
+                      base.replace("TrimReaper", "unrelated"), base + " unrelated Berardi"):
+            self.assertIsNotNone(PERSONAL.search(PUBLIC_REPO_URL.sub("", value)))
+
     def test_private_terms_loader(self):
         with tempfile.TemporaryDirectory() as directory:
             terms = os.path.join(directory, "terms.txt")

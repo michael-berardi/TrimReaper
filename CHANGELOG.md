@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.19.5 (2026-11-15)
+
+- MCP rejects explicitly supplied non-object params and tool arguments, including null, false, zero, empty strings and empty arrays, instead of silently treating them as omitted. Omitted objects still use the existing defaults. No removal rules changed.
+- Setup uses the published installer URL. The shorter README links to a cleanup reference with corrected archive, stash and steady-pass descriptions.
+
 ## 0.19.4 (2026-11-14)
 
 - The in-use check now sees a temp folder that a running process names by its short path. A process names its temp folder
