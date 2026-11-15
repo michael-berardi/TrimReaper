@@ -306,7 +306,7 @@ These also remove files, each with its own checks:
     unlocked, the folder's parent exists (an empty mount point passes this, as in the engine's archive rule) and the
     commit check passes.
   - Repository dependencies and Rust debug/incremental output must be ignored and untracked, in a repository whose Git state is clean (including hidden index changes) and whose HEAD is already held by a remote. A stash does not preserve this ignored, untracked output; it remains in Git metadata. An enclosing retention marker other than `disposable`, or a running job that owns the project, keeps the output. Collection-root working directories such as the home or code folder do not name a project. Actual removal holds the canonical build-queue project lock, creating it if needed, plus existing Cargo locks for Rust, through the fresh Git, retention, process and boundary checks and result receipt. Release artifacts stay.
-  - Older Playwright builds may be removed when a newer build of that same browser exists and no process uses the old one. Models, Docker's disk image and local snapshots are only measured.
+  - Older Playwright builds may be removed when a newer build of that same browser exists, no Playwright install registered in the cache's `.links` lists the old one (checked again just before removal), it is at least an hour old and no process uses it. Models, Docker's disk image and local snapshots are only measured.
 
 - **Evidence expiry** (`reap --job ... --expire-evidence`, and `tick`) unlinks old screenshots, recordings, traces and
   logs one file at a time. It holds the same owner lock and job authority, writes plan and result receipts, records each

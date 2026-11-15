@@ -934,6 +934,40 @@ def clean_browser_builds(root: str, errors: list | None = None) -> list[tuple[st
     return found
 
 
+def clean_playwright_needed(root: str) -> set[str]:
+    """Cache folder names registered by the Playwright installations still present."""
+    needed = set()
+    try:
+        links = list(os.scandir(os.path.join(root, ".links")))
+    except OSError:
+        return needed
+    for link in links:
+        try:
+            with open(link.path, encoding="utf-8") as f:
+                package = f.read().strip()
+            if not os.path.isabs(package) or not os.path.isdir(package):
+                continue
+            with open(os.path.join(package, "browsers.json"), encoding="utf-8") as f:
+                data = json.load(f)
+            browsers = data.get("browsers", []) if isinstance(data, dict) else []
+            if not isinstance(browsers, list):
+                continue
+            for browser in browsers:
+                if not isinstance(browser, dict) or not isinstance(browser.get("name"), str):
+                    continue
+                name = browser["name"].replace("-", "_")
+                overrides = browser.get("revisionOverrides")
+                revisions = [browser.get("revision")]
+                if isinstance(overrides, dict):
+                    revisions.extend(overrides.values())
+                for revision in revisions:
+                    if isinstance(revision, str) and revision.isascii() and revision.isdigit():
+                        needed.add(f"{name}-{revision}")
+        except (OSError, UnicodeError, ValueError):
+            continue
+    return needed
+
+
 # Folders that never hold a Rust crate's target: dependency stores, virtual environments, generated web output and tool caches.
 # (A walk of the dev and .cache homes listed 2.3 million entries, mostly these, and gave up at the 500,000-entry budget.)
 CLEAN_RUST_SCAN_SKIP = frozenset({".git", "node_modules", "Library", ".cache", ".local", ".Trash", "dist", "build", "vendor", ".venv", "venv", "__pycache__",
@@ -1567,6 +1601,10 @@ def clean_extra_gates(entry: dict, table: dict | None = None) -> None:
         if now() - info.st_mtime < 3600:
             raise ReapRefused("recent:less-than-1h")
     else:
+        if os.path.basename(path) in clean_playwright_needed(entry["root"]):
+            raise ReapRefused("needed-by-playwright-install")
+        if now() - os.lstat(path).st_mtime < 3600:
+            raise ReapRefused("recent:less-than-1h")
         builds = clean_browser_builds(entry["root"])
         if not any(browser == entry["browser"] and build > entry["build"] for _, browser, build in builds):
             raise ReapRefused("newest-browser-build")
@@ -1644,8 +1682,10 @@ def clean_extra_entries(only: set, errors: list, idle_hours: int = 48, rung: dic
                     add("browser-clones", clone.path, root)
     if "playwright" in only:
         root = clean_home("Library", "Caches", "ms-playwright")
+        needed = clean_playwright_needed(root)
         for path, browser, build in clean_browser_builds(root, errors):
-            add("playwright", path, root, browser=browser, build=build)
+            if os.path.basename(path) not in needed:
+                add("playwright", path, root, browser=browser, build=build)
     table = reap_process_table() if entries else None
     for entry in entries:
         try:
@@ -2015,7 +2055,7 @@ def clean_inventory() -> list[dict]:
         found.append({"kind": "model", "name": "ollama", "path": ollama, "note": "`ollama rm <model>` removes one"})
     browsers = os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or (clean_home("Library", "Caches", "ms-playwright") if os.uname().sysname == "Darwin"
                                                               else clean_home(".cache", "ms-playwright"))
-    children("browser", browsers, "a project pinned to this Playwright version downloads it again")
+    children("browser", browsers, "cleanup keeps builds needed by registered Playwright installs, the newest per browser, and builds less than one hour old")
     raw = clean_home("Library", "Containers", "com.docker.docker", "Data", "vms", "0", "data", "Docker.raw")
     try:
         info = os.lstat(raw)

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.19.7 (2026-11-15)
+
+- Browser builds that an installed Playwright still needs are kept. When two projects on different Playwright versions
+  shared one browser cache, the `playwright` cleanup removed the older project's builds because the newer project had
+  newer ones, and that project's browser tests then failed with `Executable doesn't exist`. Cleanup now reads the
+  installs Playwright registers in the cache (`.links`) and keeps every build one of them lists, checking again just
+  before removal. A build less than an hour old is also kept, so a download in progress is never removed. The newest
+  build of each browser stays, as before.
+
 ## 0.19.6 (2026-11-15)
 
 - A busy cleanup lock now explains that the holder and lock age cannot be verified until the lock is released. Locking and removal checks are unchanged.

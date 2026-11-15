@@ -28,7 +28,7 @@ trimreaper clean --steady        # the quiet pass: long-idle repository output a
 | Temp folders | A folder of yours in the shared temp folder after a day without a change, and in your per-user temp folder after three days, when nothing in it changed in that time and no process uses it. Folders the system or running apps manage there (`com.apple.*`, sockets, locks) are never candidates |
 | Browser code-sign clones (macOS) | A browser copies its app bundle into your per-user `X` folder at every launch and removes it on quit; a killed browser (automation, a crash) leaves one behind each time. Each abandoned copy goes after an hour when no process has it open |
 | Go module cache, unused Docker images, unavailable simulators | Only with `--deep` (`xcrun simctl delete unavailable` also deletes the app data of simulators the selected Xcode cannot run) |
-| Superseded Playwright browser builds | Older builds only, when a newer build of the same browser is installed and no process uses the old one |
+| Superseded Playwright browser builds | Older builds only, when a newer build of the same browser is installed, no installed Playwright still needs the old one, it is at least an hour old and no process uses it |
 | Local models (Hugging Face, Ollama, LM Studio), Docker's disk image, local snapshots | Reported with their size. Never removed |
 
 Worktrees are found through `git worktree list` in every repository in `cloneBases`, and in the folders where agent tools

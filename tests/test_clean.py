@@ -286,6 +286,7 @@ class Debris(Home):
         root = self.home / "Library/Caches/ms-playwright"
         for name in ("chromium-99", "chromium-100", "firefox-8", "firefox-10", "chromium_headless_shell-12", "chromium_headless_shell-13", "unknown"):
             self.put(root, name + "/browser")
+        self.age(root, 1)  # a build less than an hour old is kept as possibly mid-download
         return root
 
     def test_playwright_keeps_newest_numeric_build_of_each_browser(self):
@@ -308,6 +309,79 @@ class Debris(Home):
         clean.shutil.rmtree(root / "chromium-100")
         with self.assertRaisesRegex(clean.ReapRefused, "newest-browser-build"):
             clean.clean_act(entry, "fixture", 7)
+
+    def test_playwright_keeps_builds_a_registered_install_still_needs(self):
+        # Two installs share one cache: an older pinned Playwright needs builds a newer one has superseded.
+        root = self.home / "Library/Caches/ms-playwright"
+        links = root / ".links"
+        links.mkdir(parents=True)
+        old = ["chromium-1243", "chromium_headless_shell-1243", "ffmpeg-1011"]
+        new = ["chromium-1255", "chromium_headless_shell-1255", "ffmpeg-1013"]
+        for name in old + new + ["webkit-2251", "webkit-2359"]:
+            self.put(root, name + "/browser")
+            self.age(root / name, 2 / 24)
+
+        def install(label, revisions):
+            package = self.tmp / "installs" / label
+            package.mkdir(parents=True)
+            (package / "browsers.json").write_text(json.dumps({"browsers": [
+                {"name": "chromium", "revision": revisions[0]},
+                {"name": "chromium-headless-shell", "revision": revisions[0]},
+                {"name": "ffmpeg", "revision": revisions[1]},
+                {"name": "webkit", "revision": "2359", "revisionOverrides": {"mac14": "2251"}},
+            ]}))
+            (links / label).write_text(str(package))
+            return package
+
+        first = install("a", ("1243", "1011"))
+        install("b", ("1255", "1013"))
+        (links / "broken").write_text(str(self.tmp / "gone"))
+        (links / "invalid").write_text(str(links))  # an existing folder without browsers.json
+        self.assertIn("webkit-2251", clean.clean_playwright_needed(str(root)))
+
+        def entry(name):
+            browser, build = name.rsplit("-", 1)
+            return {"name": "playwright", "kind": "debris", "path": str(root / name), "root": str(root), "browser": browser, "build": int(build)}
+
+        def candidates():
+            errors = []
+            found = clean.clean_extra_entries({"playwright"}, errors)
+            self.assertEqual(errors, [])
+            return {Path(e["path"]).name: e for e in found}
+
+        def last_look(e):
+            # clean_act's delete-time check, without removing anything.
+            with mock.patch.object(clean, "clean_remove_folder", side_effect=lambda e, run, root, git, gate: gate()):
+                clean.clean_act(e, "fixture", 7)
+
+        offered = candidates()
+        self.assertTrue(set(old + new).isdisjoint(offered), offered)
+        for name in old:
+            with self.assertRaisesRegex(clean.ReapRefused, "^needed-by-playwright-install$"):
+                last_look(entry(name))
+        (first / "browsers.json").unlink()
+        first.rmdir()
+        offered = candidates()
+        for name in old:
+            self.assertIn(name, offered)
+            self.assertNotIn("keep", offered[name])
+            last_look(entry(name))
+        # The newest build of each browser stays even when no install registers it.
+        (links / "b").unlink()
+        for name in new:
+            with self.assertRaisesRegex(clean.ReapRefused, "^newest-browser-build$"):
+                last_look(entry(name))
+        os.utime(root / old[0], None)
+        with self.assertRaisesRegex(clean.ReapRefused, "^recent:less-than-1h$"):
+            last_look(entry(old[0]))
+        # An install registered after the scan is checked again at deletion.
+        install("c", ("1243", "1011"))
+        with self.assertRaisesRegex(clean.ReapRefused, "^needed-by-playwright-install$"):
+            last_look(offered[old[1]])
+        # A real pass removes nothing any registered install needs.
+        self.run_target("playwright")
+        for name in old + ["webkit-2251", "webkit-2359"]:
+            self.assertTrue((root / name).exists(), name)
 
     def test_docker_build_gate_and_colima_trim_commands(self):
         for command in ("123 docker build .", "123 docker buildx build .", "123 /bin/docker-buildx build ."):
