@@ -97,6 +97,26 @@ class DeadOwnerAcknowledge(unittest.TestCase):
         with core.reap_cleanup_owner("inspect", inspect=True) as status:
             self.assertEqual(status["handoff"]["run"], "0123456789ab")
 
+    def test_wait_timeout_reports_retry_and_only_valid_unverified_snapshot(self):
+        self.lock.parent.mkdir(parents=True, mode=0o700)
+        parent = self.home
+        for component in host.REAP_OWNER_DIRS:
+            parent = parent / component
+            os.chmod(parent, 0o700)
+        for journal, snapshot_expected in ((b'partial', False),
+            (b'{"run":"0123456789ab","pid":123456,"scope":"clean","phase":"started"}\n', True)):
+            self.lock.write_bytes(journal)
+            os.chmod(self.lock, 0o600)
+            with self.lock.open("r+b") as holder:
+                fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with self.assertRaises(core.ReapRefused) as raised:
+                    with core.reap_cleanup_owner("test", wait=0.05):
+                        self.fail("a busy lock must refuse")
+                message = str(raised.exception)
+                self.assertIn("lock held by an active owner; waited 0.05 seconds; retry after the owner finishes", message)
+                self.assertEqual("unverified journal snapshot (not proof of holder)" in message, snapshot_expected)
+                self.assertEqual(self.lock.read_bytes(), journal)
+
     def test_interrupted_run_with_a_dead_owner_is_acknowledged_by_the_next_clean_and_it_proceeds(self):
         run = self.interrupted_run(self.dead_pid())
         with core.reap_cleanup_owner("clean") as owner:

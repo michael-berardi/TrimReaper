@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.1 (2026-11-15)
+
+- Cleanup owners can wait briefly for a busy lock and preview interrupted handoffs without changing them. A timed-out wait says how long it waited and when to retry; any journal snapshot is explicitly unverified.
+
 ## 0.20.0 (2026-11-15)
 
 - New clean targets for space that had to be reclaimed by hand (a disk at 88% brought to 70%). Each goes through the guarded

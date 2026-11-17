@@ -6128,8 +6128,31 @@ def reap_dead_owner_report(previous: dict | None, phase: str, state: str | None 
                   "receiptRecords": len(records), "ownerState": state}
 
 
+FIXTURE_CLEANUP_WAIT_SECONDS = 2.0
+
+
+def reap_busy_snapshot(fd: int) -> str:
+    """Diagnostic only: an unlocked journal may be stale, partial, or unrelated to the flock holder."""
+    fallback = "holder unknown (unverified journal snapshot unavailable)"
+    try:
+        size = os.fstat(fd).st_size
+        tail = os.pread(fd, min(size, 16384), max(0, size - 16384))
+        if not tail.endswith(b"\n"):
+            return fallback
+        note = json.loads(tail.splitlines()[-1])
+        if (not isinstance(note, dict) or note.get("phase") != "started"
+                or not re.fullmatch(r"[0-9a-f]{12}", str(note.get("run", "")))
+                or type(note.get("pid")) is not int or note["pid"] <= 0
+                or not isinstance(note.get("scope"), str)
+                or not re.fullmatch(r"[a-zA-Z0-9:_.-]{1,100}", note["scope"])):
+            return fallback
+        return f"unverified journal snapshot (not proof of holder): run {note['run']}, pid {note['pid']}, scope {note['scope']}"
+    except (OSError, ValueError, IndexError, TypeError):
+        return fallback
+
+
 @contextmanager
-def reap_cleanup_owner(scope: str, acknowledge: dict | None = None, inspect: bool = False, expected: str | None = None):
+def reap_cleanup_owner(scope: str, acknowledge: dict | None = None, inspect: bool = False, expected: str | None = None, wait: float = 0, preview: bool = False):
     """One deleting worker per artifact home, across jobs, releases, ticks and state directories.
     Keep the inode permanently: unlinking a busy lock would admit a second worker. The private journal in the
     locked file is the handoff note; an interrupted/missing final note refuses the next sweep for investigation.
@@ -6141,7 +6164,7 @@ def reap_cleanup_owner(scope: str, acknowledge: dict | None = None, inspect: boo
             raise ReapRefused("cleanup-owner-busy:cannot-acknowledge-an-active-sweep")
         if expected is not None:
             raise ReapRefused("cleanup-owner-busy:cannot-compact-an-active-sweep")
-        if held.get("stopped") and not inspect:
+        if held.get("stopped") and (not inspect or preview):
             raise ReapRefused("cleanup-handoff-stopped:" + held["stopped"])
         if held["root"] != str(root):
             raise ReapRefused("cleanup-owner-unavailable:artifact-home-changed-during-sweep")
@@ -6180,12 +6203,25 @@ def reap_cleanup_owner(scope: str, acknowledge: dict | None = None, inspect: boo
             info = os.fstat(fd)
             if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600:
                 raise ReapRefused("cleanup-owner-unavailable:not-private-file")
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError as error:
-                if error.errno in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES):
-                    raise ReapRefused("cleanup-owner-busy:lock held; holder unknown; age unknown; owner status cannot be inspected until the lock is released; then read the handoff and receipts before retrying")
-                raise
+            deadline = time.monotonic() + max(0, wait)
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError as error:
+                    if error.errno not in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES):
+                        raise
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        snapshot = reap_busy_snapshot(fd)
+                        if wait > 0:
+                            detail = "cleanup-owner-busy:lock held by an active owner; waited " + f"{wait:g}" + " seconds; retry after the owner finishes"
+                            if not snapshot.startswith("holder unknown"):
+                                detail += "; " + snapshot
+                            raise ReapRefused(detail)
+                        raise ReapRefused("cleanup-owner-busy:lock held; " + snapshot +
+                                          "; age unknown; owner status cannot be inspected until the lock is released; then read the handoff and receipts before retrying")
+                    time.sleep(min(0.05, remaining))
             current = os.stat("disk-cleanup.lock", dir_fd=dfd, follow_symlinks=False)
             if (info.st_dev, info.st_ino) != (current.st_dev, current.st_ino):
                 raise ReapRefused("cleanup-owner-unavailable:lock-replaced")
@@ -6214,6 +6250,15 @@ def reap_cleanup_owner(scope: str, acknowledge: dict | None = None, inspect: boo
             if expected is not None and (token != expected or phase not in ("finished", "acknowledged")):
                 raise ReapRefused("cleanup-compaction-stale-or-unsettled:read-current-owner-status")
             if inspect:
+                if preview and phase not in ("none", "finished", "acknowledged"):
+                    dead = reap_dead_owner_note(previous, phase)
+                    generated = None if dead else reap_dead_owner_report(previous, phase)
+                    if not dead and not generated:
+                        raise ReapRefused("cleanup-handoff-incomplete:previous-worker; read reap-owner-status and acknowledge reviewed notes and receipts")
+                    if generated:
+                        data = generated[0].encode()
+                        if len(data) > 65536 or reap_ack_report_problem(token, data):
+                            raise ReapRefused("cleanup-handoff-incomplete:generated-report-invalid")
                 yield {"phase": phase, "expectedRun": token, "handoff": previous, "bytes": info.st_size}
                 return
             if acknowledge:
