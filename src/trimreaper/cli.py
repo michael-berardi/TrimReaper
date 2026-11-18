@@ -360,7 +360,7 @@ def parser() -> argparse.ArgumentParser:
         audit = sub.add_parser(name, help="metadata-only audit: what is reapable, what is kept and why (deletes nothing)")
         audit.add_argument("--job", type=job_id)
         audit.add_argument("--items", action="store_true", help="list every item")
-        audit.add_argument("--budget", type=int, default=core.REAP_AUDIT_SECONDS, help="seconds the audit may take")
+        audit.add_argument("--budget", type=int, default=None, help="seconds the audit may take (default: policy reapAuditSeconds, 60)")
         audit.add_argument("--limit", type=int, default=40)
         audit.add_argument("--after", type=job_id, help="resume after this job (the previous call's cursorAfter)")
         audit.set_defaults(func=cmd_status)

@@ -14,7 +14,8 @@ from trimreaper import core
 from helpers import Home
 
 IGNORED = ["node_modules/", ".next/", ".open-next/", "target/", ".turbo/", ".astro/", "dist/", ".wrangler/", ".dev.vars", ".env*", ".vercel/"]
-GONE = ["node_modules", ".astro", ".next", ".turbo", "target", ".open-next"]
+GONE = ["node_modules", ".astro", ".next", ".turbo", "target", ".open-next", "dist"]
+TAG = b"Signature: 8a477f597d28d172789f06886806bc55\n# fixture\n"
 
 
 class ScratchBase(Home):
@@ -56,10 +57,12 @@ class ScratchBase(Home):
         self.git(path, "push", "-q", "-u", "origin", "main")
         return path
 
-    def checkout(self, name="slot2/vitals", outputs=tuple(GONE) + ("dist",)) -> Path:
+    def checkout(self, name="slot2/vitals", outputs=tuple(GONE)) -> Path:
         root = self.repo(self.scratch / name)
         for out in outputs:
             self.put(root, f"{out}/sub/file.bin", b"x" * 2000)
+        if "target" in outputs:
+            self.put(root, "target/CACHEDIR.TAG", TAG)  # a target dir is Cargo's only by Cargo's own mark
         return root
 
     def receipts(self) -> list[dict]:
@@ -75,14 +78,13 @@ class ScratchBase(Home):
 
 
 class RegenerableDirs(ScratchBase):
-    def test_clean_pushed_quiet_checkout_loses_its_regenerable_dirs_but_never_dist_or_source(self):
+    def test_clean_pushed_quiet_checkout_loses_its_regenerable_dirs_dist_included_but_never_source(self):
         root = self.checkout()
         self.quiet()
         out = self.regen()
         self.assertEqual(out["deleted"], len(GONE), out)
         for name in GONE:
             self.assertFalse((root / name).exists(), name)
-        self.assertTrue((root / "dist" / "sub" / "file.bin").exists(), "dist can hold a release: never derived")
         self.assertTrue((root / "src" / "main.txt").exists())
         self.assertEqual(self.git(root, "status", "--porcelain"), "")
         records = [r for r in self.receipts() if r.get("class") == "scratch-regenerable"]
@@ -106,7 +108,9 @@ class RegenerableDirs(ScratchBase):
         self.assertTrue(all(i["reason"].startswith("retention-preserved:not-quiet") for i in out["items"]), out["items"])
         self.assertTrue((root / "node_modules").exists())
 
-    def test_dirty_untracked_unpushed_and_stashed_checkouts_are_kept(self):
+    def test_dirty_untracked_unpushed_and_stashed_checkouts_lose_only_their_derived_dirs(self):
+        """0.20.2: the derived dirs are git-ignored and untracked, so the checkout's own edits, untracked files, unpushed commits and stash
+        are not their business: the dirs go, and every one of those survives byte for byte."""
         self.quiet()
         dirty = self.checkout("a/dirty"); (dirty / "src" / "main.txt").write_text("changed\n")
         untracked = self.checkout("b/untracked"); (untracked / "notes.txt").write_text("mine\n")
@@ -114,12 +118,34 @@ class RegenerableDirs(ScratchBase):
         self.git(unpushed, "add", "src/new.txt"); self.git(unpushed, "commit", "-q", "-m", "local only")
         stashed = self.checkout("d/stashed"); (stashed / "src" / "main.txt").write_text("wip\n")
         self.git(stashed, "stash", "push", "-q")
+        heads = {r: self.git(r, "rev-parse", "HEAD") for r in (dirty, untracked, unpushed, stashed)}
         out = self.regen()
-        self.assertEqual(out["deleted"], 0, out)
-        for root, reason in ((dirty, "dirty"), (untracked, "dirty"), (unpushed, "unpushed"), (stashed, "stash-present")):
-            self.assertTrue((root / "node_modules").exists(), root)
-            mine = [i for i in out["items"] if i["path"].startswith(str(root) + "/")]
-            self.assertTrue(mine and all(i["reason"].split(":")[0] in (reason, "git-error") or reason in i["reason"] for i in mine), (root, [i["reason"] for i in mine]))
+        self.assertEqual(out["deleted"], 4 * len(GONE), out)
+        for root in (dirty, untracked, unpushed, stashed):
+            for name in GONE:
+                self.assertFalse((root / name).exists(), (root, name))
+            self.assertEqual(self.git(root, "rev-parse", "HEAD"), heads[root])
+            self.assertTrue((root / ".git").exists() and (root / "src" / "main.txt").exists())
+        self.assertEqual((dirty / "src" / "main.txt").read_text(), "changed\n")
+        self.assertEqual((untracked / "notes.txt").read_text(), "mine\n")
+        self.assertEqual((unpushed / "src" / "new.txt").read_text(), "n\n")
+        self.assertIn("local only", self.git(unpushed, "log", "-1", "--format=%s"))
+        self.assertIn("wip", self.git(stashed, "stash", "show", "-p"))
+
+    def test_a_dir_git_does_not_ignore_and_a_target_without_cargos_mark_stay(self):
+        self.quiet()
+        root = self.checkout("u/unignored", outputs=())
+        (root / ".gitignore").write_text(".env*\n")
+        self.put(root, "node_modules/pkg/index.js")
+        self.put(root, "dist/index.html")
+        self.put(root, "java/target/classes/A.class")        # named target, never written by Cargo
+        self.put(root, "rs/target/.rustc_info.json", b"{}")   # Cargo's own mark
+        self.put(root, "rs/target/debug/app")
+        (root / ".gitignore").write_text(".env*\nrs/target/\njava/target/\n")
+        out = self.regen()
+        self.assertTrue((root / "node_modules/pkg/index.js").exists() and (root / "dist/index.html").exists(), "untracked, not ignored: source")
+        self.assertTrue((root / "java/target/classes/A.class").exists())
+        self.assertFalse((root / "rs/target").exists(), out["items"])
 
     def test_an_open_handle_or_cwd_keeps_it(self):
         root = self.checkout()
@@ -152,7 +178,7 @@ class RegenerableDirs(ScratchBase):
         out = self.regen()
         for rel in kept:
             self.assertEqual((root / rel).read_bytes(), b"keep", rel)
-        self.assertEqual({n for n in GONE if not (root / n).exists()}, {".astro", ".turbo", ".open-next"}, out["items"])
+        self.assertEqual({n for n in GONE if not (root / n).exists()}, {".astro", ".turbo", ".open-next", "dist"}, out["items"])
 
     def test_tracked_content_a_non_git_folder_and_a_nested_checkout_are_not_removed(self):
         self.quiet()

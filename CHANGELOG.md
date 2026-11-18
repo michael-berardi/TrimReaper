@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.20.2 (2026-11-18)
+
+- Disk pressure now reaches the build output that actually fills the disk. 70 GB of job cache folders held `node_modules`, `.next`,
+  `dist` and Cargo `target` dirs that pressure never saw, because each `J-NNNN/<dir>` was one opaque item.
+  - A git worktree or clone inside a job's cache folder is scanned: its derived dirs are items of their own
+    (`job-clone-regenerable`, ownership `cache-worktree`), released under pressure by parked and interrupted jobs and
+    after a finished job settles. A cache folder that is itself a Cargo target dir (`J-NNNN/target-rust`) is released the same way.
+    A `target` counts only with Cargo's own mark (valid `CACHEDIR.TAG` or `.rustc_info.json`). Only git-ignored, tracked-free dirs go;
+    protected leaves, release-bearing targets, retention markers, claims, locks and open handles keep them. Running and
+    starting jobs keep everything.
+  - A parked or interrupted job that pins a finished job's folders (`awaited-by`, or a host's input pin through
+    `reap_pin_released`) no longer holds its pure derived output under pressure; a pin on source stays.
+  - Agent-scratch checkouts lose their derived dirs (and `dist`) under pressure once quiet, whatever the checkout's own
+    unpushed commits or edits; the checkout and its commits are never touched.
+- The audit budget is the policy key `reapAuditSeconds` (60) and the tick's audit escalates it (2x, up to 8x) while its previous audit
+  was incomplete. Agent scratch is audited first, within 40% of the budget, and each folder gets an even share of what is left, so it is no
+  longer starved by large job folders. A size that hit its limit is a lower bound (`bytesLowerBound`, `summary.unreapedBytesIsLowerBound`), never 0.
+- Tests no longer scan this machine's shared and per-user temp folders.
+
 ## 0.20.1 (2026-11-15)
 
 - Cleanup owners can wait briefly for a busy lock and preview interrupted handoffs without changing them. A timed-out wait says how long it waited and when to retry; any journal snapshot is explicitly unverified.

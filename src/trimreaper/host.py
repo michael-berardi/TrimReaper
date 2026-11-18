@@ -98,6 +98,9 @@ DEFAULT_POLICY = {
     "cleanFloorGB": 10,
     # Parked/blocked jobs give up their derived build output after this many hours without a report; 0 = only under pressure.
     "parkedReapHours": 24,
+    # Wall-clock seconds one audit (reap-status, and the tick's sizing pass) may spend. The tick's own pass doubles it, up to 8x, while its
+    # previous audit ended incomplete; a bare reap-status keeps this value so it returns inside a 120 s shell guard.
+    "reapAuditSeconds": 60,
     # A finished job whose worker terminal is still open stops holding that job's folders once the job finished this many
     # hours ago and the terminal has been idle as long; the terminal itself is never closed. 0 = such a job keeps them.
     "reapOpenTerminalGraceHours": 0,
@@ -294,6 +297,9 @@ def check_policy(policy: dict) -> None:
         value = merged[key]
         if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= high:
             raise HostError(f"policy {key} must be a whole number from 0 to {high}, not {json.dumps(value)}")
+    value = merged["reapAuditSeconds"]
+    if not isinstance(value, int) or isinstance(value, bool) or not 5 <= value <= 3600:
+        raise HostError(f"policy reapAuditSeconds must be a whole number of seconds from 5 to 3600, not {json.dumps(value)}")
     value = merged["worktreeIdleDays"]
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise HostError(f"policy worktreeIdleDays must be a whole number of days (0 = never), not {json.dumps(value)}")

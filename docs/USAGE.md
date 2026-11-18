@@ -126,8 +126,20 @@ producer's source/output identity record, shared build locks, no live claim on t
 no running builder. A source working directory alone is not an output handle. Source and retained data stay;
 legacy outputs without producer proof stay on the stricter route. See [the embedding contract](EMBEDDING.md).
 
-Under disk pressure (at or above `diskWarnPercent`, 75%), the build output of parked or interrupted jobs goes too;
-they rebuild it when they resume. The pressure check runs during a `tick` that has at least one finished job due.
+Under disk pressure (at or above `diskWarnPercent`, 75%), the derived output of parked or interrupted jobs goes too; they
+rebuild it when they resume. The pressure check runs during a `tick`. Where it applies (0.20.2):
+
+- the job's named clones (`node_modules`, `.next`, `.open-next`, `.turbo`, `.astro`, `target`; never `dist` there);
+- a git worktree or clone inside the job's cache folder (`<cacheRoot>/J-NNNN/<dir>` with a `.git`): the same dirs plus `dist`;
+- a cache folder that is itself a Cargo target dir (`J-NNNN/target-rust`);
+- a git checkout under agent scratch (`scratchRoot/<task>`), once the checkout has been quiet for `scratchRegenIdleHours`
+  (2); its own edits, untracked files, stash and unpushed commits are not touched.
+
+A `target` counts only when Cargo marked it (a valid `CACHEDIR.TAG` or `.rustc_info.json`), and only dirs that git ignores
+and tracks nothing of go; a dir holding a protected leaf (`.env*`, `.dev.vars*`, `.wrangler`, `.vercel`), a release artifact
+in a `target`, or a job folder or worktree carrying a retention marker stays. A running, starting (queued, approved) job
+keeps everything, and a job that is only *blocked* keeps the pins it holds. A parked or interrupted job that another job
+waits on (or pins as an input) does not hold that job's pure derived output under pressure; a pin on source stays.
 
 ## What it never removes
 

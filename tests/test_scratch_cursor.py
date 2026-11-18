@@ -213,14 +213,14 @@ class ScratchCursor(ScratchHome):
             self.listing()  # the unbounded real listing proves all six and remembers them
         self.put(self.scratch("g-task"), "inner.txt")  # a seventh, never proved
         clock = [0.0]
-        real = core.reap_release_candidates
+        real = core.reap_agent_scratch_items
 
-        def late():
-            clock[0] = 100.0  # the audit's budget is spent by the time it reaches agent scratch
-            return real()
+        def late(*args, **kwargs):
+            clock[0] = 100.0  # scratch's share of the audit's budget is already spent when its listing is made (audited first since 0.20.2)
+            return real(*args, **kwargs)
 
         with mock.patch.object(core.time, "monotonic", side_effect=lambda: clock[0]), \
-                mock.patch.object(core, "reap_release_candidates", side_effect=late):
+                mock.patch.object(core, "reap_agent_scratch_items", side_effect=late):
             out = core.reap_audit(None, 10, True, 1)
 
         rows = {os.path.basename(r["path"]): r for r in out["agentScratch"]}

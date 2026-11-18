@@ -36,7 +36,8 @@ finishes, in case it is resumed. A **build queue** is any tool that takes a per-
    stashed tracked work, and an unpushed HEAD, are the clone's business, not its output's: they do not preserve build output that
    rebuilds from the source that stays, and the folder is still proved free of tracked files, matched case-insensitively against the index (a tracked file inside is refused even
    when `--assume-unchanged` or `--skip-worktree` hides it from `git status`). The clean, stash-free and pushed proofs still gate
-   `dist` and every whole-clone removal.
+   `dist` and every whole-clone removal, except `dist` of a worktree in a job's cache folder and of a scratch checkout (0.20.2: git-ignored
+   and tracked-free, as for the other derived dirs).
    For a whole clone: every branch, reflog entry and unreachable commit is on a remote, there are no tags or other refs,
    no linked worktree depends on it, and every ignored file is known build output. Git runs with hooks, fsmonitor,
    includes, filters and global config disabled. Repository config that could run a program is refused before git reads it.

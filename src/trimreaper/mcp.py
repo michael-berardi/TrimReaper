@@ -38,7 +38,7 @@ TOOLS = [
      "annotations": {"readOnlyHint": True},
      "inputSchema": {"type": "object", "additionalProperties": False, "properties": {
          "job": JOB, "items": {"type": "boolean", "default": False, "description": "List every item"},
-         "budgetSeconds": {"type": "integer", "minimum": 1, "default": core.REAP_AUDIT_SECONDS},
+         "budgetSeconds": {"type": "integer", "minimum": 1, "description": "default: policy reapAuditSeconds (60)"},
          "limit": {"type": "integer", "minimum": 1, "default": 40}}}},
     {"name": "reap",
      "description": "Run the guarded reaper once on one target. A dry run (the default) runs every check and removes nothing; "
@@ -115,7 +115,7 @@ def call(name: str, args: dict) -> dict:
         return cli.cmd_job_list(namespace())
     if name == "reap_status":
         return cli.cmd_status(namespace(job=cli.job_id(args["job"]) if args.get("job") else None, items=bool(args.get("items")),
-                                        budget=int(args.get("budgetSeconds", core.REAP_AUDIT_SECONDS)), limit=int(args.get("limit", 40)), after=None))
+                                        budget=int(args["budgetSeconds"]) if args.get("budgetSeconds") is not None else None, limit=int(args.get("limit", 40)), after=None))
     if name == "reap":
         target = args.get("target", "job")
         if target == "job" and not args.get("job"):

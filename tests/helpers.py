@@ -41,6 +41,8 @@ class Home(unittest.TestCase):
         self.addCleanup(env.stop)
         # The clean pass never reaches this machine's tools, caches or disk level from a test: none by default, fakes per test.
         for patch in (mock.patch.object(clean, "CLEAN_TOOLS", ()), mock.patch.object(clean, "CLEAN_FOLDERS", ()),
+                      # nor this machine's shared and per-user temp folders (a tick scanned the real /var/folders and failed on macOS-owned EPERM folders)
+                      mock.patch.object(clean, "clean_temp_roots", lambda hours=None: []),
                       mock.patch.object(clean, "disk_state", lambda: {"path": str(self.tmp), "usedPercent": 50, "freeBytes": 10 ** 12})):
             patch.start()
             self.addCleanup(patch.stop)
