@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.20.3 (2026-11-19)
+
+- The installer no longer reports success while the `trimreaper` command on PATH is still an older copy. When
+  `~/.local/bin/trimreaper` belongs to something else (for example a pipx install), the new version is still installed in its
+  private folder, but the installer now exits 3 and says how to fix it (`pipx uninstall trimreaper`, or remove the file, then run
+  the installer again). Before, it exited 0, so an upgrade looked done while every `trimreaper` call ran the old version.
+
 ## 0.20.2 (2026-11-18)
 
 - Disk pressure now reaches the build output that actually fills the disk. 70 GB of job cache folders held `node_modules`, `.next`,
