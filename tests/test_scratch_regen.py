@@ -49,7 +49,7 @@ class ScratchBase(Home):
         (path / ".gitignore").write_text("\n".join(IGNORED) + "\n")
         (path / "src").mkdir()
         (path / "src" / "main.txt").write_text("source\n")
-        (path / "package.json").write_text("{}\n")  # derived output sits beside its package's package.json
+        (path / "package.json").write_text('{"scripts": {"build": "vite build"}}\n')  # derived output sits beside its package's package.json
         self.git(path, "add", "-A")
         self.git(path, "commit", "-q", "-m", "init")
         bare = self.remotes / (path.name + ".git")

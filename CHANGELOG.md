@@ -14,12 +14,16 @@
     vendored runtime's `lib/node_modules` or a `.vendor` copy is never offered. A `target` counts only with Cargo's own mark: a valid
     `CACHEDIR.TAG` or a `.rustc_info.json` that parses as Cargo's cache (`{}` no longer does).
   - `dist` is reclaimable only when EVERYTHING in it is recognisable web/build output (an allowlist: `.js .mjs .cjs .map .css .html .json
-    .wasm .d.ts`, images, fonts, `.txt`). Anything else keeps it, in or beside it: an installer, an archive of any format (`.zip`, `.tar.*`,
+    .wasm .d.ts`, images, fonts, and only `robots.txt`, `LICENSE*` and `*.LICENSE.txt` as text). Anything else keeps it, in or beside it: an installer, an archive of any format (`.zip`, `.tar.*`,
     `.7z`, `.vsix`, `.jar`, `.snap`, `.flatpak`, `.nupkg`, `.crx`, `.xpi`...), a `.blockmap`, a channel manifest (`latest*.yml`,
     `beta-mac.yml`, `release.json`, `appcast.xml`), an app bundle, a release folder, a link, a nested git repository (a gh-pages worktree)
     or a file of a type nobody listed. A `node_modules`/`dist` below a packaged `*.app`, `*.framework` or `Contents` folder is a shipped copy
     and never offered. A disposable marker on a derived dir no longer lifts these fences (Cargo's mark, placement, the `dist` allowlist
     and its pressure rule).
+  - A `dist` also needs a positive build signal beside it, or it stays as possibly hand-made: a bundler config (vite, webpack, rollup, esbuild,
+    astro, next, tsup, parcel, svelte), a tsconfig whose `outDir` is `dist`, or a `package.json` whose `scripts.build` is set or whose
+    `main`/`module`/`types`/`bin`/`exports`/`files` point into `dist`. A versioned subfolder (`v1.2.0`, `1.2.0`) is a release shape and keeps it.
+    The dist scan stops at the audit's hard ceiling and keeps the dist when time runs out.
   - A parked or interrupted pinner (`awaited-by`, or a host's input pin through `reap_pin_released`) stops holding pure derived output under
     pressure only when it rebuilds that output itself: it works inside the very checkout, and an interrupted one has no live continuation.
     A producer's output that a consumer merely reads stays pinned. Every pinner is asked, not only the first one named, and the audit and the

@@ -19,7 +19,7 @@ NEEDS = ("ignored", "untracked")
 
 
 def derived(root: Path, base: str, kind: str, put) -> None:
-    put(root, f"{base}/package.json" if base else "package.json", b"{}")
+    put(root, f"{base}/package.json" if base else "package.json", b'{"scripts": {"build": "vite build"}}')
     put(root, f"{base}/{kind}/dep/index.js" if base else f"{kind}/dep/index.js")
     if kind == "target":
         put(root, f"{base}/{kind}/CACHEDIR.TAG" if base else f"{kind}/CACHEDIR.TAG", TAG)
@@ -61,11 +61,11 @@ class IgnoredAncestorFenceScratch(ScratchBase):
 
 
 INSIDE = ("app.vsix", "tool.jar", "a.tar.xz", "a.tar.bz2", "a.tar.zst", "a.7z", "a.snap", "a.flatpak", "a.nupkg", "a.crx", "a.xpi", "a.blockmap",
-          "latest-linux-arm64.yml", "beta-mac.yml", "mystery.dat", "data.bin", "LICENSE", "installer", "notes.md", "feed.yaml", "app.AppImage",
+          "latest-linux-arm64.yml", "beta-mac.yml", "mystery.dat", "data.bin", "NOTES.txt", "installer", "notes.md", "feed.yaml", "app.AppImage",
           "mac/App.app/Contents/Info.plist", "deep/er/er/pack.rar", "a.js.gz")
 BESIDE = ("app.vsix", "a.7z", "a.tar.zst", "latest-linux-arm64.yml", "beta-mac.yml", "a.blockmap", "a.nupkg", "a.snap", "App.app/Contents/Info.plist", "a.zip")
 WEB = ("index.html", "assets/app-1a2b.js", "assets/app.css", "assets/app.js.map", "assets/logo.svg", "assets/f.woff2", "types/index.d.ts", "data.json",
-       "mod.wasm", "favicon.ico", "robots.txt", "site.webmanifest")
+       "mod.wasm", "favicon.ico", "robots.txt", "site.webmanifest", "LICENSE", "assets/vendor.js.LICENSE.txt")
 
 
 class DistAllowlist(CacheBase):
@@ -128,10 +128,94 @@ class DisposableMarkerKeepsFences(CacheBase):
         target = self.worktree("J-0931", name="t", outputs=())
         self.put(target, "target/classes/A.class")
         self.put(target, "target/.ut-retention-disposable", b"")
-        self.put(target, "package.json", b"{}")
+        self.put(target, "package.json", b'{"scripts": {"build": "vite build"}}')
         self.pressure_tick()
         self.assertTrue((dist / "dist/a.vsix").exists())
         self.assertTrue((target / "target/classes/A.class").exists())
+
+    def test_control_a_disposable_marked_dist_of_only_web_output_beside_a_build_signal_goes_in_the_same_tick(self):
+        self.job("J-0932")
+        kept = self.worktree("J-0932", name="k", outputs=("dist",))
+        self.put(kept, "dist/a.vsix", b"x")
+        self.put(kept, "dist/.ut-retention-disposable", b"")
+        goes = self.worktree("J-0932", name="g", outputs=("dist",))        # the fixture's package.json has scripts.build
+        self.put(goes, "dist/index.html", b"w")
+        self.put(goes, "dist/.ut-retention-disposable", b"")
+        self.pressure_tick()
+        self.assertTrue((kept / "dist/a.vsix").exists())
+        self.assertFalse((goes / "dist").exists(), "control: the marker plus web output plus a build signal is reclaimable")
+
+
+class DistBuildSignal(CacheBase):
+    """R4 m-a: a dist is reclaimable only with a positive build signal beside it; hand-made output, notes and versioned folders keep it."""
+
+    def make(self, job: str, name: str, package: bytes | None, extra: dict | None = None, files=("dist/index.html", "dist/app.js")) -> Path:
+        root = self.worktree(job, name=name, outputs=())
+        pkg = root / "package.json"
+        if package is None:
+            pkg.unlink()
+        else:
+            pkg.write_bytes(package)
+        for rel, data in (extra or {}).items():
+            self.put(root, rel, data)
+        for rel in files:
+            self.put(root, rel, b"w")
+        return root
+
+    def test_a_hand_written_dist_beside_a_script_less_package_json_is_kept_and_a_vite_style_one_goes(self):
+        self.job("J-0990")
+        hand = self.make("J-0990", "hand", b'{"name": "site"}', files=("dist/index.html", "dist/NOTES.txt"))
+        vite = self.make("J-0990", "vite", b'{"scripts": {"build": "vite build"}}', files=("dist/index.html", "dist/assets/app-1a2b.js"))
+        self.pressure_tick()
+        self.assertTrue((hand / "dist/index.html").exists() and (hand / "dist/NOTES.txt").exists())
+        self.assertEqual(core.reap_dist_keep_reason(str(hand / "dist")), "dist-no-build-signal")
+        self.assertFalse((vite / "dist").exists(), "control: a real build output beside a build script goes")
+
+    def test_hand_made_dist_with_only_web_files_and_a_tsconfig_without_outdir_is_kept(self):
+        self.job("J-0991")
+        root = self.make("J-0991", "ts", None, {"tsconfig.json": b'{"compilerOptions": {"outDir": "build"}}'})
+        self.pressure_tick()
+        self.assertTrue((root / "dist/index.html").exists())
+        self.assertEqual(core.reap_dist_keep_reason(str(root / "dist")), "dist-no-build-signal")
+
+    def test_every_recognised_build_signal_makes_a_plain_dist_reclaimable(self):
+        signals = {"vite": {"vite.config.ts": b""}, "webpack": {"webpack.config.js": b""}, "rollup": {"rollup.config.mjs": b""},
+                   "esbuild": {"esbuild.config.js": b""}, "astro": {"astro.config.mjs": b""}, "next": {"next.config.js": b""},
+                   "tsup": {"tsup.config.ts": b""}, "parcel": {".parcelrc": b"{}"}, "svelte": {"svelte.config.js": b""},
+                   "tsconfig": {"tsconfig.build.json": b'{"compilerOptions": {"outDir": "./dist"}}'}}
+        pkgs = {"main": b'{"main": "dist/index.js"}', "module": b'{"module": "./dist/index.mjs"}', "exports": b'{"exports": {".": {"import": "./dist/a.js"}}}',
+                "files": b'{"files": ["dist"]}', "bin": b'{"bin": {"x": "dist/cli.js"}}'}
+        for name, extra in signals.items():
+            root = self.make("J-0992", f"s-{name}", None, extra)
+            self.assertIsNone(core.reap_dist_keep_reason(str(root / "dist")), name)
+        for name, package in pkgs.items():
+            root = self.make("J-0992", f"p-{name}", package)
+            self.assertIsNone(core.reap_dist_keep_reason(str(root / "dist")), name)
+        root = self.make("J-0992", "other", b'{"main": "src/index.js", "files": ["src"]}')
+        self.assertEqual(core.reap_dist_keep_reason(str(root / "dist")), "dist-no-build-signal")
+
+    def test_a_versioned_subfolder_keeps_the_dist_and_text_is_limited(self):
+        self.job("J-0993")
+        for label, rel in (("v-folder", "dist/v1.2.0/app.js"), ("bare-folder", "dist/1.2.0/app.js"), ("pre", "dist/2.0.0-rc.1/app.js"), ("notes", "dist/NOTES.txt"),
+                           ("readme", "dist/readme.txt")):
+            root = self.make("J-0993", label, b'{"scripts": {"build": "vite build"}}', files=("dist/index.js", rel))
+            self.pressure_tick()
+            self.assertTrue((root / rel).exists(), label)
+        ok = self.make("J-0993", "ok", b'{"scripts": {"build": "vite build"}}', files=("dist/index.js", "dist/robots.txt", "dist/LICENSE", "dist/a.js.LICENSE.txt"))
+        self.assertIsNone(core.reap_dist_keep_reason(str(ok / "dist")))
+
+    def test_a_scan_past_the_deadline_keeps_the_dist(self):
+        self.job("J-0994")
+        root = self.make("J-0994", "late", b'{"scripts": {"build": "vite build"}}')
+        self.assertIsNone(core.reap_dist_keep_reason(str(root / "dist")))
+        self.assertEqual(core.reap_dist_keep_reason(str(root / "dist"), time.monotonic() - 1), "dist-scan-deadline")
+        core.REAP_PROBE.ceiling = time.monotonic() - 1          # the audit's own ceiling, read when no deadline is passed
+        try:
+            self.assertEqual(core.reap_dist_keep_reason(str(root / "dist")), "dist-scan-deadline")
+            self.assertEqual(core.reap_scoped_fence({"kind": "dist", "path": str(root / "dist"), "root": str(root), "class": "job-clone-regenerable",
+                                                      "ownership": "cache-worktree"}, pressure=False), "dist-scan-deadline")
+        finally:
+            core.REAP_PROBE.ceiling = None
 
 
 class NestedRepoInsideACandidate(CacheBase):
@@ -174,14 +258,21 @@ class NestedRepoInsideACandidate(CacheBase):
         self.assertTrue((nested / ".git").exists())
 
     def test_a_pushed_clean_nested_clone_in_node_modules_is_still_proved_not_assumed(self):
-        """The nested clone has no remote: nothing is pushed, so the all-refs proof refuses even though it is clean."""
+        """A nested clone with a remote and every ref pushed is clean, yet the candidate is still kept: a repository inside derived output is
+        never assumed to be disposable, pushed or not (the control without a remote is the test above)."""
         self.job("J-0962")
         root = self.worktree("J-0962", outputs=("node_modules",))
         nested = root / "node_modules" / "pkg"
         nested.mkdir(parents=True, exist_ok=True)
+        remote = root.parent / "nested-remote.git"
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(remote)], check=True, capture_output=True)
         self.git(nested, "init", "-q", "-b", "main")
         (nested / "a.txt").write_text("a\n")
         self.git(nested, "add", "-A"); self.git(nested, "commit", "-qm", "a")
+        self.git(nested, "remote", "add", "origin", str(remote))
+        self.git(nested, "push", "-q", "-u", "origin", "main")
+        self.assertEqual(self.git(nested, "status", "--porcelain").strip(), "")
+        self.assertEqual(self.git(nested, "rev-parse", "HEAD").strip(), self.git(remote, "rev-parse", "main").strip())   # really pushed
         self.pressure_tick()
         self.assertTrue((nested / "a.txt").exists())
 
@@ -250,7 +341,7 @@ class PinPlusAnotherReason(CacheBase):
         self.assertFalse((root / "node_modules").exists())
 
     def test_the_audit_with_a_pin_released_still_asks_the_terminal_and_the_claims(self):
-        """The audit's own path: the blocker is recomputed, not set to None, so a terminal is still asked."""
+        """The audit's own path: a released pin lifts only the pin's blocker; reap_item then asks the terminal, the claims and every other proof afresh."""
         root = self.producer("J-0976")
         self.job("J-0977", "parked", waits_on="J-0976", cwd=root)
         self.job("J-0978", "parked", cwd=root)                                # a parked claimer: releasable under pressure like the pinner
@@ -413,7 +504,7 @@ class PackagedBundlesAreVendored(CacheBase):
         self.job("J-0917")
         root = self.worktree("J-0917", outputs=("node_modules",))
         for bundle in ("Build/Foo.app/Contents/Resources/app", "Build/Bar.framework/Resources", "Out/Foo.AppEx/Contents/Resources"):
-            self.put(root, f"{bundle}/package.json", b"{}")
+            self.put(root, f"{bundle}/package.json", b'{"scripts": {"build": "vite build"}}')
             self.put(root, f"{bundle}/node_modules/dep/index.js")
             self.put(root, f"{bundle}/dist/index.js")
         self.pressure_tick()

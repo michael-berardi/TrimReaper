@@ -40,7 +40,7 @@ class CacheBase(Home):
 
     def worktree(self, job: str, name: str = "wt", ignore=IGNORE, outputs=DERIVED, linked: bool = False) -> Path:
         """A git clone (or linked worktree) of a pushed repository inside the job's cache folder, holding derived output."""
-        base = self.clone(f"base-{job.lower()}-{name}", ignored=ignore, tracked={"README.md": "hello\n", "package.json": "{}\n"})
+        base = self.clone(f"base-{job.lower()}-{name}", ignored=ignore, tracked={"README.md": "hello\n", "package.json": '{"scripts": {"build": "vite build"}}\n'})
         root = self.cache / job / name
         root.parent.mkdir(parents=True, exist_ok=True)
         if linked:
@@ -437,7 +437,7 @@ class Placement(CacheBase):
         self.job("J-0801")
         root = self.worktree("J-0801", outputs=("node_modules",))
         self.put(root, "resources/node/bin/node", b"#!runtime\n")
-        self.put(root, "resources/node/lib/node_modules/npm/package.json", b"{}")
+        self.put(root, "resources/node/lib/node_modules/npm/package.json", b'{"scripts": {"build": "vite build"}}')
         self.put(root, "resources/node/lib/node_modules/corepack/dist/lib.js")
         self.pressure_tick()
         self.assertFalse((root / "node_modules").exists())                # control
@@ -447,7 +447,7 @@ class Placement(CacheBase):
         self.job("J-0802")
         root = self.worktree("J-0802", outputs=("node_modules",))
         for vendor in (".vendor", "vendor", "third_party"):
-            self.put(root, f"steak-dsh/.scratch/{vendor}/package.json", b"{}")
+            self.put(root, f"steak-dsh/.scratch/{vendor}/package.json", b'{"scripts": {"build": "vite build"}}')
             self.put(root, f"steak-dsh/.scratch/{vendor}/node_modules/dep/index.js")
         self.pressure_tick()
         self.assertFalse((root / "node_modules").exists())                # control
@@ -458,9 +458,9 @@ class Placement(CacheBase):
         """The ancestor is what git ignores, not the dir: `check-ignore` on the dir alone says yes."""
         self.job("J-0803")
         root = self.worktree("J-0803", ignore=IGNORE + (".scratch/",), outputs=("node_modules",))
-        self.put(root, ".scratch/pkg/package.json", b"{}")
+        self.put(root, ".scratch/pkg/package.json", b'{"scripts": {"build": "vite build"}}')
         self.put(root, ".scratch/pkg/node_modules/dep/index.js")
-        self.put(root, "pkg/package.json", b"{}")
+        self.put(root, "pkg/package.json", b'{"scripts": {"build": "vite build"}}')
         self.put(root, "pkg/node_modules/dep/index.js")                   # control: not below an ignored ancestor
         needs = ("ignored", "untracked")
         with self.assertRaises(core.ReapRefused) as refused:
@@ -486,7 +486,7 @@ class Placement(CacheBase):
     def test_node_modules_must_sit_beside_a_package_json_and_dist_beside_one_or_a_build_config(self):
         self.job("J-0804")
         root = self.worktree("J-0804", outputs=("node_modules",))
-        self.put(root, "packages/a/package.json", b"{}")
+        self.put(root, "packages/a/package.json", b'{"scripts": {"build": "vite build"}}')
         self.put(root, "packages/a/node_modules/x.js")                    # control: a workspace package's own output
         self.put(root, "packages/b/node_modules/x.js")                    # no package.json beside it
         self.put(root, "packages/b/dist/index.js")                        # no package.json, no build config
@@ -501,11 +501,11 @@ class Placement(CacheBase):
         root = self.worktree("J-0806", outputs=("node_modules",))
         outside = self.tmp / "outside"
         self.put(outside, "node_modules/precious.js")
-        self.put(outside, "package.json", b"{}")
+        self.put(outside, "package.json", b'{"scripts": {"build": "vite build"}}')
         self.put(outside, "target/CACHEDIR.TAG", TAG)
         self.put(outside, "target/debug/app")
         (root / "linked").symlink_to(outside)                                  # an intermediate folder
-        self.put(root, "pkg/package.json", b"{}")
+        self.put(root, "pkg/package.json", b'{"scripts": {"build": "vite build"}}')
         (root / "pkg/node_modules").symlink_to(outside / "node_modules")       # a derived name that is a link
         (root / "target").symlink_to(outside / "target")
         self.pressure_tick()
@@ -547,7 +547,7 @@ class Placement(CacheBase):
     def test_a_protected_ancestor_inside_the_worktree_keeps_everything_below_it(self):
         self.job("J-0809")
         root = self.worktree("J-0809", outputs=("node_modules",))
-        self.put(root, ".vercel/output/functions/x.func/package.json", b"{}")
+        self.put(root, ".vercel/output/functions/x.func/package.json", b'{"scripts": {"build": "vite build"}}')
         self.put(root, ".vercel/output/functions/x.func/node_modules/dep/index.js")
         self.pressure_tick()
         self.assertFalse((root / "node_modules").exists())                 # control
@@ -582,7 +582,7 @@ class GitFailsClosed(CacheBase):
         self.job("J-0813")
         root = self.worktree("J-0813", outputs=("node_modules",))
         for name, sound in (("sound", True), ("broken", False)):
-            inner = self.clone(f"inner-{name}", ignored=("node_modules/",), tracked={"README.md": "x\n", "package.json": "{}\n"})
+            inner = self.clone(f"inner-{name}", ignored=("node_modules/",), tracked={"README.md": "x\n", "package.json": '{"scripts": {"build": "vite build"}}\n'})
             subprocess.run(["git", "-C", str(root), "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(inner), f"mods/{name}"],
                            check=True, capture_output=True)
             self.put(root, f"mods/{name}/node_modules/dep/index.js")
@@ -598,11 +598,11 @@ class GitFailsClosed(CacheBase):
         self.job("J-0814")
         root = self.worktree("J-0814", ignore=IGNORE + ("weird*/",), outputs=())
         weird = root / "weird\x01dir"
-        self.put(weird, "package.json", b"{}")
+        self.put(weird, "package.json", b'{"scripts": {"build": "vite build"}}')
         self.put(weird, "node_modules/x.js")
         with self.assertRaises(core.ReapRefused):
             core.reap_git_proof(str(root), str(weird / "node_modules"), ("ignored", "untracked"))
-        self.put(root, "plain/package.json", b"{}")
+        self.put(root, "plain/package.json", b'{"scripts": {"build": "vite build"}}')
         self.put(root, "plain/node_modules/x.js")
         core.reap_git_proof(str(root), str(root / "plain/node_modules"), ("ignored", "untracked"))   # control
 

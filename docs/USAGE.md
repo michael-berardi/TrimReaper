@@ -138,7 +138,7 @@ rebuild it when they resume. The pressure check runs during a `tick`. Where it a
 
 A `target` counts only when Cargo marked it (a valid `CACHEDIR.TAG` or a `.rustc_info.json` that parses as Cargo's cache), and only dirs
 whose own path git ignores (no ignored ancestor) and tracks nothing of go, at a package root (beside a `package.json`; `dist` also beside a
-recognised build config) and not below a `vendor`, `.vendor`, `runtime` or `third_party` folder; a dir holding a protected leaf (`.env*`, `.dev.vars*`, `.wrangler`, `.vercel`), a release artifact
+recognised build config, and a `dist` also needs a positive build signal beside it: a bundler config (vite, webpack, rollup, esbuild, astro, next, tsup, parcel, svelte), a tsconfig whose `outDir` is `dist`, or a `package.json` with a `build` script or a `main`/`module`/`types`/`bin`/`exports`/`files` entry pointing into `dist`; a hand-made `dist` with no signal stays, as does one holding a versioned folder such as `v1.2.0`) and not below a `vendor`, `.vendor`, `runtime` or `third_party` folder; a dir holding a protected leaf (`.env*`, `.dev.vars*`, `.wrangler`, `.vercel`), a release artifact
 in a `target`, or a job folder or worktree carrying a retention marker stays. A running, starting (queued, approved) job
 keeps everything, and a job that is only *blocked* keeps the pins it holds. A parked or interrupted job that another job waits on does not hold derived output under pressure only when that job itself
 rebuilds it (it works inside the same checkout and has no live continuation); output a consumer merely reads, and a pin on source, stay.

@@ -107,7 +107,11 @@ REAP_BUILD_CONFIGS = ("vite.config.", "webpack.config.", "rollup.config.", "tsup
 # keep it (the folder that holds `dist` may hold the installer a build wrote there).
 REAP_DIST_WEB_SUFFIXES = (".js", ".mjs", ".cjs", ".map", ".css", ".html", ".htm", ".json", ".wasm", ".d.ts", ".d.mts", ".d.cts", ".tsbuildinfo",
                           ".svg", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".ico", ".woff", ".woff2", ".ttf", ".otf", ".eot",
-                          ".webmanifest", ".txt")
+                          ".webmanifest")
+REAP_DIST_TEXT_NAMES = ("robots.txt",)   # the only plain text a build writes by itself; LICENSE* and *.LICENSE.txt are accepted by prefix/suffix (0.20.2 R4)
+REAP_DIST_BUILD_CONFIGS = ("vite.config.", "webpack.config.", "rollup.config.", "esbuild.config.", "astro.config.", "next.config.", "tsup.config.",
+                           "parcel.config.", ".parcelrc", "svelte.config.")   # a bundler/build config beside `dist` is a positive build signal
+REAP_DIST_VERSION_DIR = re.compile(r"v?\d+(?:\.\d+)+(?:[-+][\w.+-]*)?")   # v1.2.0, 1.2.0, 2.0.0-rc.1: a versioned folder is a release shape
 REAP_DIST_RELEASE_SUFFIXES = (".app", ".dmg", ".pkg", ".ipa", ".msix", ".msixbundle", ".appx", ".appxbundle", ".sig", ".asc", ".tgz", ".txz", ".tbz2",
                               ".tar", ".tar.gz", ".tar.xz", ".tar.bz2", ".tar.zst", ".tar.lz", ".zip", ".gz", ".xz", ".bz2", ".zst", ".7z", ".rar", ".lz",
                               ".lzma", ".z", ".cab", ".iso", ".img", ".exe", ".msi", ".deb", ".rpm", ".appimage", ".apk", ".aab", ".whl", ".egg", ".gem",
@@ -4576,11 +4580,95 @@ def reap_dist_release_shaped(name: str) -> bool:
     return name in REAP_DIST_RELEASE_NAMES or name.endswith(REAP_DIST_RELEASE_SUFFIXES) or bool(REAP_DIST_CHANNEL.fullmatch(name))
 
 
-def reap_dist_keep_reason(path: str) -> str | None:
+def reap_dist_into(value) -> bool:
+    """True when a package.json path value (a string) points into `dist`."""
+    if not isinstance(value, str):
+        return False
+    value = value.strip().replace("\\", "/")
+    while value.startswith("./"):
+        value = value[2:]
+    return value == "dist" or value.startswith("dist/")
+
+
+def reap_dist_json_into(value, depth: int = 0) -> bool:
+    if depth > 6:
+        return False
+    if isinstance(value, str):
+        return reap_dist_into(value)
+    if isinstance(value, dict):
+        return any(reap_dist_json_into(v, depth + 1) for v in value.values())
+    if isinstance(value, list):
+        return any(reap_dist_json_into(v, depth + 1) for v in value[:200])
+    return False
+
+
+def reap_dist_read_small(directory: str, name: str) -> str | None:
+    """A plain single-link file of at most 1 MB read without following a link; None when it is anything else."""
+    try:
+        fd = os.open(directory, REAP_ROOT_FLAGS)
+        try:
+            info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            if not (stat.S_ISREG(info.st_mode) and info.st_size <= 1 << 20):
+                return None
+            leaf = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+            try:
+                with os.fdopen(leaf, "rb", closefd=False) as handle:
+                    return handle.read((1 << 20) + 1).decode("utf-8", "replace")
+            finally:
+                os.close(leaf)
+        finally:
+            os.close(fd)
+    except OSError:
+        return None
+
+
+def reap_dist_build_signal(directory: str) -> bool:
+    """A positive signal that the `dist` in `directory` is written by a build: a recognised bundler/build config beside it, a tsconfig whose
+    outDir is dist, or a package.json whose scripts.build is set or whose main/module/types/bin/exports/files point into dist. Without one a
+    dist may be hand-made, and it stays."""
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return False
+    if any(reap_fold(name).startswith(REAP_DIST_BUILD_CONFIGS) for name in names):
+        return True
+    for name in names:
+        if reap_fold(name).startswith("tsconfig") and reap_fold(name).endswith(".json"):
+            text = reap_dist_read_small(directory, name) or ""
+            for match in re.finditer(r'"outDir"\s*:\s*"([^"]*)"', text):
+                if reap_dist_into(match[1]):
+                    return True
+    text = reap_dist_read_small(directory, "package.json")
+    if text:
+        try:
+            data = json.loads(text)
+        except ValueError:
+            return False
+        if isinstance(data, dict):
+            scripts = data.get("scripts")
+            if isinstance(scripts, dict) and isinstance(scripts.get("build"), str) and scripts["build"].strip():
+                return True
+            if any(reap_dist_json_into(data.get(key)) for key in ("main", "module", "types", "typings", "bin", "exports", "files")):
+                return True
+    return False
+
+
+def reap_dist_text_allowed(name: str) -> bool:
+    """The plain text a build writes by itself (case-folded name): robots.txt, LICENSE*, *.LICENSE.txt. Any other .txt is hand-written notes."""
+    return name in REAP_DIST_TEXT_NAMES or name.startswith("license") or name.endswith(".license.txt")
+
+
+def reap_dist_keep_reason(path: str, deadline: float | None = None) -> str | None:
     """Why a `dist` is NOT plain build output, else None. Names only, bounded, never following a link. An allowlist: the folder is reclaimable only
     when every file in it is a recognisable web/build output type and nothing in or beside it is release-shaped (an installer, package, archive of
     any format, signed bundle, release folder or channel manifest). A nested git repository (a gh-pages worktree), a link, a file of any other
-    type, anything unreadable, over budget or too deep keeps it: "dist-release-bearing" for a release shape, "dist-not-web-output" otherwise."""
+    type, anything unreadable, over budget or too deep keeps it: "dist-release-bearing" for a release shape, "dist-not-web-output" otherwise.
+    0.20.2 R4: no positive build signal beside it (reap_dist_build_signal) keeps it ("dist-no-build-signal"); a versioned subfolder (v1.2.0) is a
+    release shape; .txt is limited to robots.txt and licences; and `deadline` (default: the audit's hard ceiling) keeps it when time runs out."""
+    if deadline is None:
+        deadline = getattr(REAP_PROBE, "ceiling", None)
+    if not reap_dist_build_signal(os.path.dirname(path)):
+        return "dist-no-build-signal"
     listed = 0
     def scan(fd, depth):
         nonlocal listed
@@ -4589,6 +4677,8 @@ def reap_dist_keep_reason(path: str) -> str | None:
                 listed += 1
                 if listed > REAP_SCAN_ENTRIES:
                     return "dist-not-web-output"
+                if deadline is not None and time.monotonic() >= deadline:
+                    return "dist-scan-deadline"   # out of time: the dist is kept, never judged on a part of its listing
                 name = reap_fold(entry.name)
                 if reap_dist_release_shaped(name):
                     return "dist-release-bearing"
@@ -4596,6 +4686,8 @@ def reap_dist_keep_reason(path: str) -> str | None:
                     return "dist-not-web-output"   # a nested repository or a protected leaf: not output a build wrote
                 info = os.stat(entry.name, dir_fd=fd, follow_symlinks=False)
                 if stat.S_ISDIR(info.st_mode):
+                    if REAP_DIST_VERSION_DIR.fullmatch(name):
+                        return "dist-release-bearing"   # dist/v1.2.0/: a versioned folder is a published release shape
                     if depth >= REAP_DIST_DEPTH:
                         return "dist-not-web-output"
                     child = os.open(entry.name, REAP_DIR_FLAGS, dir_fd=fd)
@@ -4608,7 +4700,7 @@ def reap_dist_keep_reason(path: str) -> str | None:
                             return found
                     finally:
                         os.close(child)
-                elif not (stat.S_ISREG(info.st_mode) and (name.endswith(REAP_DIST_WEB_SUFFIXES) or name.startswith(REAP_MARKER_PREFIX))):
+                elif not (stat.S_ISREG(info.st_mode) and (name.endswith(REAP_DIST_WEB_SUFFIXES) or reap_dist_text_allowed(name) or name.startswith(REAP_MARKER_PREFIX))):
                     return "dist-not-web-output"
         return None
     try:
