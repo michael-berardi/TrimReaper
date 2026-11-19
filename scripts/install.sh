@@ -84,8 +84,15 @@ if [ -e "$BIN_DIR/trimreaper" ] || [ -L "$BIN_DIR/trimreaper" ]; then
           || grep -qxF "exec \"$HOME_DIR/venv/bin/python\" -m trimreaper \"\$@\"" "$BIN_DIR/trimreaper" 2>/dev/null; }; then
     :
   else
-    say "TrimReaper $VERSION is installed in $HOME_DIR, but $BIN_DIR/trimreaper is not ours, so it was left alone. Run it with: $HOME_DIR/venv/bin/python -m trimreaper"
-    return 0
+    # Exiting 0 here hid a stale PATH command: `trimreaper` kept reporting the old version after an "upgrade".
+    # The new venv is installed, but the command the user runs is not, so this is a failure the caller can see.
+    say "TrimReaper $VERSION is installed in $HOME_DIR, but $BIN_DIR/trimreaper is not ours, so it was left alone and still runs the OLD copy." >&2
+    case "$(readlink "$BIN_DIR/trimreaper" 2>/dev/null)" in
+      *pipx*) say "It is a pipx install. Run: pipx uninstall trimreaper   then run this installer again." >&2 ;;
+      *) say "Remove or rename $BIN_DIR/trimreaper, then run this installer again." >&2 ;;
+    esac
+    say "Until then run the new one with: $HOME_DIR/venv/bin/python -m trimreaper" >&2
+    return 3
   fi
 fi
 cat > "$BIN_DIR/trimreaper.tmp.$$" <<SHIM

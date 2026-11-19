@@ -79,10 +79,17 @@ say "ok: pip install uses --no-index --no-deps"
 # --- macOS: a trimreaper we did not write is never overwritten; our marker and a 0.19.0 shim are replaced ---
 TH="$WORK/home5"; mkdir -p "$TH/.local/bin"
 printf '#!/bin/sh\necho users-own-tool\n' > "$TH/.local/bin/trimreaper"; chmod 755 "$TH/.local/bin/trimreaper"
-HOME="$TH" TRIMREAPER_RELEASE_BASE="$GOOD" sh scripts/install.sh >"$WORK/own.log" 2>&1 \
-  || { cat "$WORK/own.log"; fail "install failed next to a foreign trimreaper"; }
+if HOME="$TH" TRIMREAPER_RELEASE_BASE="$GOOD" sh scripts/install.sh >"$WORK/own.log" 2>&1; then
+  cat "$WORK/own.log"; fail "install exited 0 although a foreign trimreaper still shadows the new one"
+fi
 [ "$("$TH/.local/bin/trimreaper")" = "users-own-tool" ] || fail "a foreign trimreaper was overwritten"
 grep -q "left alone" "$WORK/own.log" || { cat "$WORK/own.log"; fail "the foreign trimreaper was not mentioned"; }
+grep -q "OLD copy" "$WORK/own.log" || { cat "$WORK/own.log"; fail "the stale command was not named"; }
+rm "$TH/.local/bin/trimreaper"
+mkdir -p "$TH/pipx/venvs/trimreaper/bin"; printf '#!/bin/sh\necho old\n' > "$TH/pipx/venvs/trimreaper/bin/trimreaper"; chmod 755 "$TH/pipx/venvs/trimreaper/bin/trimreaper"
+ln -s "$TH/pipx/venvs/trimreaper/bin/trimreaper" "$TH/.local/bin/trimreaper"
+HOME="$TH" TRIMREAPER_RELEASE_BASE="$GOOD" sh scripts/install.sh >"$WORK/pipx.log" 2>&1 && fail "install exited 0 over a pipx symlink"
+grep -q "pipx uninstall trimreaper" "$WORK/pipx.log" || { cat "$WORK/pipx.log"; fail "the pipx fix was not named"; }
 rm "$TH/.local/bin/trimreaper"
 HOME="$TH" TRIMREAPER_RELEASE_BASE="$GOOD" sh scripts/install.sh >/dev/null 2>&1 || fail "fresh install failed"
 grep -q "trimreaper-installer" "$TH/.local/bin/trimreaper" || fail "the shim has no marker"
