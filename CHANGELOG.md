@@ -6,17 +6,27 @@
   `dist` and Cargo `target` dirs that pressure never saw, because each `J-NNNN/<dir>` was one opaque item.
   - A git worktree or clone inside a job's cache folder is scanned: its derived dirs are items of their own
     (`job-clone-regenerable`, ownership `cache-worktree`), released under pressure by parked and interrupted jobs and
-    after a finished job settles. A cache folder that is itself a Cargo target dir (`J-NNNN/target-rust`) is released the same way.
-    A `target` counts only with Cargo's own mark (valid `CACHEDIR.TAG` or `.rustc_info.json`). Only git-ignored, tracked-free dirs go;
-    protected leaves, release-bearing targets, retention markers, claims, locks and open handles keep them. Running and
-    starting jobs keep everything.
-  - A parked or interrupted job that pins a finished job's folders (`awaited-by`, or a host's input pin through
-    `reap_pin_released`) no longer holds its pure derived output under pressure; a pin on source stays.
-  - Agent-scratch checkouts lose their derived dirs (and `dist`) under pressure once quiet, whatever the checkout's own
+    after a finished job settles (`dist`: under disk pressure only, never because a job finished or a timer elapsed). A cache folder
+    that is itself a Cargo target dir (`J-NNNN/target-rust`) is released the same way.
+  - What counts as derived (review fixes): the dir's OWN path must be what git ignores (an ignored ancestor refuses it, for named clones
+    too), it must not sit below a `vendor`/`.vendor`/`runtime`/`third_party` folder, and it must sit at a package root
+    (`node_modules` and the other JS outputs beside a `package.json`; `dist` beside one or a recognised build config). So a
+    vendored runtime's `lib/node_modules` or a `.vendor` copy is never offered. A `target` counts only with Cargo's own mark: a valid
+    `CACHEDIR.TAG` or a `.rustc_info.json` that parses as Cargo's cache (`{}` no longer does).
+  - `dist` has a release fence like `target`: an installer, `.pkg`/`.dmg`/`.app`, archive (`.zip`, `.tgz`), signed bundle, release folder or
+    release manifest (`latest*.yml`, `latest.json`, `appcast.xml`...) in or beside it keeps it.
+  - A parked or interrupted pinner (`awaited-by`, or a host's input pin through `reap_pin_released`) stops holding pure derived output under
+    pressure only when it rebuilds that output itself: it works inside the very checkout, and an interrupted one has no live continuation.
+    A producer's output that a consumer merely reads stays pinned. Every pinner is asked, not only the first one named.
+  - The git proofs of a derived dir (git-ignored, tracked-free, no ignored ancestor) are asked again immediately before the removal, with the
+    locks held; retention, Cargo's mark, placement, the release fence and the pressure reading were already recomputed there.
+  - Agent-scratch checkouts lose their derived dirs (and `dist`, with the same fences) under pressure once quiet, whatever the checkout's own
     unpushed commits or edits; the checkout and its commits are never touched.
-- The audit budget is the policy key `reapAuditSeconds` (60) and the tick's audit escalates it (2x, up to 8x) while its previous audit
-  was incomplete. Agent scratch is audited first, within 40% of the budget, and each folder gets an even share of what is left, so it is no
-  longer starved by large job folders. A size that hit its limit is a lower bound (`bytesLowerBound`, `summary.unreapedBytesIsLowerBound`), never 0.
+- The audit budget is the policy key `reapAuditSeconds` (60). The tick's audit escalates it (2x, up to 8x, never above 480 s whatever
+  the policy says) while its previous audit was incomplete. Agent scratch is audited first, within 40% of the budget, and the job audits keep
+  their own 40%; each folder gets an even share of what is left, and nothing is promised after the deadline: the whole audit stops
+  sizing at 1.25x its budget (a size past it is a lower bound). A size that hit its limit is a lower bound (`bytesLowerBound`,
+  `summary.unreapedBytesIsLowerBound`), and a folder's size is never floored to 0.
 - Tests no longer scan this machine's shared and per-user temp folders.
 
 ## 0.20.1 (2026-11-15)

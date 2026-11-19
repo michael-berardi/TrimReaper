@@ -97,6 +97,19 @@ REAP_CACHE_WORKTREE = "cache-worktree"
 REAP_SCRATCH_CHECKOUT = "scratch-checkout"
 REAP_SCOPED_OWNERSHIP = (REAP_CACHE_WORKTREE, REAP_SCRATCH_CHECKOUT)
 REAP_RUSTC_INFO = ".rustc_info.json"
+REAP_VENDORED_NAMES = ("vendor", ".vendor", "vendored", "third_party", "third-party", "runtime", "runtimes", "bundled")  # a derived name below one of these is a vendored copy, not build output
+REAP_PACKAGE_KINDS = ("node_modules", ".next", ".open-next", ".turbo", ".astro", "dist")   # output of a JS package: it sits beside that package's package.json
+REAP_BUILD_CONFIGS = ("vite.config.", "webpack.config.", "rollup.config.", "tsup.config.", "esbuild.config.", "svelte.config.", "astro.config.",
+                      "next.config.", "nuxt.config.", "tsconfig", "tauri.conf.json")
+REAP_DIST_RELEASE_SUFFIXES = (".app", ".dmg", ".pkg", ".ipa", ".msix", ".sig", ".asc", ".tgz", ".tar.gz", ".zip", ".exe", ".msi", ".deb", ".rpm",
+                              ".appimage", ".apk", ".aab", ".whl")
+REAP_DIST_RELEASE_NAMES = ("latest.json", "latest.yml", "latest-mac.yml", "latest-linux.yml", "releases", "release", "appcast.xml", "release.json",
+                           "release-manifest.json", "sha256sums", "sha256sums.txt", "checksums.txt")
+REAP_AUDIT_MAX_SECONDS = 480          # absolute ceiling of any audit budget, escalated or not on the tick, whatever the policy says
+REAP_AUDIT_FLOOR_SECONDS = 0.05       # a size taken after the deadline still sees a little of the folder (a directory's own blocks are 0 on APFS); the hard ceiling below still caps the sum
+REAP_AUDIT_OVERRUN = 1.25             # hard ceiling of a whole audit: budget x this; past it a size is a lower bound taken in no time
+REAP_AUDIT_JOB_SHARE = 0.4            # the share of the budget the job audits keep for themselves, whatever agent scratch spent first
+REAP_PIN_HOLDER = re.compile(r"(?:input-pinned-by|awaited-by):(J-\d{4,5})\((\w+)\)$")   # the blocker text of a pinned producer
 REAP_PIN_ITEM = threading.local()   # the item the engine is deciding on right now: a host's input pin consults it through reap_pin_released
 # Escalation: the clean pass climbs a ladder when its goal is unmet and, for one rung, widens the windows that decide when a finished
 # job's artifacts age out. An override only ever SHORTENS a window the operator set to a positive number (0 means off, and
@@ -156,18 +169,19 @@ def reap_pin_released(conn, other: dict, item: dict | None = None) -> bool:
     interruption clock. An unproved clock, a parked, blocked, queued or running job keeps the pin."""
     if other.get("status") in REAP_TERMINAL:
         return True
-    # A parked or interrupted pinner does not hold PURE derived output (node_modules, a Cargo target ...) while the disk is under
-    # pressure: its job rebuilds it. A pin on source (anything else) stays. The item is the argument, or the one the engine is
-    # deciding on (REAP_PIN_ITEM), so a host's own pin check reaches the same answer through this function.
+    # A parked or interrupted pinner stops holding PURE derived output under disk pressure only when the output is provably regenerable by
+    # that pinner itself (reap_pin_regenerable). The item is the argument, or the one the engine is deciding on (REAP_PIN_ITEM), so a host's
+    # own pin check reaches the same answer through this function. Every other pinner of the same output is asked separately by the caller.
     if other.get("status") in ("parked", "interrupted"):
-        if item is not None:
-            if reap_pressure_item(item) and reap_pressure_now():
-                return True
-        elif getattr(REAP_PIN_ITEM, "item", None) is not None:
-            # A host asks this once per job record for every item it decides on: the verdict is taken once per item (not once per job)
-            if getattr(REAP_PIN_ITEM, "verdict", None) is None:
-                REAP_PIN_ITEM.verdict = reap_pressure_item(REAP_PIN_ITEM.item) and reap_pressure_now()
-            if REAP_PIN_ITEM.verdict:
+        target = item if item is not None else getattr(REAP_PIN_ITEM, "item", None)
+        if target is not None and reap_pin_regenerable(conn, other, target):
+            if item is None:
+                # a host asks this once per job record for every item it decides on: the disk reading is taken once per item
+                if getattr(REAP_PIN_ITEM, "verdict", None) is None:
+                    REAP_PIN_ITEM.verdict = reap_pressure_item(target) and reap_pressure_now()
+                if REAP_PIN_ITEM.verdict:
+                    return True
+            elif reap_pressure_item(item) and reap_pressure_now():
                 return True
     rung = getattr(REAP_ESCALATION, "rung", None)
     hours = (rung or {}).get("pinnedHours")
@@ -191,6 +205,38 @@ def reap_idle_expired(job: dict, policy: dict) -> bool:
             clocks += [value.get(key) for key in ("at", "since", "parkedAt")]
     clocks = [stamp for stamp in clocks if isinstance(stamp, (int, float)) and not isinstance(stamp, bool)]
     return bool(clocks) and now() - max(clocks) >= hours * 3600
+
+
+def reap_pin_regenerable(conn, pinner: dict, item: dict) -> bool:
+    """True only when the pinner itself rebuilds this output: it is parked or interrupted, works INSIDE the checkout the output sits in (its cwd
+    is below the item's root), and, if interrupted, no continuation of it is live or unreadable. A producer's output that a consumer merely
+    reads (the pin the host records for an input) is not regenerable by the consumer: the producer is done and will not rebuild it, and the
+    consumer would resume to a missing input. Nothing proves it then, so the pin holds."""
+    if pinner.get("status") not in ("parked", "interrupted") or not item.get("root"):
+        return False
+    cwd = pinner.get("cwd")
+    if not isinstance(cwd, str) or not cwd.strip():
+        return False
+    try:
+        if not reap_inside(reap_canon(cwd), reap_canon(item["root"])):
+            return False
+    except (OSError, ValueError, ReapRefused):
+        return False
+    if pinner["status"] == "interrupted":
+        successors = reap_continuation_ids(conn, pinner["id"])
+        if successors is None:
+            return False
+        for successor_id in successors:
+            successor = row(conn, "SELECT status FROM jobs WHERE id=?", (successor_id,))
+            if not successor or successor["status"] not in REAP_TERMINAL:
+                return False
+    return True
+
+
+def reap_pinners(conn, job_id: str) -> list[dict]:
+    """EVERY unfinished job that waits on (pins) this job's folders: the blocker text names only the first."""
+    return [other for other in rows(conn, "SELECT * FROM jobs") if other["status"] not in REAP_TERMINAL
+            and (job_wait(other) or {}).get("job") == job_id]
 
 
 def reap_pressure_now() -> bool:
@@ -223,7 +269,7 @@ def reap_pressure_allows(item: dict, job: dict) -> bool:
     """Only derived output of idle jobs, under pressure or after their quiet window."""
     return reap_pressure_item(item) \
         and job["status"] in REAP_PRESSURE_IDLE \
-        and (bool(getattr(REAP_PRESSURE, "on", False)) or reap_idle_expired(job, reap_policy())) \
+        and (bool(getattr(REAP_PRESSURE, "on", False)) or (item.get("kind") != "dist" and reap_idle_expired(job, reap_policy()))) \
         and reap_idle_terminal_allows(job)
 
 
@@ -1117,6 +1163,18 @@ def reap_git_item_checks(root: str, path: str, needs: tuple, cache: dict | None 
         if code not in (0, 1):
             raise ReapRefused(f"git-error:check-ignore:{code}")
         passed.append("known-regenerable-astro" if code == 1 else "git-ignored")
+        if code == 0 and os.path.basename(path) in REAP_REGENERABLE:   # a folder INSIDE derived output (target/debug) is ignored through its parent by design
+            # The dir's OWN path must be what Git ignores: a derived name inside an ignored tree (a vendored runtime's lib/node_modules, a
+            # .vendor copy) passes `check-ignore` only because an ancestor is ignored, and is not build output. Any ignored ancestor
+            # between the dir and the repository root refuses it; a name that cannot be asked about safely refuses too.
+            parts = Path(rel).parts[:-1]
+            ancestors = ["/".join(parts[:level]) for level in range(1, len(parts) + 1)]
+            if ancestors:
+                if not all(reap_safe_name(name) for name in ancestors):
+                    raise ReapRefused("git-error:unsafe-ancestor-name")
+                if reap_git_ignored(root, ancestors):
+                    raise ReapRefused("ignored-ancestor")
+            passed.append("git-no-ignored-ancestor")
     if "untracked" in needs:
         # Case-folded and literal: a case-insensitive filesystem shows the index entry `Node_Modules/x` as `node_modules/x`,
         # and a case-sensitive pathspec would call that folder untracked and remove the tracked work living in it.
@@ -2153,8 +2211,23 @@ def reap_item_retention(item: dict, prove: bool = True) -> str:
         return REAP_DISPOSABLE
     if cls == "job-clone-regenerable" and item.get("ownership") in REAP_SCOPED_OWNERSHIP and item.get("kind") in REAP_PRESSURE_KINDS \
             and os.path.basename(item["path"]) == item.get("kind"):
+        item.pop("quietReason", None)
         if item["kind"] == "target" and not reap_cargo_target_recognised(item["path"]):
+            item["quietReason"] = "target-not-recognised"
             return "unmarked"  # only Cargo's own marks make a folder named target build output
+        placement = reap_derived_placement(item)
+        if placement:
+            item["quietReason"] = placement
+            return "unmarked"
+        if item["kind"] == "dist":
+            # dist can hold a release: kept when anything release-shaped is in or beside it, and never reaped because the job finished or a timer
+            # elapsed: only while the disk is under pressure, judged again at every call (the removal's last look included)
+            if reap_dist_release_bearing(item["path"]):
+                item["quietReason"] = "dist-release-bearing"
+                return "unmarked"
+            if not reap_pressure_now():  # the disk's own reading each time, never a verdict an earlier part of the pass took
+                item["quietReason"] = "below-pressure-threshold"
+                return "unmarked"
         return REAP_DISPOSABLE
     if cls == "job-clone-regenerable" and item.get("kind") in REAP_DERIVED_KINDS \
             and os.path.basename(item["path"]) == item.get("kind"):
@@ -2174,6 +2247,13 @@ def reap_item_retention(item: dict, prove: bool = True) -> str:
             return found
         if item["kind"] == "target" and not reap_cargo_target_recognised(item["path"]):
             item["quietReason"] = "target-not-recognised"
+            return found
+        placement = reap_derived_placement(item)
+        if placement:
+            item["quietReason"] = placement
+            return found
+        if item["kind"] == "dist" and reap_dist_release_bearing(item["path"]):
+            item["quietReason"] = "dist-release-bearing"
             return found
         if not reap_scratch_pressure_on():
             item["quietReason"] = "below-pressure-threshold"
@@ -4400,21 +4480,96 @@ def reap_cachedir_tagged(path: str) -> bool:
 
 
 def reap_rustc_info(path: str) -> bool:
-    """True when the folder's top level holds Cargo's `.rustc_info.json`: a plain, single-link file of this user. Only its metadata is read."""
+    """True when the folder's top level holds Cargo's own `.rustc_info.json`: a plain, single-link file of this user, at most 1 MB, that parses
+    as Cargo's cache (an integer `rustc_fingerprint` and an `outputs` object). `{}` or any other JSON is not Cargo's mark."""
     try:
         fd = os.open(path, REAP_ROOT_FLAGS)
         try:
             info = os.stat(REAP_RUSTC_INFO, dir_fd=fd, follow_symlinks=False)
-            return stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and info.st_nlink == 1
+            if not (stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and info.st_nlink == 1 and info.st_size <= 1 << 20):
+                return False
+            leaf = os.open(REAP_RUSTC_INFO, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+            try:
+                with os.fdopen(leaf, "rb", closefd=False) as handle:
+                    data = json.loads(handle.read((1 << 20) + 1))
+            finally:
+                os.close(leaf)
         finally:
             os.close(fd)
-    except OSError:
+    except (OSError, ValueError):
         return False
+    return isinstance(data, dict) and type(data.get("rustc_fingerprint")) is int and isinstance(data.get("outputs"), dict)
 
 
 def reap_cargo_target_recognised(path: str) -> bool:
-    """A Cargo target dir is recognised by its own marks (a valid CACHEDIR.TAG, or .rustc_info.json), never by its name alone."""
+    """A Cargo target dir is recognised by its own marks (a valid CACHEDIR.TAG, or a valid .rustc_info.json), never by its name alone."""
     return reap_cachedir_tagged(path) or reap_rustc_info(path)
+
+
+def reap_derived_placement(item: dict) -> str | None:
+    """Why a derived-named dir of a worktree or checkout is NOT derived output, else None. Names and one small listing only. A vendored or
+    runtime tree (`resources/node/lib/node_modules`, `.vendor/node_modules`) holds copies that nothing rebuilds, and a package's own output
+    sits beside that package's package.json (`dist` also beside a recognised build config). Unreadable means not derived."""
+    path, root, kind = str(item.get("path") or ""), str(item.get("root") or ""), str(item.get("kind") or "")
+    try:
+        steps = Path(path).relative_to(root).parts[:-1]
+    except ValueError:
+        return "outside-root"
+    if any(reap_fold(step) in REAP_VENDORED_NAMES for step in steps):
+        return "vendored-path"
+    if kind not in REAP_PACKAGE_KINDS:
+        return None
+    try:
+        names = os.listdir(os.path.dirname(path))
+        if "package.json" in names and stat.S_ISREG(os.lstat(os.path.join(os.path.dirname(path), "package.json")).st_mode):
+            return None
+    except OSError:
+        return "package-root-unreadable"
+    if kind == "dist" and any(reap_fold(name).startswith(REAP_BUILD_CONFIGS) for name in names):
+        return None
+    return "not-at-package-root"
+
+
+def reap_dist_release_bearing(path: str) -> bool:
+    """Names-only, bounded, non-following scan of a `dist` folder AND the folder beside it for anything release-shaped: an installer, package,
+    archive, signed bundle, a release folder or a release manifest. Anything unreadable, over budget or too deep counts as release-bearing:
+    the folder is kept."""
+    listed = 0
+    def scan(fd, depth):
+        nonlocal listed
+        with os.scandir(fd) as entries:
+            for entry in entries:
+                listed += 1
+                if listed > REAP_SCAN_ENTRIES:
+                    return True
+                name = reap_fold(entry.name)
+                if name in REAP_DIST_RELEASE_NAMES or name.endswith(REAP_DIST_RELEASE_SUFFIXES):
+                    return True
+                if reap_protected(entry.name) or reap_is_git(entry.name):
+                    continue
+                info = os.stat(entry.name, dir_fd=fd, follow_symlinks=False)
+                if stat.S_ISDIR(info.st_mode):
+                    if depth >= 4:
+                        return True
+                    child = os.open(entry.name, REAP_DIR_FLAGS, dir_fd=fd)
+                    try:
+                        opened = os.fstat(child)
+                        if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino) or scan(child, depth + 1):
+                            return True
+                    finally:
+                        os.close(child)
+        return False
+    try:
+        beside = os.listdir(os.path.dirname(path))
+        if any(reap_fold(name) in REAP_DIST_RELEASE_NAMES for name in beside):
+            return True
+        fd = os.open(path, REAP_ROOT_FLAGS)
+        try:
+            return scan(fd, 0)
+        finally:
+            os.close(fd)
+    except OSError:
+        return True
 
 
 # ---- an interrupted job whose work a durable continuation took over ---------------------------------------------------
@@ -5011,6 +5166,8 @@ def reap_cache_worktree_items(job: dict, subdir: str) -> tuple[list[dict], bool]
             continue
         item = {"path": path, "root": subdir, "repo": reap_repo_of(path, subdir), "owner": job["id"], "jobs": [job["id"]],
                 "class": "job-clone-regenerable", "kind": kind, "ownership": REAP_CACHE_WORKTREE}
+        if reap_derived_placement(item):
+            continue  # a vendored copy or a folder that is no package's output is not offered at all
         items.append({**item, "retention": reap_item_retention(item)})
     return items, partial
 
@@ -6671,7 +6828,7 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
                     raise ReapRefused("retention-changed")
                 raise ReapRefused(reap_item_idle_reason(item))
             if declared != REAP_DISPOSABLE:
-                if item.get("class") == "scratch-regenerable" and declared == "unmarked" and item.get("quietReason"):
+                if item.get("class") in ("scratch-regenerable", "job-clone-regenerable") and declared == "unmarked" and item.get("quietReason"):
                     raise ReapRefused("retention-preserved:" + str(item["quietReason"])[:60])
                 raise ReapRefused(f"retention-preserved:{declared[:40]}")
             checks.append("retention-owner-class")
@@ -6710,7 +6867,7 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
             if retention != REAP_DISPOSABLE:
                 if item.get("class") == "agent-scratch" and retention == "unmarked":
                     raise ReapRefused(reap_item_idle_reason(item))
-                if item.get("class") == "scratch-regenerable" and retention == "unmarked" and item.get("quietReason"):
+                if item.get("class") in ("scratch-regenerable", "job-clone-regenerable") and retention == "unmarked" and item.get("quietReason"):
                     raise ReapRefused("retention-preserved:" + str(item["quietReason"])[:60])
                 raise ReapRefused(f"retention-preserved:{retention}")
             checks.append("retention-disposable")
@@ -6750,6 +6907,7 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
                 stack.enter_context(reap_locks(reap_cargo_locks(item["path"]), create=False))
                 checks.append("cache-tag-locks")
             repos, proved, git_dirs, archive, templates, secrets = [], set(), [], None, frozenset(), []
+            revet = None
             item.pop("archiveUnsaved", None)
             scratch = item["class"] == "agent-scratch" and reap_scratch_protected(item["path"])
             protected_ok = whole_clone and reap_policy().get("cloneProtectedCopies", "remove") == "remove"
@@ -6787,7 +6945,10 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
                         reap_git_gate(item["source"])
                         checks.append("detached-source-git-safe")
                 elif spec["git"]:
-                    checks.extend(reap_git_proof(item.get("repo") or item["root"], item["path"], reap_class_git_needs(item), ctx.setdefault("git", {}) if mode == "audit" else None))
+                    needs = reap_class_git_needs(item)
+                    checks.extend(reap_git_proof(item.get("repo") or item["root"], item["path"], needs, ctx.setdefault("git", {}) if mode == "audit" else None))
+                    if mode != "audit" and set(needs) <= {"ignored", "untracked"}:
+                        revet = (item.get("repo") or item["root"], item["path"], needs)  # a derived dir's two cheap proofs are asked again at the end
                 if allow_git and not whole_clone:  # EVERY .git the scan permits is proved, at any depth and under any name, or the item stays whole
                     for repo in sorted(set(repos)):
                         needs = ("clean", "pushed", "all-refs") + (("protected-ok",) if scratch else ())
@@ -6901,6 +7062,10 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
             if reap_authority(item) != evidence:
                 raise ReapRefused("authority-changed")
             checks.append("authority-final")
+            if revet:
+                # Immediately before the removal, with the locks held: the git proofs of a derived dir again (a file tracked, an ancestor
+                # ignored, a unignore since the first look). Retention, Cargo's mark, placement and the release fence were recomputed above.
+                checks.extend("final-" + c for c in reap_git_proof(*revet))
             if targeted and reap_fence(item["source"], item["sourceRoot"]) != source_fence:
                 raise ReapRefused("output-source-identity-changed")
             if not apply:
@@ -7903,9 +8068,6 @@ def reap_pressure_pass(conn, policy: dict, live_ids: set, started: float, action
         reap_pinned_pressure_pass(conn, live_ids, started, actions, errors, clones)
 
 
-REAP_PIN_HOLDER = re.compile(r"(?:input-pinned-by|awaited-by):(J-\d{4,5})\((\w+)\)$")
-
-
 def reap_pinned_pressure_pass(conn, live_ids: set, started: float, actions: list, errors: list, clones: list) -> None:
     """Under pressure, a FINISHED job whose only hold is a parked or interrupted job's pin gives up its pure derived output (a Cargo
     target folder, node_modules ...): the pinner rebuilds it. Anything else of the job, and every job another kind of job pins, stays."""
@@ -8195,6 +8357,8 @@ def reap_scratch_regen_items(deadline: float | None = None) -> tuple[list[dict],
                 continue
             item = {"path": path, "root": root, "repo": reap_repo_of(path, root), "owner": AGENT_SCRATCH_OWNER, "jobs": [],
                     "class": "scratch-regenerable", "kind": kind, "ownership": REAP_SCRATCH_CHECKOUT}
+            if reap_derived_placement(item):
+                continue
             if path not in chosen or len(root) > len(chosen[path]["root"]):
                 chosen[path] = item
     items = []
@@ -8649,14 +8813,25 @@ def reap_audit_proved_scratch(item: dict) -> bool:
         and not proof.get("idle") and proof.get("detail") != "listing-budget-exhausted" and item.get("retention") != REAP_DISPOSABLE
 
 
+def reap_audit_share(ctx: dict, deadline: float, items_left: int) -> float:
+    """Seconds one item may size for: an even share of what is left to the deadline (a token 0.05 s once it passed), at most 60, and never more
+    than the audit's hard ceiling allows: nothing is promised past that ceiling."""
+    moment = time.monotonic()
+    seconds = max(REAP_AUDIT_FLOOR_SECONDS, min(60.0, (deadline - moment) / max(1, items_left)))
+    if ctx.get("hardDeadline") is not None:
+        seconds = min(seconds, ctx["hardDeadline"] - moment)
+    return max(0.0, seconds)
+
+
 def reap_audit_item(item: dict, blocker: str | None, ctx: dict, deadline: float, items_left: int = 1) -> dict:
     base = {"path": item["path"], "class": item["class"], "kind": item["kind"]}
     try:
         info = os.lstat(item["path"])
     except OSError:
         return {**base, "state": "gone", "bytes": 0, "blocking": None}
-    # each of the folders still to audit gets an even share of what is left (a quick one hands its time on); never less than a second
-    ctx["sizeBudget"] = 1.0 if time.monotonic() > deadline else max(1.0, min(60.0, (deadline - time.monotonic()) / max(1, items_left)))
+    # each of the folders still to audit gets an even share of what is left (a quick one hands its time on). Nothing is guaranteed past the
+    # deadline, and no share runs past the audit's hard ceiling (ctx["hardDeadline"]): a size taken with no time left is a lower bound.
+    ctx["sizeBudget"] = reap_audit_share(ctx, deadline, items_left)
     size_reason = None
     idle_pressure = False
     if blocker and os.path.basename(item["path"]) in REAP_OUTPUT_KINDS and reap_output_registry_present(item["path"]):
@@ -8673,11 +8848,11 @@ def reap_audit_item(item: dict, blocker: str | None, ctx: dict, deadline: float,
     elif blocker and reap_pressure_item(item) and reap_pressure_now():
         # An input pin or an awaiting job holds the producer's folders: a PARKED or INTERRUPTED pinner does not hold pure derived output
         # under pressure (a pin on source stays). The per-item authority below asks the pin again, for this very item.
-        pinner = re.match(r"(?:input-pinned-by|awaited-by):(J-\d{4,5})\((\w+)\)$", blocker)
+        pinner = REAP_PIN_HOLDER.match(blocker)
         if pinner and pinner.group(2) in ("parked", "interrupted"):
             with db() as conn:
-                consumer = row(conn, "SELECT * FROM jobs WHERE id=?", (pinner.group(1),))
-                released = bool(consumer) and reap_pin_released(conn, consumer, item)
+                holders = reap_pinners(conn, item["owner"])
+                released = bool(holders) and all(reap_pin_released(conn, consumer, item) for consumer in holders)  # every pinner, not the first one named
             if released:
                 blocker = None
                 idle_pressure = True
@@ -8703,8 +8878,8 @@ def reap_audit_item(item: dict, blocker: str | None, ctx: dict, deadline: float,
         size, complete = done["bytes"], not done.get("bytesIncomplete")
         size_reason = done.get("sizeReason")
     else:
-        # A folder the budget never reached is still measured for a moment: its partial size is a lower bound, never a zero
-        sizing = reap_metadata_size(item["path"], max(1.0, min(60.0, (deadline - time.monotonic()) / max(1, items_left))))
+        # A folder the budget never reached keeps only the walk's partial size: a lower bound (the folder's own blocks at least), never a zero
+        sizing = reap_metadata_size(item["path"], reap_audit_share(ctx, deadline, items_left))
         size, complete, size_reason = sizing["bytes"], sizing["complete"], sizing["reason"]
     entry["bytes"] = size
     if size is None or not complete:
@@ -8718,11 +8893,11 @@ def reap_audit_item(item: dict, blocker: str | None, ctx: dict, deadline: float,
 # Every reason an item is kept, as an action the operator (or a later tick) can take. reap-status prints the line for each reason
 # it reports, with the bytes behind it; an unlisted reason still prints, with a pointer to the item's own text.
 REAP_REASON_ACTIONS = {
-    "job-parked": "unfinished job (parked): clone/cache/evidence kept; derived output (node_modules, .next, dist, Cargo target dirs) of its named clones, of git worktrees in its cache folder and of Cargo target folders there goes under pressure or after parkedReapHours without a report",
+    "job-parked": "unfinished job (parked): clone/cache/evidence kept; derived output (node_modules, .next, Cargo target dirs; dist only under disk pressure) of its named clones, of git worktrees in its cache folder and of Cargo target folders there goes under pressure or after parkedReapHours without a report",
     "job-approved": "job approved and waiting to run: kept until it finishes",
     "job-running": "job running: kept until it finishes",
     "job-queued": "job queued: kept until it finishes",
-    "job-blocked": "job blocked: clone/cache/evidence kept; derived output of its clones and cache worktrees goes under pressure or after parkedReapHours without a report",
+    "job-blocked": "job blocked: clone/cache/evidence kept; derived output of its clones and cache worktrees goes under pressure or after parkedReapHours without a report (dist only under pressure)",
     "job-interrupted": "job interrupted: clone/cache/evidence kept; derived output of its clones and cache worktrees goes only under disk pressure",
     "settling": "job finished moments ago: reaped after the settle window",
     "worker-terminal-still-open": "worker terminal still live: never removed under a live terminal; close it through cleanup-status / cleanup-record",
@@ -8761,6 +8936,10 @@ REAP_REASON_ACTIONS = {
     "protected-leaf": "holds .env*/.dev.vars*/.wrangler/.vercel: never copied or removed by a cache/regenerable item; kept",
     "in-use": "a process has it open or as its cwd: kept until it exits",
     "not-git-ignored": "build output that git does not ignore: kept",
+    "ignored-ancestor": "a folder above it is what git ignores (a vendored or runtime tree), so it is not build output: kept",
+    "vendored-path": "below a vendor/runtime folder: a vendored copy, not build output: kept",
+    "not-at-package-root": "not beside a package.json (dist: or a recognised build config): not a package's build output: kept",
+    "dist-release-bearing": "a dist that holds or sits beside an installer, package, archive, signed bundle or release manifest: kept",
     "tracked-files": "tracked files inside: kept",
     "size-time-limit": "sizing hit its time limit this pass: the reaper's own pass doubles the budget each attempt (up to 8x) until it completes",
     "size-entry-limit": "too many entries to size this pass: the reaper's own pass doubles the entry budget each attempt (up to 8x) until it completes",
@@ -8809,7 +8988,10 @@ def reap_audit_net(entries: list) -> None:
         inner = sum(e.get("bytes") or 0 for e in entries if e is not parent and e.get("class") == "job-clone-regenerable"
                     and str(e.get("path")).startswith(parent["path"] + "/"))
         if inner:
-            parent["bytes"] = max(0, parent["bytes"] - inner)
+            # the folder keeps at least its own allocated bytes' worth: a lower bound of one byte, never a 0 that reads as "empty"
+            parent["bytes"] = parent["bytes"] - inner
+            if parent["bytes"] < 1:
+                parent["bytes"], parent["bytesLowerBound"] = 1, True
             parent["bytesExcludesItems"] = True
 
 
@@ -8883,9 +9065,10 @@ def reap_audit(only: str | None, limit: int, include_items: bool, budget: int, p
     started = time.monotonic()
     deadline = started + budget
     job_deadline = started + budget * 0.9  # the rest of the budget is for the releases
+    ctx_hard = started + budget * REAP_AUDIT_OVERRUN  # no size anywhere in this audit runs past this, whatever is left to do
     live_ids, live_idle = reap_live_snapshot()
     clones = reap_clone_roots()
-    ctx: dict = {"run": "audit"}
+    ctx: dict = {"run": "audit", "hardDeadline": ctx_hard}
     try:
         ctx["table"] = reap_process_table()
     except ReapRefused as refusal:
@@ -8897,6 +9080,7 @@ def reap_audit(only: str | None, limit: int, include_items: bool, budget: int, p
     # so 154 of 157 scratch folders reported 0 bytes and `audit-budget-exhausted`. A job's audit cannot be cut short mid-item, so only
     # the order keeps the share.
     scratch_deadline = started + budget * REAP_AUDIT_SCRATCH_SHARE
+    ctx["hardDeadline"] = scratch_deadline + budget * 0.05  # scratch cannot spend the jobs' share: its sizes stop a hair past its own
     scratch_rows, scratch_report = [], None
     if not only:
         with db() as conn:  # the tick's own listing keeps the cursor and the remembered proofs; the audit starts at that cursor and reads them
@@ -8913,6 +9097,9 @@ def reap_audit(only: str | None, limit: int, include_items: bool, budget: int, p
             audited = reap_audit_item(item, None, ctx, scratch_deadline, len(listing) - n)
             scratch_rows.append(audited)
             reap_bucket(categories, reasons, audited, reason_bytes)
+    ctx["hardDeadline"] = ctx_hard
+    if not only:  # the job audits keep their reserved share even when scratch ran over its own
+        job_deadline = max(job_deadline, min(ctx_hard, time.monotonic() + budget * REAP_AUDIT_JOB_SHARE))
     with db() as conn:
         jobs = rows(conn, "SELECT * FROM jobs WHERE id=?", (only,)) if only else rows(conn, "SELECT * FROM jobs ORDER BY id")
         known = {j["id"] for j in rows(conn, "SELECT id FROM jobs")}
@@ -8953,7 +9140,7 @@ def reap_audit(only: str | None, limit: int, include_items: bool, budget: int, p
                 blocker = reap_job_blocker(conn, job, live_ids, live_idle)
                 if not blocker and "table" not in ctx:
                     blocker = ctx.get("table_error") or "process-table-unavailable"
-                item_deadline = max(job_deadline, time.monotonic() + REAP_AUDIT_JOB_SECONDS)  # a job that was started is finished: its items are never starved
+                item_deadline = min(max(job_deadline, time.monotonic() + REAP_AUDIT_JOB_SECONDS), ctx_hard)  # a job that was started is finished, up to the hard ceiling
                 entries = [e for e in (reap_audit_item(item, blocker, ctx, item_deadline, len(items) - n) for n, item in enumerate(items)) if e["state"] != "gone"]
                 reap_audit_net(entries)
                 if persist and not only:
@@ -9026,14 +9213,14 @@ def reap_audit_budget(persist: bool = False) -> int:
     seconds = reap_policy().get("reapAuditSeconds", REAP_AUDIT_SECONDS)
     seconds = seconds if type(seconds) is int and seconds >= 1 else REAP_AUDIT_SECONDS
     if not persist:
-        return seconds
+        return seconds  # a bare reap-status keeps the plain value: it returns inside the shell's 120 s guard
     try:
         with db() as conn:
             factor = reap_audit_cursor(conn).get("budgetFactor", 1)
     except (HostError, OSError, sqlite3.Error):
         factor = 1
     factor = factor if type(factor) is int and 1 <= factor <= REAP_AUDIT_ESCALATE else 1
-    return seconds * factor
+    return min(seconds * factor, REAP_AUDIT_MAX_SECONDS)  # the tick's own audit never exceeds the absolute ceiling, whatever the policy says
 
 
 def tool_reap_status(params: dict) -> dict:

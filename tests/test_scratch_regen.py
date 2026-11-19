@@ -49,6 +49,7 @@ class ScratchBase(Home):
         (path / ".gitignore").write_text("\n".join(IGNORED) + "\n")
         (path / "src").mkdir()
         (path / "src" / "main.txt").write_text("source\n")
+        (path / "package.json").write_text("{}\n")  # derived output sits beside its package's package.json
         self.git(path, "add", "-A")
         self.git(path, "commit", "-q", "-m", "init")
         bare = self.remotes / (path.name + ".git")
@@ -139,7 +140,7 @@ class RegenerableDirs(ScratchBase):
         self.put(root, "node_modules/pkg/index.js")
         self.put(root, "dist/index.html")
         self.put(root, "java/target/classes/A.class")        # named target, never written by Cargo
-        self.put(root, "rs/target/.rustc_info.json", b"{}")   # Cargo's own mark
+        self.put(root, "rs/target/.rustc_info.json", b'{"rustc_fingerprint": 1234567890123456789, "outputs": {}, "successes": {}}')   # Cargo's own mark
         self.put(root, "rs/target/debug/app")
         (root / ".gitignore").write_text(".env*\nrs/target/\njava/target/\n")
         out = self.regen()

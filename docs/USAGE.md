@@ -130,16 +130,18 @@ Under disk pressure (at or above `diskWarnPercent`, 75%), the derived output of 
 rebuild it when they resume. The pressure check runs during a `tick`. Where it applies (0.20.2):
 
 - the job's named clones (`node_modules`, `.next`, `.open-next`, `.turbo`, `.astro`, `target`; never `dist` there);
-- a git worktree or clone inside the job's cache folder (`<cacheRoot>/J-NNNN/<dir>` with a `.git`): the same dirs plus `dist`;
+- a git worktree or clone inside the job's cache folder (`<cacheRoot>/J-NNNN/<dir>` with a `.git`): the same dirs plus `dist`, which goes
+  under disk pressure only and never when it holds or sits beside a release (installer, package, archive, signed bundle, release manifest);
 - a cache folder that is itself a Cargo target dir (`J-NNNN/target-rust`);
 - a git checkout under agent scratch (`scratchRoot/<task>`), once the checkout has been quiet for `scratchRegenIdleHours`
   (2); its own edits, untracked files, stash and unpushed commits are not touched.
 
-A `target` counts only when Cargo marked it (a valid `CACHEDIR.TAG` or `.rustc_info.json`), and only dirs that git ignores
-and tracks nothing of go; a dir holding a protected leaf (`.env*`, `.dev.vars*`, `.wrangler`, `.vercel`), a release artifact
+A `target` counts only when Cargo marked it (a valid `CACHEDIR.TAG` or a `.rustc_info.json` that parses as Cargo's cache), and only dirs
+whose own path git ignores (no ignored ancestor) and tracks nothing of go, at a package root (beside a `package.json`; `dist` also beside a
+recognised build config) and not below a `vendor`, `.vendor`, `runtime` or `third_party` folder; a dir holding a protected leaf (`.env*`, `.dev.vars*`, `.wrangler`, `.vercel`), a release artifact
 in a `target`, or a job folder or worktree carrying a retention marker stays. A running, starting (queued, approved) job
-keeps everything, and a job that is only *blocked* keeps the pins it holds. A parked or interrupted job that another job
-waits on (or pins as an input) does not hold that job's pure derived output under pressure; a pin on source stays.
+keeps everything, and a job that is only *blocked* keeps the pins it holds. A parked or interrupted job that another job waits on does not hold derived output under pressure only when that job itself
+rebuilds it (it works inside the same checkout and has no live continuation); output a consumer merely reads, and a pin on source, stay.
 
 ## What it never removes
 
