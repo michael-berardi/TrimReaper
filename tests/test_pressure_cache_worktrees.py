@@ -48,7 +48,7 @@ class CacheBase(Home):
         else:
             subprocess.run(["git", "clone", "-q", str(self.remotes / f"base-{job.lower()}-{name}.git"), str(root)], check=True, capture_output=True)
         for kind in outputs:
-            self.put(root, f"{kind}/sub/build.bin", b"x" * 4096)
+            self.put(root, f"{kind}/sub/build.js" if kind == "dist" else f"{kind}/sub/build.bin", b"x" * 4096)   # a dist holds web output: that is what the allowlist recognises
         if "target" in outputs:
             self.put(root, "target/CACHEDIR.TAG", TAG)
         self.age(root, 2)
@@ -172,14 +172,14 @@ class CacheWorktreeFences(CacheBase):
         self.job("J-0521")
         root = self.worktree("J-0521", ignore=(".env*",), outputs=("node_modules", "dist"))  # no .gitignore entry: untracked source
         self.pressure_tick()
-        self.assertTrue((root / "node_modules/sub/build.bin").exists() and (root / "dist/sub/build.bin").exists())
+        self.assertTrue((root / "node_modules/sub/build.bin").exists() and (root / "dist/sub/build.js").exists())
 
     def test_a_tracked_file_inside_a_derived_dir_keeps_it(self):
         self.job("J-0522")
         root = self.worktree("J-0522", outputs=("dist",))
-        self.git(root, "add", "-f", "dist/sub/build.bin")
+        self.git(root, "add", "-f", "dist/sub/build.js")
         self.pressure_tick()
-        self.assertTrue((root / "dist/sub/build.bin").exists())
+        self.assertTrue((root / "dist/sub/build.js").exists())
 
     def test_a_derived_dir_holding_a_protected_leaf_is_refused_whole(self):
         self.job("J-0523")
@@ -542,7 +542,7 @@ class Placement(CacheBase):
         self.put(root, "dist/keep/notes.md", b"mine\n")
         self.pressure_tick()
         self.assertFalse((root / "node_modules").exists())                 # control
-        self.stay(root, "dist/keep/notes.md", "dist/sub/build.bin")
+        self.stay(root, "dist/keep/notes.md", "dist/sub/build.js")
 
     def test_a_protected_ancestor_inside_the_worktree_keeps_everything_below_it(self):
         self.job("J-0809")
@@ -696,7 +696,7 @@ class InUseAndChanges(CacheBase):
         with mock.patch.object(core, "load_policy", return_value=policy), mock.patch.object(core, "reap_metadata_size", sizing), \
                 mock.patch.object(core, "disk_level", lambda *a: level["v"]), core.db() as conn:
             core.reap_tick(conn, policy, [], actions, errors)
-        self.assertTrue((changed / "dist/sub/build.bin").exists())
+        self.assertTrue((changed / "dist/sub/build.js").exists())
 
 
 class DistRules(CacheBase):
@@ -713,7 +713,7 @@ class DistRules(CacheBase):
         self.pressure_tick()
         self.assertFalse((plain / "dist").exists())                          # control: the same fixture without a release goes
         for label, root in roots.items():
-            self.assertTrue((root / "dist/sub/build.bin").exists(), label)
+            self.assertTrue((root / "dist/sub/build.js").exists(), label)
 
     def test_a_cache_worktree_dist_goes_only_under_pressure_never_because_the_job_finished_or_a_timer_elapsed(self):
         self.write_config({"policy": {"parkedReapHours": 1, "evidenceExpiryDays": 30}})
@@ -732,7 +732,7 @@ class DistRules(CacheBase):
         self.assertEqual(errors, [])
         self.assertFalse((finished / "node_modules").exists(), "control: a finished job's other derived output goes without pressure")
         self.assertFalse((parked / "node_modules").exists(), "control: so does a quiet parked job's, by its timer")
-        self.assertTrue((finished / "dist/sub/build.bin").exists() and (parked / "dist/sub/build.bin").exists())
+        self.assertTrue((finished / "dist/sub/build.js").exists() and (parked / "dist/sub/build.js").exists())
         with contextlib.closing(self.state()) as conn, conn:
             conn.execute("DELETE FROM meta WHERE key LIKE 'reap:pressure:%'")
         self.pressure_tick()

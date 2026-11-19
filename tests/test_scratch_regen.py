@@ -61,7 +61,7 @@ class ScratchBase(Home):
     def checkout(self, name="slot2/vitals", outputs=tuple(GONE)) -> Path:
         root = self.repo(self.scratch / name)
         for out in outputs:
-            self.put(root, f"{out}/sub/file.bin", b"x" * 2000)
+            self.put(root, f"{out}/sub/file.js" if out == "dist" else f"{out}/sub/file.bin", b"x" * 2000)
         if "target" in outputs:
             self.put(root, "target/CACHEDIR.TAG", TAG)  # a target dir is Cargo's only by Cargo's own mark
         return root

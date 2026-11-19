@@ -131,7 +131,7 @@ rebuild it when they resume. The pressure check runs during a `tick`. Where it a
 
 - the job's named clones (`node_modules`, `.next`, `.open-next`, `.turbo`, `.astro`, `target`; never `dist` there);
 - a git worktree or clone inside the job's cache folder (`<cacheRoot>/J-NNNN/<dir>` with a `.git`): the same dirs plus `dist`, which goes
-  under disk pressure only and never when it holds or sits beside a release (installer, package, archive, signed bundle, release manifest);
+  under disk pressure only, and only when everything in it is recognisable web output (anything else, or an installer, archive, signed bundle or release manifest in or beside it, keeps it);
 - a cache folder that is itself a Cargo target dir (`J-NNNN/target-rust`);
 - a git checkout under agent scratch (`scratchRoot/<task>`), once the checkout has been quiet for `scratchRegenIdleHours`
   (2); its own edits, untracked files, stash and unpushed commits are not touched.

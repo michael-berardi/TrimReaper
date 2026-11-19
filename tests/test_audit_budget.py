@@ -262,4 +262,4 @@ class TickBounds(Home):
         core.REAP_AUDIT_PERSIST.on = False
         with mock.patch.object(core, "reap_audit", wraps=core.reap_audit) as audit:
             core.tool_reap_status({})
-        self.assertEqual(audit.call_args.args[3], 100)                          # control: an explicit status never escalates
+        self.assertEqual(audit.call_args.args[3], core.REAP_AUDIT_SHELL_SECONDS)   # control: a status outside the tick never escalates, and stays under the shell guard (R3)

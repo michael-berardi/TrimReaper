@@ -13,11 +13,17 @@
     (`node_modules` and the other JS outputs beside a `package.json`; `dist` beside one or a recognised build config). So a
     vendored runtime's `lib/node_modules` or a `.vendor` copy is never offered. A `target` counts only with Cargo's own mark: a valid
     `CACHEDIR.TAG` or a `.rustc_info.json` that parses as Cargo's cache (`{}` no longer does).
-  - `dist` has a release fence like `target`: an installer, `.pkg`/`.dmg`/`.app`, archive (`.zip`, `.tgz`), signed bundle, release folder or
-    release manifest (`latest*.yml`, `latest.json`, `appcast.xml`...) in or beside it keeps it.
+  - `dist` is reclaimable only when EVERYTHING in it is recognisable web/build output (an allowlist: `.js .mjs .cjs .map .css .html .json
+    .wasm .d.ts`, images, fonts, `.txt`). Anything else keeps it, in or beside it: an installer, an archive of any format (`.zip`, `.tar.*`,
+    `.7z`, `.vsix`, `.jar`, `.snap`, `.flatpak`, `.nupkg`, `.crx`, `.xpi`...), a `.blockmap`, a channel manifest (`latest*.yml`,
+    `beta-mac.yml`, `release.json`, `appcast.xml`), an app bundle, a release folder, a link, a nested git repository (a gh-pages worktree)
+    or a file of a type nobody listed. A `node_modules`/`dist` below a packaged `*.app`, `*.framework` or `Contents` folder is a shipped copy
+    and never offered. A disposable marker on a derived dir no longer lifts these fences (Cargo's mark, placement, the `dist` allowlist
+    and its pressure rule).
   - A parked or interrupted pinner (`awaited-by`, or a host's input pin through `reap_pin_released`) stops holding pure derived output under
     pressure only when it rebuilds that output itself: it works inside the very checkout, and an interrupted one has no live continuation.
-    A producer's output that a consumer merely reads stays pinned. Every pinner is asked, not only the first one named.
+    A producer's output that a consumer merely reads stays pinned. Every pinner is asked, not only the first one named, and the audit and the
+    removal ask the same question for a host's input pin (the pinner its blocker text names); the audit looks a job's pinners up once.
   - The git proofs of a derived dir (git-ignored, tracked-free, no ignored ancestor) are asked again immediately before the removal, with the
     locks held; retention, Cargo's mark, placement, the release fence and the pressure reading were already recomputed there.
   - Agent-scratch checkouts lose their derived dirs (and `dist`, with the same fences) under pressure once quiet, whatever the checkout's own
@@ -26,7 +32,9 @@
   the policy says) while its previous audit was incomplete. Agent scratch is audited first, within 40% of the budget, and the job audits keep
   their own 40%; each folder gets an even share of what is left, and nothing is promised after the deadline: the whole audit stops
   sizing at 1.25x its budget (a size past it is a lower bound). A size that hit its limit is a lower bound (`bytesLowerBound`,
-  `summary.unreapedBytesIsLowerBound`), and a folder's size is never floored to 0.
+  `summary.unreapedBytesIsLowerBound`), and a folder's size is never floored to 0. The worktree scans and every git probe of an audit stop at
+  that same ceiling too, and an audit outside the tick (`reap-status`, explicit `--budget` included) is capped at 90 s whatever the policy
+  says, so even its 1.25x ceiling returns inside the 120 s shell guard.
 - Tests no longer scan this machine's shared and per-user temp folders.
 
 ## 0.20.1 (2026-11-15)
