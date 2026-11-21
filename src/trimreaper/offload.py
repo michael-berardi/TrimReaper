@@ -563,7 +563,10 @@ def move_one(item: dict, dry_run: bool) -> dict:
     if tree_stats(path)["newest"] > item["stats"]["newest"]:
         shutil.rmtree(partial, ignore_errors=True)
         raise host.HostError(f"{path} changed during the copy; nothing was removed")
-    active = parent_active(item, item.get("settled", item["quiet"]), core.reap_process_table(), time.time(),
+    table = core.reap_process_table()
+    if item.get("regenDone"):  # the folder was worked on by our own deletions: a process that opened it meanwhile keeps it
+        core.reap_holders(str(path), str(path), table)
+    active = parent_active(item, item.get("settled", item["quiet"]), table, time.time(),
                          {"regen": {n: p["regenDone"] for n, p in item.get("siblings", {}).get("peers", {}).items() if p.get("regenDone")}})
     if active:  # the copy can take minutes: look at the kept folder again before the original is swapped
         shutil.rmtree(partial, ignore_errors=True)

@@ -272,6 +272,15 @@ class OverflowRetention(Home):
         with self.assertRaisesRegex(core.ReapRefused, "retention:customer"):
             clean.clean_overflow_gates({"path": os.path.realpath(moved / "node_modules"), "regen": "node_modules", "jobs": [], "command": []}, None)
 
+    def test_a_marker_at_a_keepfolder_home_job_root_keeps_the_expired_moved_children(self):
+        home_job = self.home / ".cache" / "ut-coordinator" / "J-0101"
+        home_job.mkdir(parents=True)
+        (home_job / ".ut-retention-customer").write_bytes(b"")
+        os.symlink(str(self.mirror / "J-0101" / "wt"), str(home_job / "wt"))
+        self.clean()
+        self.assertTrue((self.mirror / "J-0101" / "wt" / "package.json").exists())
+        self.assertTrue(os.path.islink(home_job / "wt"))
+
     def test_an_expired_job_folder_holding_a_release_artifact_is_kept(self):
         self.put(self.mirror / "J-0101", "out/App-1.0.dmg", b"d" * 8192)
         self.age(self.mirror / "J-0101", 40)

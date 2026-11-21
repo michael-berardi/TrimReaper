@@ -2298,7 +2298,7 @@ def clean_overflow_home_side(path: str, overflow: str) -> tuple[str | None, bool
     there (if any) and whether its git dir is gone."""
     home = reap_canon(reap_home())
     original = os.path.join(home, os.path.relpath(path, overflow))
-    current, repo, broken = os.path.dirname(original), None, False
+    current, repo, broken = original, None, False   # the home folder itself too: a keepFolder job root stays a real folder in home
     while reap_inside(current, home) and current != home:
         if os.path.isdir(current) and not os.path.islink(current):
             retention = reap_cache_retention(current)

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.22.3 (2026-11-21)
+
+- Third review round. The overflow sweep also checks the home folder a moved folder came from: a retention marker or repository at a
+  job's home root (the kept folder that holds links) keeps the moved children. Before a folder whose output offload deleted is swapped
+  for its link, the open-handle check runs again.
+
 ## 0.22.2 (2026-11-21)
 
 - Second review round. Offload plans which folders will move (size, goal, limit and free-space rules) before it deletes anything, so a
