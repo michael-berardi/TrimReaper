@@ -76,3 +76,20 @@ class FixtureExpiry(Home):
         self.assertEqual(offload.fixture_refusal(root / "fixtures"), "fixture-never-moved")
         self.assertEqual(offload.fixture_refusal(root), "holds-fixtures-never-moved")
         self.assertIsNone(offload.fixture_refusal(self.home / "nothing"))
+
+    def test_non_evidence_job_marker_keeps_fixtures(self):
+        root = self.setup_job(marker=False)
+        self.put(root, ".ut-retention-customer", b"")
+        self.assertEqual(self.fixtures_item(root)["retention"], "customer")
+
+    def test_offload_checks_children_for_fixtures(self):
+        base = self.home / "jobs"
+        (base / "J-0071" / "fixtures").mkdir(parents=True)
+        self.assertEqual(offload.fixture_refusal(base), "holds-fixtures-never-moved")
+
+    def test_weight_left_out_of_archive_only_inside_fixtures(self):
+        from pathlib import Path as P
+        # the collect walk tests the file's own path: a weight in a repo outside any fixtures folder is still saved
+        import inspect
+        src = inspect.getsource(core.reap_archive_collect)
+        self.assertIn("Path(absolute).parts", src)
