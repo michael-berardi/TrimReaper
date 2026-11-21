@@ -5,6 +5,9 @@
 - Review fixes for 0.23.0. A finished job's fixtures are disposable only under a missing or evidence-class job marker: a customer,
   release or ambiguous job marker keeps them. The model-weight skip in an archive tests the file's own path, so a weight in a
   repository outside any fixtures folder is still saved. Offload also refuses a folder whose children hold a fixtures folder.
+- Offload refuses to replace an existing overflow destination with a named error unless it is a `.partial` left by an interrupted
+  copy. If a home symlink was replaced by a real folder of the same name, that folder may be the only copy: nothing is deleted.
+- Offload rechecks open holders immediately before the swap, whether or not its own regeneration touched the folder.
 
 ## 0.23.0 (2026-11-21)
 

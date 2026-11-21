@@ -583,13 +583,23 @@ def move_one(item: dict, dry_run: bool) -> dict:
         shutil.rmtree(partial, ignore_errors=True)
         raise host.HostError(f"{path} changed during the copy; nothing was removed")
     table = core.reap_process_table()
-    if item.get("regenDone"):  # the folder was worked on by our own deletions: a process that opened it meanwhile keeps it
+    # The copy can take minutes: a process may have opened the folder since `refusal` checked it, whether or not our own
+    # regeneration touched it. Never swap in that case.
+    try:
         core.reap_holders(str(path), str(path), table)
+    except core.ReapRefused:
+        shutil.rmtree(partial, ignore_errors=True)
+        raise
     active = parent_active(item, item.get("settled", item["quiet"]), table, time.time(),
                          {"regen": {n: p["regenDone"] for n, p in item.get("siblings", {}).get("peers", {}).items() if p.get("regenDone")}})
     if active:  # the copy can take minutes: look at the kept folder again before the original is swapped
         shutil.rmtree(partial, ignore_errors=True)
         raise host.HostError(f"{path} was not moved, the kept folder became active during the copy ({active})")
+    if dest.exists() and not dest.name.endswith(".partial"):
+        # A home symlink can be replaced by a real folder of the same name. That folder is the only copy left in home;
+        # the overflow folder is the older copy. Deleting it here would destroy the only surviving copy.
+        shutil.rmtree(partial, ignore_errors=True)
+        raise host.HostError(f"offload-destination-exists:{dest}: refusing to delete an existing overflow folder; nothing was moved")
     if dest.exists():
         shutil.rmtree(dest)
     os.rename(partial, dest)

@@ -131,6 +131,61 @@ class OffloadJobs(Base):
         self.assertFalse((self.base / "app-j0001").is_symlink())
 
 
+class MoveOne(Base):
+    """The last checks before the swap protect both copies, not just the folder being moved."""
+
+    def setUp(self):
+        super().setUp()
+        self.path = self.src / "old"
+        self.dest = self.root / "home" / "jobs" / "old"
+        self.item = {"path": self.path, "dest": self.dest, "bytes": 8192,
+                     "stats": self.fake_stats(self.path), "quiet": 1, "reads": None, "siblings": {"peers": {}}}
+        holders = mock.patch.object(core, "reap_holders", return_value=None)
+        holders.start()
+        self.addCleanup(holders.stop)
+
+    def test_existing_real_destination_is_refused_without_deleting_it(self):
+        self.dest.parent.mkdir(parents=True)
+        self.dest.mkdir()
+        sentinel = self.dest / "only-copy.txt"
+        sentinel.write_text("keep me")
+        with self.assertRaisesRegex(host.HostError, "offload-destination-exists:"):
+            offload.move_one(self.item, False)
+        self.assertEqual(sentinel.read_text(), "keep me")
+        self.assertTrue(self.path.is_dir())
+        self.assertFalse(self.path.is_symlink())
+        self.assertEqual(list(self.dest.parent.glob(".offload-*.partial")), [])
+
+    def test_holders_are_rechecked_when_regen_did_not_touch_the_folder(self):
+        self.assertNotIn("regenDone", self.item)
+        calls = []
+
+        def holders(path, root, table=None):
+            calls.append((path, root))
+            if root == str(self.path):
+                raise core.ReapRefused("in-use:cwd:99(zsh)")
+
+        with mock.patch.object(core, "reap_holders", side_effect=holders):
+            with self.assertRaisesRegex(core.ReapRefused, "in-use:cwd:99"):
+                offload.move_one(self.item, False)
+        self.assertIn((str(self.path), str(self.path)), calls)
+        self.assertTrue(self.path.is_dir())
+        self.assertFalse(self.path.is_symlink())
+        self.assertFalse(self.dest.exists())
+        self.assertEqual(list(self.dest.parent.glob(".offload-*.partial")), [])
+
+    def test_partial_named_destination_is_still_replaced(self):
+        self.dest = self.root / "home" / ".offload-old.partial"
+        self.item["dest"] = self.dest
+        self.dest.parent.mkdir(parents=True)
+        self.dest.mkdir()
+        (self.dest / "stale.txt").write_text("old partial")
+        out = offload.move_one(self.item, False)
+        self.assertTrue(out["moved"])
+        self.assertFalse((self.dest / "stale.txt").exists())
+        self.assertEqual((self.dest / "a.bin").read_bytes(), b"x" * 4096)
+
+
 class KeepFolder(Base):
     def setUp(self):
         super().setUp()
