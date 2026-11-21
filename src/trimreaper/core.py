@@ -9144,6 +9144,7 @@ def reap_bucket(categories: dict, reasons: dict, entry: dict, reason_bytes: dict
 
 
 REAP_AUDIT_CACHE_SECONDS = 86400       # a job's audit from an earlier pass is shown (marked cached) this long when the budget ends before it
+REAP_AUDIT_SCAN_FLOOR = 5              # least time a started job's name scan gets, whatever the ceiling says
 REAP_AUDIT_JOB_SECONDS = 60            # least time a started job's items get, whatever is left of the budget (the next call resumes after it)
 REAP_AUDIT_CURSOR = "reap:audit-cursor"
 REAP_AUDIT_PERSIST = threading.local()   # set by the tick's sizing pass: that pass (and only it) writes the cursor and the per-job cache
@@ -9308,13 +9309,15 @@ def reap_audit_inner(only: str | None, limit: int, include_items: bool, budget: 
                 cached_jobs += 1
             else:
                 fresh += 1
-                items, notes = reap_job_items(job, clones, deadline=min(max(job_deadline, time.monotonic() + REAP_AUDIT_JOB_SECONDS), ctx_hard))   # the scans stop at the hard ceiling too
+                # the scans stop at the hard ceiling too, but never before a first look: a ceiling already passed (a tiny budget) made the scan
+                # find nothing and the audit remember the job as having no items
+                items, notes = reap_job_items(job, clones, deadline=max(time.monotonic() + REAP_AUDIT_SCAN_FLOOR, min(max(job_deadline, time.monotonic() + REAP_AUDIT_JOB_SECONDS), ctx_hard)))
                 incomplete.extend(notes)
                 items = [i for i in items if i["path"] not in seen]  # a clone named for two jobs is listed once
                 seen.update(i["path"] for i in items)
                 if not items:
                     last_done = job["id"]
-                    if persist:
+                    if persist and not notes:   # a scan cut short proves nothing: never remember it as "no items"
                         reap_audit_remember(conn, job, None, [])
                     continue
                 blocker = reap_job_blocker(conn, job, live_ids, live_idle)

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.21.1 (2026-11-20)
+
+- A status audit whose time budget is already spent no longer reports a job as having nothing to reap. The job's name scan got a
+  deadline that had already passed, found no folders, and the audit remembered that as "no items". The scan now always gets a
+  short first look, and a scan cut short is never remembered as empty.
+
 ## 0.21.0 (2026-11-20)
 
 - A folder a running job merely started in no longer holds other jobs' finished work. A declared path that is a collection root

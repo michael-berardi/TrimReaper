@@ -263,3 +263,16 @@ class TickBounds(Home):
         with mock.patch.object(core, "reap_audit", wraps=core.reap_audit) as audit:
             core.tool_reap_status({})
         self.assertEqual(audit.call_args.args[3], core.REAP_AUDIT_SHELL_SECONDS)   # control: a status outside the tick never escalates, and stays under the shell guard (R3)
+
+
+class SpentBudget(Home):
+    core_disk_percent = 50
+
+    def test_a_spent_budget_still_finds_the_jobs_folders(self):
+        """0.21.1: a ceiling that had already passed gave the job's name scan no time, so it found nothing and the audit remembered the job as empty."""
+        self.cli("job", "add", "J-0801", "--status", "done")
+        folder = self.home / ".cache/trimreaper/jobs" / "J-0801" / "wt"
+        folder.mkdir(parents=True)
+        (folder / "a.txt").write_text("x")
+        out = core.reap_audit(None, 10, True, 0, persist=True)   # a zero budget: every ceiling is already past
+        self.assertEqual([j["job"] for j in out["jobs"]], ["J-0801"], out["jobs"])
