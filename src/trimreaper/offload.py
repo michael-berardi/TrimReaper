@@ -493,7 +493,12 @@ def fixture_refusal(path: Path) -> str | None:
     if path.name.lower() == "fixtures" or path.name.startswith("ut-fixture-"):
         return "fixture-never-moved"
     try:
-        for child in [path, *sorted(c for c in path.iterdir() if c.is_dir() and not c.is_symlink())[:2000]]:  # the folder and its children
+        children = [c for c in path.iterdir() if c.is_dir() and not c.is_symlink()]
+        if len(children) > 2000:
+            return "fixtures-unreadable"  # too many children to prove none holds fixtures: keep
+        for child in [path, *children]:  # the folder and its children
+            if child is not path and (child.name.lower() == "fixtures" or child.name.startswith("ut-fixture-")):
+                return "holds-fixtures-never-moved"
             if (child / "fixtures").is_dir() and not (child / "fixtures").is_symlink():
                 return "holds-fixtures-never-moved"
     except FileNotFoundError:
@@ -595,13 +600,11 @@ def move_one(item: dict, dry_run: bool) -> dict:
     if active:  # the copy can take minutes: look at the kept folder again before the original is swapped
         shutil.rmtree(partial, ignore_errors=True)
         raise host.HostError(f"{path} was not moved, the kept folder became active during the copy ({active})")
-    if dest.exists() and not dest.name.endswith(".partial"):
+    if dest.exists():
         # A home symlink can be replaced by a real folder of the same name. That folder is the only copy left in home;
         # the overflow folder is the older copy. Deleting it here would destroy the only surviving copy.
         shutil.rmtree(partial, ignore_errors=True)
         raise host.HostError(f"offload-destination-exists:{dest}: refusing to delete an existing overflow folder; nothing was moved")
-    if dest.exists():
-        shutil.rmtree(dest)
     os.rename(partial, dest)
     holding = path.parent / f".offload-{path.name}.old"
     os.rename(path, holding)

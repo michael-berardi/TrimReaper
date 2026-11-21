@@ -3123,7 +3123,7 @@ def reap_archive_collect(item: dict, units: list, evidence_cutoff: float | None,
                     continue  # cache content outside every repository (unless `loose`); a linked worktree's own `.git` pointer; the way to a nested repository
                 held = secret or reap_protected(name)
                 if stat.S_ISREG(info.st_mode) and not held and reap_model_weight(name, info.st_size) \
-                        and "fixtures" in {reap_fold(part) for part in Path(absolute).parts}:
+                        and "fixtures" in {reap_fold(part) for part in (Path(path).name, *Path(sub).parts[:-1])}:
                     left_out(sub, "model-weight", info.st_size)  # a fixture's downloaded weights are never saved: they download again
                     continue
                 if unit is not None and unit["kind"] == "git" and (in_unit in unit["clean"] or (in_unit in unit["ignoredKnown"] and not held)):

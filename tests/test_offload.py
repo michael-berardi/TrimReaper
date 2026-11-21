@@ -174,16 +174,17 @@ class MoveOne(Base):
         self.assertFalse(self.dest.exists())
         self.assertEqual(list(self.dest.parent.glob(".offload-*.partial")), [])
 
-    def test_partial_named_destination_is_still_replaced(self):
-        self.dest = self.root / "home" / ".offload-old.partial"
+    def test_partial_named_destination_is_kept_too(self):
+        # the interrupted-copy leftover is .offload-<name>.partial beside the destination, never the destination itself
+        self.dest = self.root / "home" / "old.partial"
         self.item["dest"] = self.dest
         self.dest.parent.mkdir(parents=True)
         self.dest.mkdir()
-        (self.dest / "stale.txt").write_text("old partial")
-        out = offload.move_one(self.item, False)
-        self.assertTrue(out["moved"])
-        self.assertFalse((self.dest / "stale.txt").exists())
-        self.assertEqual((self.dest / "a.bin").read_bytes(), b"x" * 4096)
+        (self.dest / "keep.txt").write_text("only copy")
+        with self.assertRaises(Exception) as caught:
+            offload.move_one(self.item, False)
+        self.assertIn("offload-destination-exists", str(caught.exception))
+        self.assertEqual((self.dest / "keep.txt").read_text(), "only copy")
 
 
 class KeepFolder(Base):

@@ -82,14 +82,43 @@ class FixtureExpiry(Home):
         self.put(root, ".ut-retention-customer", b"")
         self.assertEqual(self.fixtures_item(root)["retention"], "customer")
 
+    def _marked(self, marker):
+        root = self.setup_job(marker=False)
+        self.put(root, marker, b"")
+        return self.fixtures_item(root)["retention"]
+
+    def test_release_job_marker_keeps_fixtures(self):
+        self.assertNotEqual(self._marked(".ut-retention-release"), "disposable")
+
+    def test_ambiguous_job_marker_keeps_fixtures(self):
+        self.assertNotEqual(self._marked(".ut-retention-ambiguous"), "disposable")
+
     def test_offload_checks_children_for_fixtures(self):
         base = self.home / "jobs"
         (base / "J-0071" / "fixtures").mkdir(parents=True)
         self.assertEqual(offload.fixture_refusal(base), "holds-fixtures-never-moved")
 
+    def test_offload_refuses_child_named_fixtures_and_oversized_folders(self):
+        base = self.home / "many"
+        (base / "ut-fixture-x").mkdir(parents=True)
+        self.assertEqual(offload.fixture_refusal(base), "holds-fixtures-never-moved")
+        other = self.home / "wide"
+        other.mkdir()
+        for n in range(2001):
+            (other / f"d{n}").mkdir()
+        self.assertEqual(offload.fixture_refusal(other), "fixtures-unreadable")
+
     def test_weight_left_out_of_archive_only_inside_fixtures(self):
-        from pathlib import Path as P
-        # the collect walk tests the file's own path: a weight in a repo outside any fixtures folder is still saved
-        import inspect
-        src = inspect.getsource(core.reap_archive_collect)
-        self.assertIn("Path(absolute).parts", src)
+        for parent, expect_left_out in (("fixtures/ut-fixture-J/model", True), ("repo/models", False), ("fixtures", True)):
+            with self.subTest(parent=parent):
+                top = self.home / ".cache/trimreaper/jobs/J-0070" / ("a%d" % abs(hash(parent)))
+                folder = top / parent
+                folder.mkdir(parents=True)
+                (folder / "w.safetensors").write_bytes(b"x" * (101 * 2 ** 20))
+                item = {"path": str(top), "root": str(top), "class": "job-cache-subdir"}
+                try:
+                    result = core.reap_archive_collect(item, [], None, loose=True)
+                except Exception as error:  # a refusal must name its cause, never hide the weight decision
+                    self.fail(f"collect refused: {error}")
+                left = [e for e in result["skipped"] if "model-weight" in str(e)]
+                self.assertEqual(bool(left), expect_left_out, result)

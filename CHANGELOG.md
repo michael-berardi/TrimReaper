@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.23.2 (2026-11-21)
+
+- Offload refuses every existing overflow destination, including one whose name ends in `.partial` (the interrupted-copy leftover is
+  a separate `.offload-<name>.partial` file beside it, which the copy already clears), so an only copy is never deleted.
+- The archive's model-weight skip looks only inside the item (its own folder name and the path within it), not at folders above it.
+- Offload refuses a folder with more than 2000 children (it cannot prove none holds fixtures) and one with a child named
+  `fixtures` or `ut-fixture-*`.
+
 ## 0.23.1 (2026-11-21)
 
 - Review fixes for 0.23.0. A finished job's fixtures are disposable only under a missing or evidence-class job marker: a customer,
