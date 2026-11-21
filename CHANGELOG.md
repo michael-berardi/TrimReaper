@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.22.0 (2026-11-21)
+
+- `offload run` deletes regenerable output instead of moving it. Inside each candidate folder, `node_modules`, `.next`, `.open-next`,
+  `.astro`, `.turbo`, `__pycache__` and a Cargo target's `debug`, `incremental` and `release/{deps,build}` go through the cleaner's guarded
+  removal first (protected leaves never entered, git must ignore it and track none of it, no process holding it, a manifest beside a
+  dependency folder, no release artifact), and only what remains is copied to the overflow volume. Release bundles stay. A live or unknown
+  job's folder is untouched. The result lists them under `regenerable` (a dry run shows what would be deleted, not moved).
+- A job folder's reads no longer hold it back. TrimReaper's and the job tool's own scans reset access times, so `read-within-5min` kept
+  folders nobody used. Job sources are judged by content changes and open handles only; other sources keep the read window.
+- A git error is named: `git-error:metadata-unavailable:<cause>`. A finished job's worktree whose git dir was deleted has no history to
+  lose and now moves instead of staying forever.
+- The overflow volume has retention. New clean rule `overflow-retention` (also in the steady pass) removes regenerable output found there
+  and the folders of jobs finished more than `archiveExpiryDays` ago, unless a retention marker or protected name is inside; the link left
+  at home goes with it.
+
 ## 0.21.1 (2026-11-20)
 
 - A status audit whose time budget is already spent no longer reports a job as having nothing to reap. The job's name scan got a

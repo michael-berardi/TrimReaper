@@ -840,8 +840,8 @@ _REAP_GIT = threading.local()
 def reap_git_gate(repo: str, allow_alternates: bool = False) -> dict:
     try:
         return reap_git_metadata_gate(repo, allow_alternates)
-    except (OSError, UnicodeError):
-        raise ReapRefused("git-error:metadata-unavailable")
+    except (OSError, UnicodeError) as error:
+        raise ReapRefused("git-error:metadata-unavailable:" + reap_named(error))
 
 
 @contextmanager
@@ -891,8 +891,8 @@ def reap_git_input(repo: str, data: str | None, *args: str) -> tuple[int, str]:
         try:
             if reap_config_stamp(held["roots"]) != held["stamp"]:
                 raise ReapRefused("git-error:unsafe-metadata:config-changed")
-        except (OSError, UnicodeError):
-            raise ReapRefused("git-error:metadata-unavailable")
+        except (OSError, UnicodeError) as error:
+            raise ReapRefused("git-error:metadata-unavailable:" + reap_named(error))
     # Bind the exact gated metadata, resolving linked-worktree and submodule gitfiles
     # in the gate, never falling back to discovery of an enclosing repository.
     argv = ["git", "--git-dir=" + gated["roots"][0], "-c", "core.hooksPath=" + os.devnull, "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false", "-c", "submodule.recurse=false",
@@ -903,8 +903,8 @@ def reap_git_input(repo: str, data: str | None, *args: str) -> tuple[int, str]:
         try:
             if reap_config_stamp(held["roots"]) != held["stamp"]:
                 raise ReapRefused("git-error:unsafe-metadata:config-changed")
-        except (OSError, UnicodeError):
-            raise ReapRefused("git-error:metadata-unavailable")
+        except (OSError, UnicodeError) as error:
+            raise ReapRefused("git-error:metadata-unavailable:" + reap_named(error))
     return outcome
 
 

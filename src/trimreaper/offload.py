@@ -1,6 +1,8 @@
 """Overflow to an external volume: move cold folders there, leave a symlink behind.
 
-Nothing is deleted before the copy is proved. A folder moves only when it is idle (nothing changed inside for
+Regenerable output inside a candidate (node_modules, .next, .open-next, .astro, .turbo, __pycache__, a Cargo target's debug,
+incremental and release/{deps,build}) is deleted first through the cleaner's guarded removal and never copied. Nothing else is
+deleted before the copy is proved. A folder moves only when it is idle (nothing changed inside for
 `quietMinutes` or its job finished), no process has it open, and the volume is mounted with room to spare. The original path becomes a symlink
 into the overflow root, so every tool keeps working; `restore` brings a folder back. Every step writes a receipt first.
 
@@ -41,9 +43,10 @@ import shutil
 import stat
 import subprocess
 import time
+import uuid
 from pathlib import Path
 
-from . import core, host
+from . import clean, core, host
 
 DAY = 86400
 WALK_ENTRIES = 400_000
@@ -269,10 +272,23 @@ def reads_recorded(path: Path) -> str | None:
     return _MOUNTS[device]
 
 
-def git_in_use(repo: str) -> str | None:
+def git_dir_gone(repo: str) -> str | None:
+    """The missing git dir a worktree's `.git` file names (its repository was deleted), else None. Such a folder has no history left to
+    lose or to prove: its files are all there is, and moving them keeps them whole."""
+    dot_git = os.path.join(repo, ".git")
+    if not os.path.isfile(dot_git) or os.path.islink(dot_git):
+        return None
+    target = clean.clean_pointer_target(dot_git)
+    return target if target and not os.path.isfile(os.path.join(target, "HEAD")) else None
+
+
+def git_in_use(repo: str, gone_ok: bool = False) -> str | None:
     """None when a repository or worktree is clean with its checked-out branch fully on its remote upstream; else
     `git-dirty:...` (uncommitted changes, or cleanliness that cannot be proved) or `git-unpushed:...`. Uses the
-    cleaner's fenced git probes (core.reap_git*), which never take optional locks or rewrite the index."""
+    cleaner's fenced git probes (core.reap_git*), which never take optional locks or rewrite the index. With `gone_ok` (a finished
+    job's worktree) a git dir that no longer exists is not work in progress."""
+    if gone_ok and git_dir_gone(repo):
+        return None
     try:
         with core.reap_git_session(repo):
             code, out = core.reap_git_clean_closed(repo, protected_ok=True)
@@ -302,7 +318,7 @@ def git_in_use(repo: str) -> str | None:
     return None
 
 
-def git_refusal(path: Path, stats: dict) -> str | None:
+def git_refusal(path: Path, stats: dict, gone_ok: bool = False) -> str | None:
     """The first repository at or under `path` that is work in progress, named with its place in the folder."""
     repos = stats.get("repos")
     if repos is None:  # stats from elsewhere: look for repositories now
@@ -310,7 +326,7 @@ def git_refusal(path: Path, stats: dict) -> str | None:
     if len(repos) > MAX_REPOS:
         return f"git-dirty:unproven:{len(repos)}-repositories"
     for repo in sorted(repos):
-        why = git_in_use(repo)
+        why = git_in_use(repo, gone_ok)
         if why:
             place = os.path.relpath(repo, path)
             return why if place == "." else f"{why} ({place})"
@@ -360,7 +376,7 @@ def parent_active(item: dict, quiet: float, table: dict, now: float, shared: dic
         names = sorted(os.listdir(parent))
     except OSError as error:
         return f"parent-active: unreadable {error.__class__.__name__}"
-    linked, reads = [], item.get("reads") == "recorded"
+    linked, reads = [], item.get("reads") == "recorded" and item.get("readQuiet", True)
     for name in names:
         if name == item["path"].name or name.startswith(".offload-"):
             continue
@@ -492,13 +508,15 @@ def refusal(item: dict, stats: dict, table: dict, now: float, statuses: dict) ->
     if state in LIVE:
         return f"job-live:{job}:{state}"
     quiet = SETTLE_SECONDS if state in FINISHED else item["quiet"]
-    if now - stats["newest"] < quiet:
+    item["readQuiet"] = not item["jobs"]  # a job's folder is judged by changes and open handles: TrimReaper's and the job tool's own scans reset atime
+    judged = item.get("judged") or stats
+    if now - judged["newest"] < quiet:
         return f"changed-within-{int(quiet // 60)}min"
-    if item.get("reads") == "recorded" and now - stats.get("read", 0) < quiet:
+    if item.get("reads") == "recorded" and item.get("readQuiet", True) and now - judged.get("read", 0) < quiet:
         return f"read-within-{int(quiet // 60)}min"
     if stats["bytes"] < item["minBytes"]:
         return "below-minimum-size"
-    in_use = git_refusal(path, stats)
+    in_use = git_refusal(path, stats, state in FINISHED)
     if in_use:
         return in_use
     item["settled"] = quiet
@@ -561,6 +579,75 @@ def move_one(item: dict, dry_run: bool) -> dict:
     return {"path": str(path), "to": str(dest), "bytes": item["bytes"], "moved": True, "reads": item.get("reads")}
 
 
+def repo_above(path: str, stop: str) -> tuple[str | None, bool]:
+    """The repository enclosing `path` below `stop` (inclusive), and whether its git link is broken."""
+    current = os.path.dirname(path)
+    while core.reap_inside(current, stop):
+        if os.path.lexists(os.path.join(current, ".git")):
+            return current, bool(git_dir_gone(current)) or os.path.isdir(os.path.join(current, ".git")) and not os.path.isfile(os.path.join(current, ".git", "HEAD"))
+        if current == stop:
+            break
+        current = os.path.dirname(current)
+    return None, False
+
+
+def regen_first(items: list, statuses: dict, dry_run: bool, now: float, only: str | None) -> dict:
+    """Regenerable output inside each candidate folder (node_modules, .next, .open-next, .astro, .turbo, __pycache__, a Cargo target's debug,
+    incremental and release deps/build) is deleted, never copied: it goes through the cleaner's guarded removal with its gates (protected
+    leaves never entered, git ignoring it, no process holding it, quiet), and only what remains is moved. A folder of a live or unknown job
+    is not touched. A dry run lists what would go."""
+    out = {"deleted": [], "deletedBytes": 0, "kept": [], "errors": [], "touched": set()}
+    table, run_id = None, uuid.uuid4().hex[:12]
+    for item in items:
+        path = item["path"]
+        if only and str(path) != str(Path(only)):
+            continue
+        if path.is_symlink() or not path.is_dir() or path.name.startswith(".offload-") or core.reap_protected(path.name):
+            continue
+        job = job_of(item["owner"]) if item["jobs"] else None
+        state = statuses.get(job) if job else None
+        if job and (state is None or state in LIVE):
+            continue
+        errors: list = []
+        found = clean.clean_regen_find(str(path), errors)
+        out["errors"] += [f"{path}: {e.get('error')}" for e in errors]
+        if not found:
+            continue
+        window = (SETTLE_SECONDS if state in FINISHED else item["quiet"]) / 3600
+        stop = str(item["path"].parent if item.get("parent") is not None else path)
+        for target, kind in found:
+            entry = {"name": "offload-regenerable", "kind": "debris", "path": target, "root": os.path.dirname(target), "paths": [target]}
+            repo, broken = repo_above(target, stop)
+            if broken and state not in FINISHED:
+                out["kept"].append({"path": target, "why": "git-dir-gone-job-not-finished"})
+                continue
+            def gates(fresh: bool):
+                nonlocal table
+                if not fresh and table is None:
+                    table = core.reap_process_table()
+                clean.clean_regen_gates(target, kind, None if fresh else table, repo, broken)
+                clean.clean_stale_tree(target, window, fresh=True)
+            try:
+                gates(False)
+                size = core.reap_metadata_size(target, 60)
+                entry["bytes"] = size["bytes"] or 0
+                if dry_run:
+                    out["deleted"].append({"path": target, "bytes": entry["bytes"], "kind": kind, "deleted": False})
+                    out["deletedBytes"] += entry["bytes"]
+                    continue
+                with core.reap_cleanup_owner("clean"):
+                    clean.clean_remove_folder(entry, run_id, entry["root"], False, lambda: gates(True))
+                if entry.get("outcome") != "removed":
+                    out["kept"].append({"path": target, "why": str(entry.get("reason") or entry.get("outcome"))})
+                    continue
+                out["touched"].add(path)
+                out["deleted"].append({"path": target, "bytes": entry["bytes"], "kind": kind, "deleted": True})
+                out["deletedBytes"] += entry["bytes"]
+            except (core.ReapRefused, OSError, host.HostError) as refused:
+                out["kept"].append({"path": target, "why": str(refused) if not isinstance(refused, OSError) else clean.clean_os_refusal(refused)})
+    return out
+
+
 def offload_pass(dry_run: bool = False, limit_bytes: int | None = None, only: str | None = None, everything: bool = False) -> dict:
     cfg = settings()
     if not cfg:
@@ -595,6 +682,13 @@ def offload_pass(dry_run: bool = False, limit_bytes: int | None = None, only: st
         off = reads_recorded(item["path"]) if real else None
         item["reads"] = "recorded" if off is None else f"not-recorded: {off}; only changes count as use"
         sized.append(item)
+    regen = regen_first(sized, statuses, dry_run, now, only)
+    if not dry_run:
+        for item in sized:  # our own deletions changed the folder's times: judge quiet by the times before them, size by what is left
+            if item["path"] in regen["touched"] and item["path"].is_dir():
+                left = tree_stats(item["path"])
+                item["judged"] = {"newest": min(left["newest"], item["stats"]["newest"]), "read": min(left["read"], item["stats"].get("read", 0))}
+                item["stats"], item["bytes"] = left, left["bytes"]
     for item in sorted(sized, key=lambda i: -i["bytes"]):
         why = refusal(item, item["stats"], table, now, statuses)
         if why:
@@ -618,8 +712,10 @@ def offload_pass(dry_run: bool = False, limit_bytes: int | None = None, only: st
             planned_bytes += item["bytes"]
         except (host.HostError, core.ReapRefused, OSError) as error:
             errors.append(f"{item['path']}: {error}")
-    errors = orphans["errors"] + errors
-    return {"root": str(root), "dryRun": dry_run, "movedBytes": planned_bytes, "moved": moved, "returned": returned, "kept": kept[:60],
+    errors = orphans["errors"] + regen["errors"] + errors
+    return {"root": str(root), "dryRun": dry_run, "movedBytes": planned_bytes, "moved": moved,
+            "regenerable": {"dryRun": dry_run, "count": len(regen["deleted"]), "bytes": regen["deletedBytes"], "deleted": regen["deleted"][:200],
+                            "kept": regen["kept"][:60], "keptCount": len(regen["kept"])}, "returned": returned, "kept": kept[:60],
             "keptCount": len(kept), "errors": errors, "disk": host.disk_state(),
             "orphans": {k: orphans[k] for k in ("pruned", "prunedBytes", "kept", "keptCount")}}
 

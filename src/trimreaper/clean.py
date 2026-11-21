@@ -174,7 +174,7 @@ CLEAN_FOLDERS = (
 )
 CLEAN_WORKTREES = "worktrees"
 CLEAN_EXTRA_NAMES = ("rust-build-output", "project-dependencies", "agent-leftovers", "browser-clones", "playwright", "finished-jobs", "dedupe-clones",
-                     "compress-logs", "tagged-caches", "cli-releases", "coordinator-outputs", "release-scratch", "temp-build-caches")
+                     "compress-logs", "tagged-caches", "cli-releases", "coordinator-outputs", "release-scratch", "temp-build-caches", "overflow-retention")
 CLEAN_RUST_BUSY = ("cargo", "rustc", "rust-analyzer", "clippy", "clippy-driver", "cargo-clippy")
 CLEAN_NAMES = tuple(t["name"] for t in CLEAN_TOOLS) + tuple(f["name"] for f in CLEAN_FOLDERS) + (CLEAN_WORKTREES,) + CLEAN_EXTRA_NAMES
 
@@ -186,7 +186,7 @@ CLEAN_NAMES = tuple(t["name"] for t in CLEAN_TOOLS) + tuple(f["name"] for f in C
 # after a verified archive of it (bundles for commits, a hashed tar for files).
 CLEAN_RUNGS = ("routine", "idle-repositories", "worktrees-and-finished-jobs", "pinned-folders", "unmarked-retention", "archive-then-remove")
 CLEAN_STEADY = "steady"
-CLEAN_STEADY_NAMES = ("rust-build-output", "project-dependencies", "finished-jobs", "dedupe-clones", "compress-logs", "tagged-caches")   # the quiet pass takes nothing else
+CLEAN_STEADY_NAMES = ("rust-build-output", "project-dependencies", "finished-jobs", "dedupe-clones", "compress-logs", "tagged-caches", "overflow-retention")   # the quiet pass takes nothing else
 CLEAN_POLICY = {"cleanEscalate": True, "cleanEscalateRepoHours": 2, "cleanEscalateWorktreeHours": 24, "cleanEscalateJobHours": 24,
                 "cleanEscalatePinnedHours": 24, "cleanSteadyHours": 6, "cleanSteadyRepoDays": 3, "cleanSteadyJobHours": 48,
                 "worktreeIdleDays": 7, "projectIdleHours": 48, "taggedCacheIdleHours": 6,
@@ -1657,6 +1657,8 @@ def clean_extra_entries(only: set, errors: list, idle_hours: int = 48, rung: dic
         clean_release_scratch_entries(errors, reclaim, add)
     if "temp-build-caches" in only:
         clean_temp_build_entries(errors, add)
+    if "overflow-retention" in only:
+        clean_overflow_entries(errors, reclaim, add)
     if "agent-leftovers" in only:
         for root, sessions in clean_leftover_roots():
             try:
@@ -1720,7 +1722,7 @@ def clean_extra_entries(only: set, errors: list, idle_hours: int = 48, rung: dic
 # output inside finished coordinator jobs, release scratch, temp build caches. Each goes through the guarded removal (fence, receipt,
 # last look) behind the usual proofs: retention markers and protected names (clean_folder_gates), no process holding it (open files,
 # working directories and command lines), an age threshold, and git ignore/untracked proofs wherever a repository is involved.
-CLEAN_RECLAIM_NAMES = ("cli-releases", "coordinator-outputs", "release-scratch", "temp-build-caches")
+CLEAN_RECLAIM_NAMES = ("cli-releases", "coordinator-outputs", "release-scratch", "temp-build-caches", "overflow-retention")
 CLEAN_SEMVER = re.compile(r"v?(\d{1,9})\.(\d{1,9})\.(\d{1,9})(?:-([0-9A-Za-z.-]{1,64}))?(?:\+[0-9A-Za-z.-]{1,64})?")
 CLEAN_RELEASES_QUIET_HOURS = 1        # a release installed less than this long ago may still be unpacking
 CLEAN_REF_FILE_BYTES = 1 << 20        # a settings file or wrapper larger than this is not read (and names nothing)
@@ -2177,7 +2179,166 @@ def clean_reclaim_gates(entry: dict, table: dict | None) -> None:
         return clean_coord_gates(entry, table)
     if kind == "release-scratch":
         return clean_release_scratch_gates(entry, table)
+    if kind == "overflow-retention":
+        return clean_overflow_gates(entry, table)
     return clean_temp_build_gates(entry, table)
+
+
+# ---- regenerable output and retention on the overflow volume (0.22.0) ------------------------------------------------------------------
+# Output a build recreates (node_modules, .next, .open-next, .astro, .turbo, __pycache__, and a Cargo target's debug, incremental and
+# release/{deps,build}) is never worth moving to the overflow volume: `offload` removes it first through the guarded removal below, and
+# the clean pass sweeps whatever reached the overflow anyway. Folders of jobs finished more than archiveExpiryDays ago are deleted there:
+# the overflow volume is not exempt from retention.
+CLEAN_REGEN_NAMES = frozenset({"node_modules", ".next", ".open-next", ".astro", ".turbo", "__pycache__"})
+CLEAN_REGEN_MANIFESTS = {"node_modules": ("package.json",), ".next": ("package.json",), ".astro": ("package.json",), ".turbo": ("package.json",),
+                         ".open-next": ("package.json", "wrangler.toml", "wrangler.json", "wrangler.jsonc")}
+CLEAN_REGEN_SECONDS = 60
+CLEAN_REGEN_ENTRIES = 1_000_000
+
+
+def clean_regen_cargo(target: str) -> list[str]:
+    """The removable parts of a Cargo target: every `debug`, every `incremental`, and `release/deps` and `release/build`; the release
+    bundles beside them stay. Empty for a folder Cargo did not write."""
+    if not clean_tagged_cargo_target(target):
+        return []
+    found = []
+    def real(path):
+        return os.path.isdir(path) and not os.path.islink(path)
+    def profile(path):
+        name = os.path.basename(path)
+        if name == "debug":
+            return [path] if real(path) else []
+        wanted = ("incremental", "deps", "build") if name == "release" else ("incremental",)
+        return [os.path.join(path, w) for w in wanted if real(os.path.join(path, w))]
+    try:
+        with os.scandir(target) as top:
+            children = [e for e in top if e.is_dir(follow_symlinks=False) and not reap_protected(e.name) and not reap_is_git(e.name)]
+        for child in children:
+            if child.name in ("debug", "release") or os.path.lexists(os.path.join(child.path, ".fingerprint")):
+                found += profile(child.path)
+                continue
+            with os.scandir(child.path) as inner:   # <target>/<triple>/<profile>
+                for entry in inner:
+                    if entry.is_dir(follow_symlinks=False) and not reap_protected(entry.name) and not reap_is_git(entry.name) \
+                            and (entry.name in ("debug", "release") or os.path.lexists(os.path.join(entry.path, ".fingerprint"))):
+                        found += profile(entry.path)
+    except OSError:
+        return []
+    return found
+
+
+def clean_regen_find(top: str, errors: list) -> list[tuple[str, str]]:
+    """(path, kind) of every regenerable folder below `top`, names only, never entering one, a repository's .git, a protected name, a
+    vendored copy or a link. Bounded by entries and time; a bound hit is named in `errors` and what was found stays."""
+    found, count, deadline = [], 0, time.monotonic() + CLEAN_REGEN_SECONDS
+    stack = [(top, 0)]
+    while stack:
+        folder, depth = stack.pop()
+        if depth > REAP_MAX_DEPTH:
+            continue
+        entries = clean_scan(folder, "regenerable-output", errors)
+        count += len(entries)
+        if count > CLEAN_REGEN_ENTRIES or time.monotonic() > deadline:
+            errors.append({"clean": "regenerable-output", "error": f"discovery-incomplete: {clean_tilde(top)}"})
+            break
+        for entry in entries:
+            name = entry.name
+            if reap_protected(name) or reap_is_git(name) or name.lower() in REAP_VENDORED_NAMES or entry.is_symlink() \
+                    or not clean_directory(entry, "regenerable-output", errors):
+                continue
+            if name == "target":
+                found += [(path, "target") for path in clean_regen_cargo(entry.path)]
+            elif name in CLEAN_REGEN_NAMES:
+                found.append((entry.path, name))
+            else:
+                stack.append((entry.path, depth + 1))
+    return found
+
+
+def clean_regen_gates(path: str, kind: str, table: dict | None, repo: str | None = None, broken: bool = False) -> None:
+    """Why one regenerable folder stays, as ReapRefused: protected names and retention markers (clean_folder_gates), the manifest that
+    makes a `node_modules` an install, no release artifact, git ignoring it and tracking none of it (a repository whose git dir is gone
+    proves nothing and is skipped), no build tool running and no process holding it."""
+    if reap_canon(path) != path:
+        raise ReapRefused("not-canonical")
+    clean_folder_gates(path)
+    manifests = CLEAN_REGEN_MANIFESTS.get(kind)
+    if manifests and not any(os.path.isfile(os.path.join(os.path.dirname(path), m)) for m in manifests):
+        raise ReapRefused("no-manifest-beside")
+    if kind == "target":
+        found = clean_release_like(path)
+        if found:
+            raise ReapRefused("release-artifact:" + found)
+        busy = sorted(set(CLEAN_RUST_BUSY) & clean_running())
+        if busy:
+            raise ReapRefused("in-use:" + ",".join(busy))
+    if repo and not broken:
+        reap_git_proof(repo, path, ("untracked",) if kind == "__pycache__" else CLEAN_IGNORED_PROOF)
+    reap_holders(path, path, table)
+
+
+def clean_overflow_gates(entry: dict, table: dict | None) -> None:
+    path = entry["path"]
+    overflow = reap_overflow_home()
+    if not overflow or path == overflow or not reap_inside(path, overflow) or reap_canon(path) != path:
+        raise ReapRefused("outside-overflow")
+    if entry.get("regen"):
+        clean_regen_gates(path, entry["regen"], table)
+        clean_stale_tree(path, CLEAN_COORD_QUIET_HOURS, fresh=table is None)
+        return
+    for job in entry["jobs"]:
+        status, active, unknown = clean_coord_status(entry["command"], job, table is None)
+        if unknown:
+            raise ReapRefused(unknown)
+        if status not in CLEAN_COORD_FINISHED:
+            raise ReapRefused("job-live:" + status[:40])
+        if not active or active > now() - entry["days"] * 86400:
+            raise ReapRefused(f"within-archiveExpiryDays:{entry['days']}")
+    retention = reap_cache_retention(path)
+    if retention not in ("unmarked", REAP_DISPOSABLE, "evidence"):
+        raise ReapRefused("retention:" + retention)
+    reap_protected_scan(path, expiring_evidence=True)   # a protected name or a preserving marker below keeps it
+    reap_holders(path, path, table)
+
+
+def clean_overflow_entries(errors: list, settings: dict, add) -> None:
+    """Candidates on the overflow volume: regenerable folders anywhere, and the folders of jobs finished more than archiveExpiryDays ago."""
+    overflow = reap_overflow_home()
+    if not overflow:
+        return
+    for path, kind in clean_regen_find(overflow, errors):
+        add("overflow-retention", path, os.path.dirname(path), regen=kind, idleHours=CLEAN_COORD_QUIET_HOURS)
+    days = reap_policy_days("archiveExpiryDays", 30)
+    if days <= 0:
+        return
+    home = reap_canon(reap_home())
+    for configured in [*settings["coordinatorRoots"], *settings["releaseScratchRoots"]]:
+        base = clean_expand(configured)
+        try:
+            mirror = os.path.join(overflow, os.path.relpath(reap_canon(base), home))
+        except ValueError:
+            continue
+        if os.path.islink(mirror) or not os.path.isdir(mirror):
+            continue
+        for child in clean_scan(mirror, "overflow-retention", errors):
+            jobs = reap_job_ids(child.name)
+            if jobs and not reap_protected(child.name) and clean_directory(child, "overflow-retention", errors):
+                add("overflow-retention", child.path, mirror, job=jobs[0], jobs=jobs, days=days, command=list(settings["coordinatorJobCommand"]))
+
+
+def clean_overflow_unlink(entry: dict) -> None:
+    """The overflow folder is gone: its link in home dangles. Only a link that still names exactly the removed folder is removed."""
+    overflow, home = reap_overflow_home(), reap_canon(reap_home())
+    if not overflow:
+        return
+    link = os.path.join(home, os.path.relpath(entry["path"], overflow))
+    try:
+        if not stat.S_ISLNK(os.lstat(link).st_mode) or os.path.lexists(entry["path"]) or os.path.realpath(link) != entry["path"]:
+            return
+        os.unlink(link)
+        reap_receipt({"phase": "link", "path": link, "to": entry["path"], "outcome": "unlinked", "class": "clean-overflow-retention"})
+    except OSError:
+        pass
 
 
 def clean_by_rule(entries: list[dict], names=()) -> dict:
@@ -2585,6 +2746,8 @@ def clean_act(entry: dict, run_id: str, days: int) -> None:
             if entry["name"] == "tagged-caches":  # Cargo's own build locks, held through the removal
                 stack.enter_context(reap_locks(clean_tagged_lock_paths(entry["path"]), create=False))
             clean_remove_folder(entry, run_id, entry["root"], False, lambda: clean_extra_gates(entry))
+            if entry["name"] == "overflow-retention" and entry.get("outcome") == "removed":
+                clean_overflow_unlink(entry)
         return
     if entry["kind"] == "worktree-entry":
         clean_entry_gates(entry)  # fresh
