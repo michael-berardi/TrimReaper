@@ -487,6 +487,19 @@ def split_link(folder: Path, cfg: dict) -> None:
     core.reap_receipt({"kind": "offload-split", "path": str(folder), "from": str(dest)})
 
 
+def fixture_refusal(path: Path) -> str | None:
+    """A fixture folder is delete-or-keep, never moved: test scaffolding the reaper expires, and a moved copy only hid it from
+    the fixture tools (J-4302: 14.7 GB of model weights moved to the overflow disk, then `path-not-canonical`)."""
+    if path.name.lower() == "fixtures" or path.name.startswith("ut-fixture-"):
+        return "fixture-never-moved"
+    try:
+        if (path / "fixtures").is_dir() and not (path / "fixtures").is_symlink():
+            return "holds-fixtures-never-moved"
+    except OSError:
+        return "fixtures-unreadable"
+    return None
+
+
 def refusal(item: dict, stats: dict, table: dict, now: float, statuses: dict) -> str | None:
     path = item["path"]
     if path.is_symlink():
@@ -495,6 +508,9 @@ def refusal(item: dict, stats: dict, table: dict, now: float, statuses: dict) ->
         return "not-a-folder"
     if core.reap_protected(path.name):
         return "protected"
+    kept = fixture_refusal(path)
+    if kept:
+        return kept
     for folder in ([item["parent"]] if item.get("parent") is not None else []) + [path]:
         held = release_refusal(folder, item.get("release"))
         if held:

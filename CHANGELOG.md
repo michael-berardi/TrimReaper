@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.23.0 (2026-11-21)
+
+- Fixtures of finished jobs are disposable scaffolding, never evidence (a finished job kept 14.7 GB of model weights). Once the job
+  finished evidenceExpiryDays ago, its `fixtures` folder is reapable even under a job-level evidence marker; only a marker on the
+  fixtures folder itself keeps it. Model weights (.safetensors, .gguf, .pt, .ckpt, .bin over 100 MB) in a fixture are never saved
+  in an archive. Every other gate (protected leaves, secret material, open handles, owner proof) still applies.
+- Offload never moves a fixtures folder or a job folder holding one: delete or keep only.
+- The cleanup lock wait backs off (0.05 s doubling to 2 s) and the fixture wait default is 120 s instead of 2 s.
+
 ## 0.22.3 (2026-11-21)
 
 - Third review round. The overflow sweep also checks the home folder a moved folder came from: a retention marker or repository at a

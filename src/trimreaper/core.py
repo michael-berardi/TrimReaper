@@ -2130,6 +2130,24 @@ def reap_evidence_marker_void(job_id: str | None) -> bool:
             and now() - job["finished_at"] >= days * 86400)
 
 
+REAP_MODEL_WEIGHT_SUFFIXES = (".safetensors", ".gguf", ".pt", ".ckpt", ".bin")
+REAP_MODEL_WEIGHT_BYTES = 100 * 2 ** 20
+
+
+def reap_model_weight(name: str, size: int) -> bool:
+    """A model weight file (over 100 MB): bulk data a tool downloads again, never evidence and never worth archiving."""
+    return reap_fold(name).endswith(REAP_MODEL_WEIGHT_SUFFIXES) and size > REAP_MODEL_WEIGHT_BYTES
+
+
+def reap_fixture_expired(item: dict) -> bool:
+    """The `fixtures` folder directly in a finished job's cache folder, once the job finished evidenceExpiryDays ago."""
+    if item.get("class") != "job-cache-subdir" or not item.get("owner") or reap_fold(os.path.basename(item["path"])) != "fixtures":
+        return False
+    if item.get("root") != reap_canon(reap_cache_root() / item["owner"]) or os.path.dirname(item["path"]) != item["root"]:
+        return False
+    return reap_scratch_expired(item["owner"])
+
+
 def reap_no_retained_names(path: str) -> bool:
     """True only when no retained-class name (a record, signing or credential name, a key or certificate extension, an
     identity file) appears anywhere below a whole-folder candidate. A job-cache subdirectory is removed as a unit, so its
@@ -2188,6 +2206,13 @@ def reap_item_retention(item: dict, prove: bool = True) -> str:
         return "evidence"
     if reap_marked_evidence_item(item):
         return REAP_DISPOSABLE
+    if reap_fixture_expired(item):
+        # A finished job's fixtures folder is disposable test scaffolding, never evidence (J-4302 kept 14.7 GB of model weights
+        # under a job-level evidence marker): after evidenceExpiryDays only its own marker keeps it. Every other gate still applies.
+        own = reap_cache_retention(item["path"])
+        if own not in ("unmarked", REAP_DISPOSABLE):
+            return own
+        return REAP_DISPOSABLE if reap_no_secret_material(item["path"]) else "ambiguous"
     cache_worktree = item.get("class") == "job-clone-regenerable" and item.get("ownership") == REAP_CACHE_WORKTREE
     if cache_worktree:
         # Derived output of a worktree in a job's cache folder: the worktree's own folder (and the one it sits in) decides first, so a
@@ -3096,6 +3121,10 @@ def reap_archive_collect(item: dict, units: list, evidence_cutoff: float | None,
                 if own_git or narrow or (unit is None and not loose):
                     continue  # cache content outside every repository (unless `loose`); a linked worktree's own `.git` pointer; the way to a nested repository
                 held = secret or reap_protected(name)
+                if stat.S_ISREG(info.st_mode) and not held and reap_model_weight(name, info.st_size) \
+                        and "fixtures" in {reap_fold(part) for part in Path(path).parts}:
+                    left_out(sub, "model-weight", info.st_size)  # a fixture's downloaded weights are never saved: they download again
+                    continue
                 if unit is not None and unit["kind"] == "git" and (in_unit in unit["clean"] or (in_unit in unit["ignoredKnown"] and not held)):
                     continue  # git holds it unchanged, or it is ignored build output
                 if unit is None:
@@ -6580,7 +6609,9 @@ def reap_dead_owner_report(previous: dict | None, phase: str, state: str | None 
                   "receiptRecords": len(records), "ownerState": state}
 
 
-FIXTURE_CLEANUP_WAIT_SECONDS = 2.0
+FIXTURE_CLEANUP_WAIT_SECONDS = 120.0   # a fixture removal waits this long for the cleanup lock (backing off) before it names the holder
+REAP_LOCK_BACKOFF_START = 0.05         # first poll of a waited-for lock; doubles up to REAP_LOCK_BACKOFF_MAX
+REAP_LOCK_BACKOFF_MAX = 2.0
 
 
 def reap_busy_snapshot(fd: int) -> str:
@@ -6656,6 +6687,7 @@ def reap_cleanup_owner(scope: str, acknowledge: dict | None = None, inspect: boo
             if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600:
                 raise ReapRefused("cleanup-owner-unavailable:not-private-file")
             deadline = time.monotonic() + max(0, wait)
+            pause = REAP_LOCK_BACKOFF_START
             while True:
                 try:
                     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -6673,7 +6705,8 @@ def reap_cleanup_owner(scope: str, acknowledge: dict | None = None, inspect: boo
                             raise ReapRefused(detail)
                         raise ReapRefused("cleanup-owner-busy:lock held; " + snapshot +
                                           "; age unknown; owner status cannot be inspected until the lock is released; then read the handoff and receipts before retrying")
-                    time.sleep(min(0.05, remaining))
+                    time.sleep(min(pause, remaining))
+                    pause = min(pause * 2, REAP_LOCK_BACKOFF_MAX)
             current = os.stat("disk-cleanup.lock", dir_fd=dfd, follow_symlinks=False)
             if (info.st_dev, info.st_ino) != (current.st_dev, current.st_ino):
                 raise ReapRefused("cleanup-owner-unavailable:lock-replaced")
