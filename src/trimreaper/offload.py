@@ -508,11 +508,10 @@ def refusal(item: dict, stats: dict, table: dict, now: float, statuses: dict) ->
     if state in LIVE:
         return f"job-live:{job}:{state}"
     quiet = SETTLE_SECONDS if state in FINISHED else item["quiet"]
-    item["readQuiet"] = not item["jobs"]  # a job's folder is judged by changes and open handles: TrimReaper's and the job tool's own scans reset atime
-    judged = item.get("judged") or stats
-    if now - judged["newest"] < quiet:
+    item["readQuiet"] = not job  # a job's folder is judged by changes and open handles: TrimReaper's and the job tool's own scans reset atime
+    if now - stats["newest"] < quiet:
         return f"changed-within-{int(quiet // 60)}min"
-    if item.get("reads") == "recorded" and item.get("readQuiet", True) and now - judged.get("read", 0) < quiet:
+    if item.get("reads") == "recorded" and item.get("readQuiet", True) and now - stats.get("read", 0) < quiet:
         return f"read-within-{int(quiet // 60)}min"
     if stats["bytes"] < item["minBytes"]:
         return "below-minimum-size"
@@ -579,19 +578,19 @@ def move_one(item: dict, dry_run: bool) -> dict:
     return {"path": str(path), "to": str(dest), "bytes": item["bytes"], "moved": True, "reads": item.get("reads")}
 
 
-def repo_above(path: str, stop: str) -> tuple[str | None, bool]:
-    """The repository enclosing `path` below `stop` (inclusive), and whether its git link is broken."""
+def repo_above(path: str) -> tuple[str | None, bool]:
+    """The repository enclosing `path`, searched up to the home folder (never only to the candidate folder: a source whose children sit
+    inside a repository is still that repository's work), and whether its `.git` file names a git dir that is gone."""
+    home = core.reap_canon(host.reap_home())
     current = os.path.dirname(path)
-    while core.reap_inside(current, stop):
+    while core.reap_inside(current, home) and current != home:
         if os.path.lexists(os.path.join(current, ".git")):
-            return current, bool(git_dir_gone(current)) or os.path.isdir(os.path.join(current, ".git")) and not os.path.isfile(os.path.join(current, ".git", "HEAD"))
-        if current == stop:
-            break
+            return current, bool(git_dir_gone(current))
         current = os.path.dirname(current)
     return None, False
 
 
-def regen_first(items: list, statuses: dict, dry_run: bool, now: float, only: str | None) -> dict:
+def regen_first(items: list, statuses: dict, dry_run: bool, now: float, only: str | None) -> dict:  # items: folders `refusal` already passed
     """Regenerable output inside each candidate folder (node_modules, .next, .open-next, .astro, .turbo, __pycache__, a Cargo target's debug,
     incremental and release deps/build) is deleted, never copied: it goes through the cleaner's guarded removal with its gates (protected
     leaves never entered, git ignoring it, no process holding it, quiet), and only what remains is moved. A folder of a live or unknown job
@@ -614,18 +613,17 @@ def regen_first(items: list, statuses: dict, dry_run: bool, now: float, only: st
         if not found:
             continue
         window = (SETTLE_SECONDS if state in FINISHED else item["quiet"]) / 3600
-        stop = str(item["path"].parent if item.get("parent") is not None else path)
         for target, kind in found:
             entry = {"name": "offload-regenerable", "kind": "debris", "path": target, "root": os.path.dirname(target), "paths": [target]}
-            repo, broken = repo_above(target, stop)
-            if broken and state not in FINISHED:
-                out["kept"].append({"path": target, "why": "git-dir-gone-job-not-finished"})
+            repo, broken = repo_above(target)
+            if broken:  # nothing can prove what git tracks there: the folder moves whole instead
+                out["kept"].append({"path": target, "why": "git-dir-gone:cannot-prove-untracked"})
                 continue
             def gates(fresh: bool):
                 nonlocal table
                 if not fresh and table is None:
                     table = core.reap_process_table()
-                clean.clean_regen_gates(target, kind, None if fresh else table, repo, broken)
+                clean.clean_regen_gates(target, kind, None if fresh else table, repo)
                 clean.clean_stale_tree(target, window, fresh=True)
             try:
                 gates(False)
@@ -682,15 +680,19 @@ def offload_pass(dry_run: bool = False, limit_bytes: int | None = None, only: st
         off = reads_recorded(item["path"]) if real else None
         item["reads"] = "recorded" if off is None else f"not-recorded: {off}; only changes count as use"
         sized.append(item)
-    regen = regen_first(sized, statuses, dry_run, now, only)
-    if not dry_run:
-        for item in sized:  # our own deletions changed the folder's times: judge quiet by the times before them, size by what is left
-            if item["path"] in regen["touched"] and item["path"].is_dir():
-                left = tree_stats(item["path"])
-                item["judged"] = {"newest": min(left["newest"], item["stats"]["newest"]), "read": min(left["read"], item["stats"].get("read", 0))}
-                item["stats"], item["bytes"] = left, left["bytes"]
+    judged = {}
     for item in sorted(sized, key=lambda i: -i["bytes"]):
         why = refusal(item, item["stats"], table, now, statuses)
+        judged[item["path"]] = why
+    regen = regen_first([i for i in sized if judged[i["path"]] is None], statuses, dry_run, now, only)
+    for item in sized:  # after our own deletions: the quiet verdict above stands, the size is what is left
+        if not dry_run and item["path"] in regen["touched"] and item["path"].is_dir():
+            item["stats"] = tree_stats(item["path"])
+            item["bytes"] = item["stats"]["bytes"]
+            if item["bytes"] < item["minBytes"]:
+                judged[item["path"]] = "below-minimum-size"
+    for item in sorted(sized, key=lambda i: -i["bytes"]):
+        why = judged[item["path"]]
         if why:
             if why != "already-offloaded":
                 entry = {"path": str(item["path"]), "why": why, "bytes": item["bytes"]}

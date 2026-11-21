@@ -2255,7 +2255,22 @@ def clean_regen_find(top: str, errors: list) -> list[tuple[str, str]]:
     return found
 
 
-def clean_regen_gates(path: str, kind: str, table: dict | None, repo: str | None = None, broken: bool = False) -> None:
+def clean_repo_above(path: str, stop: str) -> tuple[str | None, bool]:
+    """The repository enclosing `path` below `stop` (the folder's whole ancestry, not only a job folder), and whether its `.git` file
+    names a git dir that is gone."""
+    current = os.path.dirname(path)
+    while reap_inside(current, stop) and current != stop:
+        dot_git = os.path.join(current, ".git")
+        if os.path.lexists(dot_git):
+            if os.path.isfile(dot_git) and not os.path.islink(dot_git):
+                gitdir = clean_pointer_target(dot_git)
+                return current, not (gitdir and os.path.isfile(os.path.join(gitdir, "HEAD")))
+            return current, False
+        current = os.path.dirname(current)
+    return None, False
+
+
+def clean_regen_gates(path: str, kind: str, table: dict | None, repo: str | None = None) -> None:
     """Why one regenerable folder stays, as ReapRefused: protected names and retention markers (clean_folder_gates), the manifest that
     makes a `node_modules` an install, no release artifact, git ignoring it and tracking none of it (a repository whose git dir is gone
     proves nothing and is skipped), no build tool running and no process holding it."""
@@ -2272,7 +2287,7 @@ def clean_regen_gates(path: str, kind: str, table: dict | None, repo: str | None
         busy = sorted(set(CLEAN_RUST_BUSY) & clean_running())
         if busy:
             raise ReapRefused("in-use:" + ",".join(busy))
-    if repo and not broken:
+    if repo:
         reap_git_proof(repo, path, ("untracked",) if kind == "__pycache__" else CLEAN_IGNORED_PROOF)
     reap_holders(path, path, table)
 
@@ -2283,7 +2298,16 @@ def clean_overflow_gates(entry: dict, table: dict | None) -> None:
     if not overflow or path == overflow or not reap_inside(path, overflow) or reap_canon(path) != path:
         raise ReapRefused("outside-overflow")
     if entry.get("regen"):
-        clean_regen_gates(path, entry["regen"], table)
+        for job in entry["jobs"]:   # a folder of a job that is not finished (it may be coming back) is never swept
+            status, _, unknown = clean_coord_status(entry["command"], job, table is None)
+            if unknown:
+                raise ReapRefused(unknown)
+            if status not in CLEAN_COORD_FINISHED:
+                raise ReapRefused("job-live:" + status[:40])
+        repo, broken = clean_repo_above(path, overflow)
+        if broken:
+            raise ReapRefused("git-dir-gone:cannot-prove-untracked")
+        clean_regen_gates(path, entry["regen"], table, repo)
         clean_stale_tree(path, CLEAN_COORD_QUIET_HOURS, fresh=table is None)
         return
     for job in entry["jobs"]:
@@ -2298,6 +2322,7 @@ def clean_overflow_gates(entry: dict, table: dict | None) -> None:
     if retention not in ("unmarked", REAP_DISPOSABLE, "evidence"):
         raise ReapRefused("retention:" + retention)
     reap_protected_scan(path, expiring_evidence=True)   # a protected name or a preserving marker below keeps it
+    clean_stale_tree(path, CLEAN_COORD_QUIET_HOURS, fresh=table is None)
     reap_holders(path, path, table)
 
 
@@ -2307,7 +2332,9 @@ def clean_overflow_entries(errors: list, settings: dict, add) -> None:
     if not overflow:
         return
     for path, kind in clean_regen_find(overflow, errors):
-        add("overflow-retention", path, os.path.dirname(path), regen=kind, idleHours=CLEAN_COORD_QUIET_HOURS)
+        jobs = reap_job_ids(*Path(os.path.relpath(path, overflow)).parts)
+        add("overflow-retention", path, os.path.dirname(path), regen=kind, idleHours=CLEAN_COORD_QUIET_HOURS, jobs=jobs,
+            command=list(settings["coordinatorJobCommand"]))
     days = reap_policy_days("archiveExpiryDays", 30)
     if days <= 0:
         return
@@ -2332,6 +2359,19 @@ def clean_overflow_unlink(entry: dict) -> None:
     if not overflow:
         return
     link = os.path.join(home, os.path.relpath(entry["path"], overflow))
+    try:   # a keepFolder job: the real folder in home holds one link per moved child, all into the folder that was just removed
+        if os.path.isdir(link) and not os.path.islink(link):
+            for name in os.listdir(link):
+                inner = os.path.join(link, name)
+                if not os.path.islink(inner):
+                    continue
+                target = os.readlink(inner)
+                if target.startswith(entry["path"] + os.sep) and not os.path.lexists(target):
+                    os.unlink(inner)
+                    reap_receipt({"phase": "link", "path": inner, "to": target, "outcome": "unlinked", "class": "clean-overflow-retention"})
+            return
+    except OSError:
+        return
     try:
         if not stat.S_ISLNK(os.lstat(link).st_mode) or os.path.lexists(entry["path"]) or os.path.realpath(link) != entry["path"]:
             return

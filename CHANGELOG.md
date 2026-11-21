@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.22.1 (2026-11-21)
+
+- Review fixes for 0.22.0. Offload deletes regenerable output only in folders it then moves: a folder it keeps (dirty git, recent change,
+  release workspace, live sibling, size or goal limits) loses nothing. The git proof now reaches the repository above the candidate
+  (not only inside it), and output whose git dir is gone is moved whole instead of deleted. Reads are ignored only for folders that
+  name a job. The overflow sweep skips folders of jobs that are not finished, checks the tree is quiet, and removes the keepFolder
+  links left in home.
+
 ## 0.22.0 (2026-11-21)
 
 - `offload run` deletes regenerable output instead of moving it. Inside each candidate folder, `node_modules`, `.next`, `.open-next`,

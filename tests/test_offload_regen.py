@@ -105,17 +105,66 @@ class Regen(Home):
             out = self.run_pass()
         self.assertIn("read-within-60min", [k["why"] for k in out["kept"]])
 
-    def test_git_error_is_named_and_finished_job_with_gone_gitdir_moves(self):
+    def test_finished_job_with_gone_gitdir_moves_and_its_output_is_not_deleted(self):
         wt = self.proj / "wt"
-        self.put(wt, "f.txt")
+        self.put(wt, "package.json", b"{}")
+        self.put(wt, "node_modules/x.js")
         (wt / ".git").write_text(f"gitdir: {self.tmp}/gone/worktrees/x\n")
         self.age(self.base, 1)
         out = self.run_pass()
         self.assertTrue(self.proj.is_symlink(), out["kept"])
-        self.statuses["J-0001"] = "parked"
-        self.assertEqual(offload.git_in_use(str(wt), gone_ok=False) is not None, True)
-        why = offload.git_in_use(str(wt))
-        self.assertTrue(why.startswith("git-dirty:unproven:"), why)
+        self.assertIn("git-dir-gone:cannot-prove-untracked", [k["why"] for k in out["regenerable"]["kept"]])
+        self.assertTrue((self.root / "home" / "jobs" / "J-0001" / "wt" / "node_modules" / "x.js").exists())
+
+    def test_gone_gitdir_is_not_moved_for_an_unfinished_job(self):
+        wt = self.proj / "wt"
+        self.put(wt, "f.txt")
+        (wt / ".git").write_text(f"gitdir: {self.tmp}/gone/worktrees/x\n")
+        self.age(self.base, 1)
+        self.assertTrue(offload.git_in_use(str(wt)).startswith("git-dirty:unproven:"))
+
+    def test_tracked_output_in_a_repository_above_the_candidate_is_kept(self):
+        repo = self.clone("site", ignored=())
+        self.put(repo, "package.json", b"{}")
+        self.put(repo, "node_modules/x.js")
+        self.git(repo, "add", "-A"); self.git(repo, "commit", "-q", "-m", "tracked deps"); self.git(repo, "push", "-q")
+        self.write_config({"offload": {"root": str(self.root), "minFreeGB": 0, "quietMinutes": 60,
+                                       "sources": [{"path": "~/dev", "children": True}]}})
+        self.age(self.dev, 1)
+        out = self.run_pass()
+        self.assertTrue((repo / "node_modules" / "x.js").exists() or (self.root / "home" / "dev" / "site" / "node_modules" / "x.js").exists())
+        self.assertEqual(out["regenerable"]["deleted"], [])
+
+    def test_kept_folder_loses_no_output(self):
+        (self.proj / "node_modules").touch()  # no-op
+        live = self.base / "J-0002"
+        self.put(live, "package.json", b"{}")
+        self.put(live, "node_modules/x.js")
+        self.put(self.proj, "src/new.txt")  # a change minutes ago: J-0001 is finished but not settled
+        out = self.run_pass()
+        self.assertTrue((live / "node_modules" / "x.js").exists())
+        self.assertEqual(out["regenerable"]["deleted"], [])
+        self.assertTrue((self.proj / "node_modules").exists())
+
+    def test_release_workspace_loses_no_output(self):
+        rel = self.home / "scratch" / "rel-0001"
+        self.put(rel, "wt/package.json", b"{}")
+        self.put(rel, "wt/.open-next/worker.js")
+        self.put(rel, "out/app.dmg")
+        self.age(self.home / "scratch", 1)
+        self.write_config({"offload": {"root": str(self.root), "minFreeGB": 0, "quietMinutes": 60,
+                                       "sources": [{"path": "~/scratch", "children": True}]}})
+        out = self.run_pass()
+        self.assertEqual(out["regenerable"]["deleted"], [])
+        self.assertTrue((rel / "wt" / ".open-next" / "worker.js").exists())
+        self.assertTrue(any(k["why"].startswith("release-artifacts") for k in out["kept"]), out["kept"])
+
+    def test_git_error_names_its_cause_through_git_in_use(self):
+        wt = self.proj / "wt2"
+        self.put(wt, "f.txt")
+        (wt / ".git").mkdir()
+        with mock.patch.object(core, "reap_git_metadata_gate", side_effect=PermissionError(13, "x")):
+            self.assertIn("metadata-unavailable:PermissionError:EACCES", offload.git_in_use(str(wt)))
 
     def test_metadata_error_names_its_cause(self):
         with mock.patch.object(core, "reap_git_metadata_gate", side_effect=PermissionError(13, "x")):
@@ -169,6 +218,22 @@ class OverflowRetention(Home):
         self.put(self.mirror / "J-0101", "notes/.ut-retention-customer", b"")
         self.clean()
         self.assertTrue((self.mirror / "J-0101" / "notes" / "n.md").exists())
+
+    def test_live_job_folder_on_the_overflow_is_not_swept(self):
+        self.statuses["J-0102"]["status"] = "running"
+        import json
+        script = self.tmp / "coord.py"
+        script.write_text("import json,sys\njobs=%r\nj=sys.argv[-1]\nprint(json.dumps({'ok':True,'job':{'id':j,**jobs[j]}}))\n" % self.statuses)
+        self.clean()
+        self.assertTrue((self.mirror / "J-0102" / "wt" / "node_modules" / "x.js").exists())
+
+    def test_keepfolder_links_in_home_go_with_the_expired_job(self):
+        home_job = self.home / ".cache" / "ut-coordinator" / "J-0101"
+        home_job.mkdir(parents=True)
+        os.symlink(str(self.mirror / "J-0101" / "wt"), str(home_job / "wt"))
+        self.clean()
+        self.assertFalse((self.mirror / "J-0101").exists())
+        self.assertFalse(os.path.lexists(home_job / "wt"))
 
     def test_rule_is_part_of_the_steady_pass(self):
         self.assertIn("overflow-retention", clean.CLEAN_STEADY_NAMES)
