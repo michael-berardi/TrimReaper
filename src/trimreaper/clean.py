@@ -1724,6 +1724,7 @@ CLEAN_RECLAIM_NAMES = ("cli-releases", "coordinator-outputs", "release-scratch",
 CLEAN_SEMVER = re.compile(r"v?(\d{1,9})\.(\d{1,9})\.(\d{1,9})(?:-([0-9A-Za-z.-]{1,64}))?(?:\+[0-9A-Za-z.-]{1,64})?")
 CLEAN_RELEASES_QUIET_HOURS = 1        # a release installed less than this long ago may still be unpacking
 CLEAN_REF_FILE_BYTES = 1 << 20        # a settings file or wrapper larger than this is not read (and names nothing)
+CLEAN_REF_CELLAR = 60000               # separate allowance for the Homebrew Cellar's tops: a big Cellar must not starve the proof of the tool's own places
 CLEAN_REF_FILES = 5000                # files and links one tool's reference search may look at; more proves nothing
 CLEAN_REF_SUFFIXES = (".json", ".jsonc", ".json5", ".toml", ".yaml", ".yml", ".ini", ".conf", ".cfg", ".sh", ".zsh", ".bash", ".plist")
 CLEAN_REF_SKIP = frozenset({"sessions", "logs", "log", "cache", "caches", "tmp", "history", "node_modules", ".git", "releases"})
@@ -1808,6 +1809,7 @@ def clean_release_refs(tool: str, releases: str, versions: list[str]) -> dict:
         return {}
     named = re.compile(re.escape(tool) + r"/releases/(" + "|".join(map(re.escape, names)) + r")(?=$|[/\s\"'`;:,)\]}<>|&\\])")
     used, budget = {}, [CLEAN_REF_FILES]
+    cellar_budget = [CLEAN_REF_CELLAR]
     def note(version: str, source: str) -> None:
         used.setdefault(version, clean_tilde(source))
     def link(path: str) -> None:
@@ -1824,7 +1826,8 @@ def clean_release_refs(tool: str, releases: str, versions: list[str]) -> dict:
             raise ReapRefused("references-unproved:unreadable:" + clean_tilde(path)[:120])
         for match in named.finditer(text):
             note(match[1], path)
-    def visit(folder: str, depth: int, suffixes, read_files: bool = True) -> None:
+    def visit(folder: str, depth: int, suffixes, read_files: bool = True, spend=None) -> None:
+        spend = spend or budget
         try:
             entries = list(os.scandir(folder))
         except FileNotFoundError:
@@ -1832,9 +1835,9 @@ def clean_release_refs(tool: str, releases: str, versions: list[str]) -> dict:
         except PermissionError:
             raise ReapRefused("references-unproved:unreadable:" + clean_tilde(folder)[:120])
         for entry in entries:
-            budget[0] -= 1
-            if budget[0] < 0:
-                raise ReapRefused(f"references-unproved:more-than-{CLEAN_REF_FILES}-entries")
+            spend[0] -= 1
+            if spend[0] < 0:
+                raise ReapRefused(f"references-unproved:more-than-{CLEAN_REF_FILES if spend is budget else CLEAN_REF_CELLAR}-entries")
             if reap_protected(entry.name) or entry.name.endswith((".bak", ".orig")) or ".before-" in entry.name:
                 continue   # secrets are never opened; backups name what was, not what is
             try:
@@ -1844,7 +1847,7 @@ def clean_release_refs(tool: str, releases: str, versions: list[str]) -> dict:
                     if read_files and (suffixes is None or entry.name.endswith(suffixes)):
                         read(entry.path, entry.stat(follow_symlinks=False))
                 elif entry.is_dir(follow_symlinks=False) and depth > 0 and entry.name.lower() not in CLEAN_REF_SKIP:
-                    visit(entry.path, depth - 1, suffixes, read_files)
+                    visit(entry.path, depth - 1, suffixes, read_files, spend)
             except FileNotFoundError:
                 continue
     visit(os.path.dirname(releases), 0, None)
@@ -1864,9 +1867,9 @@ def clean_release_refs(tool: str, releases: str, versions: list[str]) -> dict:
                 continue
             for keg in os.scandir(formula.path):
                 if keg.is_dir(follow_symlinks=False):
-                    visit(keg.path, 0, None, read_files=False)
-                    visit(os.path.join(keg.path, "bin"), 0, None)
-                    visit(os.path.join(keg.path, "libexec"), 0, None, read_files=False)
+                    visit(keg.path, 0, None, read_files=False, spend=cellar_budget)
+                    visit(os.path.join(keg.path, "bin"), 0, None, spend=cellar_budget)
+                    visit(os.path.join(keg.path, "libexec"), 0, None, read_files=False, spend=cellar_budget)
     return used
 
 
@@ -3521,7 +3524,7 @@ def clean_auto(conn, policy: dict, actions: list, errors: list, event=None) -> N
                     "goalMet": out["goalMet"], "remainingBytes": out["remainingBytes"],
                     "done": out["summary"]["done"], "freedBytes": freed, "removedBytes": removed or 0,
                     "rungs": [{k: r[k] for k in ("name", "done", "removedBytes", "goalMet")} for r in out.get("rungs", [])],
-                    "topBlockers": out.get("topBlockers", [])[:3]})
+                    "topBlockers": out.get("topBlockers", [])[:5]})
     errors.extend(out["errors"])
     clean_compress_report(out, actions, errors)
     if out.get("stopped"):

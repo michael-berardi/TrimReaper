@@ -369,7 +369,9 @@ class ScratchAndEvidence(ScratchHome):
                 with self.subTest(status=status, claim=claim):
                     task = self.put(root, f"task-{status}-{claim}/nested/out.log").parent.parent
                     self.age(task, 20)
-                    cwd = root if claim == "ancestor" else task / "nested" if claim == "descendant" else task
+                    if claim == "ancestor":
+                        continue   # the scratch root is a collection root: see test_collection_root_cwd_claims_nothing
+                    cwd = task / "nested" if claim == "descendant" else task
                     job = f"J-{320 + s * 3 + c:04d}"
                     self.add_job(job, cwd, status=status)
                     out = self.cli("reap", "--scratch")
@@ -377,6 +379,18 @@ class ScratchAndEvidence(ScratchHome):
                     held = next(i for i in out["items"] if i["path"] == str(task))
                     self.assertEqual(held["reason"], f"claimed-by:{job}({status})")
                     self.cli("job", "status", job, "done")
+
+    def test_collection_root_cwd_claims_nothing(self):
+        root = self.home / ".cache" / "agent-scratch"
+        for n, (label, cwd) in enumerate((("home", self.home), ("dev", self.dev), ("scratch", root), ("cache", self.home / ".cache"))):
+            with self.subTest(cwd=label):
+                task = self.put(root, f"broad-{label}/out.log").parent
+                self.age(task, 20)
+                job = f"J-{340 + n:04d}"
+                self.add_job(job, cwd, status="running")
+                out = self.cli("reap", "--scratch")
+                self.assertFalse(task.exists(), out)
+                self.cli("job", "status", job, "done")
 
     def test_machine_recorded_scratch_claim_is_not_inferred_from_the_cwd(self):
         root = self.home / ".cache" / "agent-scratch"

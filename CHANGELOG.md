@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.21.0 (2026-11-20)
+
+- A folder a running job merely started in no longer holds other jobs' finished work. A declared path that is a collection root
+  (`/`, the home folder, a clone base such as `~/dev`, `~/.cache`, the job-cache root, the agent-scratch root, or any folder above one)
+  now claims nothing below it; only a specific worktree or folder still does. Before, one job running from the home folder kept
+  about 6 GB of finished jobs' folders under `claimed-by`.
+- The CLI-release proof no longer fails on a large Homebrew Cellar. The Cellar has its own allowance (60000 entries) apart from the
+  tool's own places (5000), so `references-unproved:more-than-5000-entries` no longer keeps every old release. A Cellar past its
+  own allowance still keeps everything.
+- The automatic clean pass names its top five blockers by bytes (was three) so a pass that frees nothing says why.
+
 ## 0.20.3 (2026-11-19)
 
 - The installer no longer reports success while the `trimreaper` command on PATH is still an older copy. When

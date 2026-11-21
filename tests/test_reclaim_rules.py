@@ -135,6 +135,18 @@ class CliReleases(Reclaim):
         self.assertEqual(out["summary"]["done"], 2, out)
         self.assertEqual(sorted(p.name for p in root.iterdir()), sorted(set(names + ["tmp-unpack"]) - {"1.0.0", "1.0.1"}))
 
+    def test_a_large_homebrew_cellar_does_not_leave_every_release_unproved(self):
+        root = self.releases([f"1.0.{n}" for n in range(6)])
+        for n in range(80):   # far more entries than the tool-places allowance below
+            (self.brew / "Cellar" / f"formula{n}" / "1.0" / "bin").mkdir(parents=True)
+        with mock.patch.object(clean, "CLEAN_REF_FILES", 40):
+            planned = self.run_clean("cli-releases", dry=True)
+            self.assertEqual(planned["byRule"]["cli-releases"]["candidates"], 3, planned["items"])
+            self.assertFalse([i for i in planned["items"] if i.get("keep")], planned["items"])
+            with mock.patch.object(clean, "CLEAN_REF_CELLAR", 10):   # a Cellar past its own allowance still keeps everything
+                out = self.run_clean("cli-releases", dry=True)
+                self.assertTrue(all(i["keep"].startswith("references-unproved:more-than-10-entries") for i in out["items"]), out["items"])
+
     def test_few_releases_young_releases_and_unreadable_settings_keep_everything(self):
         root = self.releases(["2.0.0", "2.1.0", "2.2.0"])
         self.assertEqual(self.run_clean("cli-releases", dry=True)["items"], [])   # three or fewer: nothing to look at

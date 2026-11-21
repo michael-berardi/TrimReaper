@@ -93,11 +93,10 @@ class MarkedEvidence(Home):
         self.assertEqual(out["deleted"], 0, out)
         self.assertTrue(child.exists())
 
-    def test_parent_claim_also_preserves(self):
+    def test_collection_root_claim_does_not_preserve(self):
         root, child = self.setup_evidence()
-        self.add_job("J-0061", cwd=root.parent, status="running")
-        self.assertEqual(self.reap()["deleted"], 0)
-        self.assertTrue(child.exists())
+        self.add_job("J-0061", cwd=root.parent, status="running")   # a collection root claims none of what lies under it
+        self.assertEqual(self.reap()["deleted"], 1)
 
     def test_nonterminal_owner_never_eligible(self):
         _, child = self.setup_evidence()

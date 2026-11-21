@@ -5259,6 +5259,19 @@ def reap_declared_paths(job: dict) -> list[str]:
     return [reap_canon(Path(str(p)).expanduser()) for p in declared if isinstance(p, str) and p.strip().startswith(("/", "~"))]
 
 
+def reap_collection_roots() -> list[str]:
+    """Folders that hold other work and never belong to one job: /, the home folder, every clone base, the user cache folder, the job-cache and
+    agent-scratch roots. A declared path equal to one of them, or above one, names a place the job merely started in."""
+    roots = ["/", reap_canon(Path.home()), reap_canon(Path.home() / ".cache"), reap_canon(reap_cache_root()),
+             reap_canon(reap_agent_scratch_root()), *reap_clone_base_paths()]
+    return sorted({r for r in roots if r})
+
+
+def reap_broad_declared(path: str, roots: list[str] | None = None) -> bool:
+    """A collection root or any ancestor of one: it claims none of what lies under it (a specific worktree or folder still does)."""
+    return any(reap_inside(root, path) for root in (roots if roots is not None else reap_collection_roots()))
+
+
 _REAP_LINKED: dict = {}
 
 
@@ -6101,13 +6114,14 @@ def reap_authority(item: dict) -> dict:
         recent = reap_recent_users(scope, ids, window * 86400) if isinstance(window, int) and not isinstance(window, bool) and window > 0 else []
         if recent:
             raise ReapRefused(f"recently-used-by:{recent[0]}")  # a later job worked in this clone: it expires cloneExpiryDays after that job finished
+    broad = reap_collection_roots()
     for job in jobs.values():
         if job["status"] in REAP_TERMINAL:
             continue
         continued_here = job["id"] in continued and continued_blocked.get(job["id"]) is None
         if not continued_here:
             if any(reap_inside(d, scope) or (independent and reap_inside(scope, d))
-                   for d in reap_declared_paths(job)) and not reap_pressure_allows(item, job):
+                   for d in reap_declared_paths(job) if not reap_broad_declared(d, broad)) and not reap_pressure_allows(item, job):
                 raise ReapRefused(f"claimed-by:{job['id']}({job['status']})")
         wait = job_wait(job)
         if (wait and wait["job"] in ids) or job["id"] == getattr(REAP_PIN_ITEM, "named", None):   # a host's input pin has no wait record: the pass names it
