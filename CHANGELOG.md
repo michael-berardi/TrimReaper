@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.23.1 (2026-11-21)
+
+- Review fixes for 0.23.0. A finished job's fixtures are disposable only under a missing or evidence-class job marker: a customer,
+  release or ambiguous job marker keeps them. The model-weight skip in an archive tests the file's own path, so a weight in a
+  repository outside any fixtures folder is still saved. Offload also refuses a folder whose children hold a fixtures folder.
+
 ## 0.23.0 (2026-11-21)
 
 - Fixtures of finished jobs are disposable scaffolding, never evidence (a finished job kept 14.7 GB of model weights). Once the job

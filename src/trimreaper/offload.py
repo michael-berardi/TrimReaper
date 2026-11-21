@@ -493,8 +493,11 @@ def fixture_refusal(path: Path) -> str | None:
     if path.name.lower() == "fixtures" or path.name.startswith("ut-fixture-"):
         return "fixture-never-moved"
     try:
-        if (path / "fixtures").is_dir() and not (path / "fixtures").is_symlink():
-            return "holds-fixtures-never-moved"
+        for child in [path, *sorted(c for c in path.iterdir() if c.is_dir() and not c.is_symlink())[:2000]]:  # the folder and its children
+            if (child / "fixtures").is_dir() and not (child / "fixtures").is_symlink():
+                return "holds-fixtures-never-moved"
+    except FileNotFoundError:
+        return None
     except OSError:
         return "fixtures-unreadable"
     return None

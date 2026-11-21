@@ -2209,9 +2209,10 @@ def reap_item_retention(item: dict, prove: bool = True) -> str:
     if reap_fixture_expired(item):
         # A finished job's fixtures folder is disposable test scaffolding, never evidence (J-4302 kept 14.7 GB of model weights
         # under a job-level evidence marker): after evidenceExpiryDays only its own marker keeps it. Every other gate still applies.
-        own = reap_cache_retention(item["path"])
-        if own not in ("unmarked", REAP_DISPOSABLE):
-            return own
+        for held in (item["path"], item["root"]):  # the fixtures folder's own marker, or a job marker that is not the evidence class
+            own = reap_cache_retention(held)
+            if own not in ("unmarked", REAP_DISPOSABLE) and not (held == item["root"] and own == "evidence"):
+                return own
         return REAP_DISPOSABLE if reap_no_secret_material(item["path"]) else "ambiguous"
     cache_worktree = item.get("class") == "job-clone-regenerable" and item.get("ownership") == REAP_CACHE_WORKTREE
     if cache_worktree:
@@ -3122,7 +3123,7 @@ def reap_archive_collect(item: dict, units: list, evidence_cutoff: float | None,
                     continue  # cache content outside every repository (unless `loose`); a linked worktree's own `.git` pointer; the way to a nested repository
                 held = secret or reap_protected(name)
                 if stat.S_ISREG(info.st_mode) and not held and reap_model_weight(name, info.st_size) \
-                        and "fixtures" in {reap_fold(part) for part in Path(path).parts}:
+                        and "fixtures" in {reap_fold(part) for part in Path(absolute).parts}:
                     left_out(sub, "model-weight", info.st_size)  # a fixture's downloaded weights are never saved: they download again
                     continue
                 if unit is not None and unit["kind"] == "git" and (in_unit in unit["clean"] or (in_unit in unit["ignoredKnown"] and not held)):
