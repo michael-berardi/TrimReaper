@@ -124,16 +124,19 @@ class Regen(Home):
         self.assertTrue(offload.git_in_use(str(wt)).startswith("git-dirty:unproven:"))
 
     def test_tracked_output_in_a_repository_above_the_candidate_is_kept(self):
-        repo = self.clone("site", ignored=())
-        self.put(repo, "package.json", b"{}")
-        self.put(repo, "node_modules/x.js")
+        repo = self.clone("mono", ignored=())
+        pkg = repo / "packages" / "web"
+        self.put(pkg, "package.json", b"{}")
+        self.put(pkg, "node_modules/x.js")
         self.git(repo, "add", "-A"); self.git(repo, "commit", "-q", "-m", "tracked deps"); self.git(repo, "push", "-q")
         self.write_config({"offload": {"root": str(self.root), "minFreeGB": 0, "quietMinutes": 60,
-                                       "sources": [{"path": "~/dev", "children": True}]}})
-        self.age(self.dev, 1)
+                                       "sources": [{"path": "~/dev/mono/packages", "children": True}]}})
+        self.age(repo, 1)
         out = self.run_pass()
-        self.assertTrue((repo / "node_modules" / "x.js").exists() or (self.root / "home" / "dev" / "site" / "node_modules" / "x.js").exists())
-        self.assertEqual(out["regenerable"]["deleted"], [])
+        self.assertEqual(out["regenerable"]["deleted"], [], out["regenerable"])
+        self.assertTrue(out["regenerable"]["kept"], out["regenerable"])
+        moved = self.root / "home" / "dev" / "mono" / "packages" / "web" / "node_modules" / "x.js"
+        self.assertTrue(moved.exists() or (pkg / "node_modules" / "x.js").exists())
 
     def test_kept_folder_loses_no_output(self):
         (self.proj / "node_modules").touch()  # no-op
@@ -145,6 +148,26 @@ class Regen(Home):
         self.assertTrue((live / "node_modules" / "x.js").exists())
         self.assertEqual(out["regenerable"]["deleted"], [])
         self.assertTrue((self.proj / "node_modules").exists())
+
+    def test_regen_in_one_kept_folder_child_does_not_block_its_sibling_move(self):
+        base = self.home / "kept"
+        for inner in ("wt", "notes"):
+            self.put(base / "J-0001", f"{inner}/package.json", b"{}")
+            self.put(base / "J-0001", f"{inner}/node_modules/x.js")
+        self.put(base / "J-0001", "coordination.jsonl", b"log")
+        self.age(base, 1)
+        self.write_config({"offload": {"root": str(self.root), "minFreeGB": 0, "quietMinutes": 60,
+                                       "jobStatusCommand": [sys.executable, str(self.script)],
+                                       "sources": [{"path": "~/kept", "children": True, "jobs": True, "keepFolder": True}]}})
+        out = self.run_pass()
+        self.assertEqual(out["errors"], [], out["errors"])
+        self.assertTrue((base / "J-0001" / "wt").is_symlink() and (base / "J-0001" / "notes").is_symlink())
+
+    def test_goal_met_folder_loses_no_output(self):
+        with mock.patch.object(offload, "goal_met", return_value=True):
+            out = offload.offload_pass()
+        self.assertEqual(out["regenerable"]["deleted"], [])
+        self.assertTrue((self.proj / "node_modules" / "x" / "index.js").exists())
 
     def test_release_workspace_loses_no_output(self):
         rel = self.home / "scratch" / "rel-0001"
@@ -226,6 +249,34 @@ class OverflowRetention(Home):
         script.write_text("import json,sys\njobs=%r\nj=sys.argv[-1]\nprint(json.dumps({'ok':True,'job':{'id':j,**jobs[j]}}))\n" % self.statuses)
         self.clean()
         self.assertTrue((self.mirror / "J-0102" / "wt" / "node_modules" / "x.js").exists())
+
+    def test_a_repository_left_in_home_above_a_moved_folder_keeps_its_output(self):
+        repo = self.home / "dev" / "mono"
+        (repo / ".git").mkdir(parents=True)
+        moved = self.overflow / "home" / "dev" / "mono" / "packages" / "web"
+        self.put(moved, "package.json", b"{}")
+        self.put(moved, "node_modules/x.js")
+        self.age(moved.parent.parent, 3)
+        errs = []
+        gates = clean.clean_overflow_gates
+        with self.assertRaisesRegex(core.ReapRefused, "repository-in-home-above"):
+            gates({"path": os.path.realpath(moved / "node_modules"), "regen": "node_modules", "jobs": [], "command": []}, None)
+
+    def test_a_retention_marker_above_the_home_path_keeps_the_moved_copy(self):
+        home_dir = self.home / "dev" / "keepme"
+        home_dir.mkdir(parents=True)
+        (home_dir / ".ut-retention-customer").write_bytes(b"")
+        moved = self.overflow / "home" / "dev" / "keepme" / "web"
+        self.put(moved, "package.json", b"{}")
+        self.put(moved, "node_modules/x.js")
+        with self.assertRaisesRegex(core.ReapRefused, "retention:customer"):
+            clean.clean_overflow_gates({"path": os.path.realpath(moved / "node_modules"), "regen": "node_modules", "jobs": [], "command": []}, None)
+
+    def test_an_expired_job_folder_holding_a_release_artifact_is_kept(self):
+        self.put(self.mirror / "J-0101", "out/App-1.0.dmg", b"d" * 8192)
+        self.age(self.mirror / "J-0101", 40)
+        self.clean()
+        self.assertTrue((self.mirror / "J-0101" / "out" / "App-1.0.dmg").exists())
 
     def test_keepfolder_links_in_home_go_with_the_expired_job(self):
         home_job = self.home / ".cache" / "ut-coordinator" / "J-0101"

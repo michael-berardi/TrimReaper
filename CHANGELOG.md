@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.22.2 (2026-11-21)
+
+- Second review round. Offload plans which folders will move (size, goal, limit and free-space rules) before it deletes anything, so a
+  folder that stays loses no output; its own deletions no longer make a kept folder's siblings look active. The overflow sweep looks at
+  what stayed behind in home: a repository above a moved folder, or a retention marker above it, keeps the moved copy. A job folder
+  holding a release artifact is never expired on the overflow.
+
 ## 0.22.1 (2026-11-21)
 
 - Review fixes for 0.22.0. Offload deletes regenerable output only in folders it then moves: a folder it keeps (dirty git, recent change,

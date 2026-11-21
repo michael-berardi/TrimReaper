@@ -388,7 +388,7 @@ def parent_active(item: dict, quiet: float, table: dict, now: float, shared: dic
             if seen and seen["complete"] and seen["newest"] <= now - quiet and (not reads or seen.get("read", 0) <= now - quiet):
                 found[name] = (None, True)  # the pass already walked this sibling as a candidate
             else:
-                found[name] = recent_change(str(parent / name), now - quiet, scan, reads)
+                found[name] = recent_change(str(parent / name), max(now - quiet, shared.get("regen", {}).get(name, peers.get(name, {}).get("regenDone", 0))), scan, reads)
         newest, complete = found[name]
         if newest is not None and newest < 0:
             return f"parent-active: {name} read {max(0, int((now + newest) // 60))} min ago"
@@ -563,7 +563,8 @@ def move_one(item: dict, dry_run: bool) -> dict:
     if tree_stats(path)["newest"] > item["stats"]["newest"]:
         shutil.rmtree(partial, ignore_errors=True)
         raise host.HostError(f"{path} changed during the copy; nothing was removed")
-    active = parent_active(item, item.get("settled", item["quiet"]), core.reap_process_table(), time.time(), {})
+    active = parent_active(item, item.get("settled", item["quiet"]), core.reap_process_table(), time.time(),
+                         {"regen": {n: p["regenDone"] for n, p in item.get("siblings", {}).get("peers", {}).items() if p.get("regenDone")}})
     if active:  # the copy can take minutes: look at the kept folder again before the original is swapped
         shutil.rmtree(partial, ignore_errors=True)
         raise host.HostError(f"{path} was not moved, the kept folder became active during the copy ({active})")
@@ -680,15 +681,27 @@ def offload_pass(dry_run: bool = False, limit_bytes: int | None = None, only: st
         off = reads_recorded(item["path"]) if real else None
         item["reads"] = "recorded" if off is None else f"not-recorded: {off}; only changes count as use"
         sized.append(item)
-    judged = {}
+    judged = {item["path"]: refusal(item, item["stats"], table, now, statuses) for item in sized}
+    # Plan first: the folders that will really move (size, goal and limit rules applied to the sizes before any deletion).
+    plan, planned = [], 0
     for item in sorted(sized, key=lambda i: -i["bytes"]):
-        why = refusal(item, item["stats"], table, now, statuses)
-        judged[item["path"]] = why
-    regen = regen_first([i for i in sized if judged[i["path"]] is None], statuses, dry_run, now, only)
-    for item in sized:  # after our own deletions: the quiet verdict above stands, the size is what is left
+        if judged[item["path"]]:
+            continue
+        if free - planned - item["bytes"] < floor:
+            judged[item["path"]] = "overflow-volume-would-drop-below-minFreeGB"
+        elif not everything and goal_met(planned):
+            judged[item["path"]] = "disk-goal-met"
+        elif limit_bytes is not None and planned >= limit_bytes:
+            judged[item["path"]] = "pass-limit-reached"
+        else:
+            plan.append(item)
+            planned += item["bytes"]
+    regen = regen_first(plan, statuses, dry_run, now, only)
+    for item in plan:  # after our own deletions: the quiet verdict stands, the size is what is left, and our own writes are not "activity"
         if not dry_run and item["path"] in regen["touched"] and item["path"].is_dir():
             item["stats"] = tree_stats(item["path"])
             item["bytes"] = item["stats"]["bytes"]
+            item["regenDone"] = time.time()
             if item["bytes"] < item["minBytes"]:
                 judged[item["path"]] = "below-minimum-size"
     for item in sorted(sized, key=lambda i: -i["bytes"]):
@@ -699,15 +712,6 @@ def offload_pass(dry_run: bool = False, limit_bytes: int | None = None, only: st
                 if item["reads"] != "recorded":
                     entry["reads"] = item["reads"]  # the quiet judgement could not see reads on this volume
                 kept.append(entry)
-            continue
-        if free - planned_bytes - item["bytes"] < floor:
-            kept.append({"path": str(item["path"]), "why": "overflow-volume-would-drop-below-minFreeGB", "bytes": item["bytes"]})
-            continue
-        if not everything and goal_met(planned_bytes):
-            kept.append({"path": str(item["path"]), "why": "disk-goal-met", "bytes": item["bytes"]})
-            continue
-        if limit_bytes is not None and planned_bytes >= limit_bytes:
-            kept.append({"path": str(item["path"]), "why": "pass-limit-reached", "bytes": item["bytes"]})
             continue
         try:
             moved.append(move_one(item, dry_run))

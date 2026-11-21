@@ -2292,11 +2292,36 @@ def clean_regen_gates(path: str, kind: str, table: dict | None, repo: str | None
     reap_holders(path, path, table)
 
 
+def clean_overflow_home_side(path: str, overflow: str) -> tuple[str | None, bool]:
+    """What stayed behind in home for a moved folder: the folders above its home path (a source inside a repository moves only its children,
+    so the repository and any retention marker above it are still in home). A retention marker there keeps it; returns the repository
+    there (if any) and whether its git dir is gone."""
+    home = reap_canon(reap_home())
+    original = os.path.join(home, os.path.relpath(path, overflow))
+    current, repo, broken = os.path.dirname(original), None, False
+    while reap_inside(current, home) and current != home:
+        if os.path.isdir(current) and not os.path.islink(current):
+            retention = reap_cache_retention(current)
+            if retention not in ("unmarked", REAP_DISPOSABLE):
+                raise ReapRefused("retention:" + retention)
+            if repo is None and os.path.lexists(os.path.join(current, ".git")):
+                repo = current
+                dot_git = os.path.join(current, ".git")
+                if os.path.isfile(dot_git):
+                    gitdir = clean_pointer_target(dot_git)
+                    broken = not (gitdir and os.path.isfile(os.path.join(gitdir, "HEAD")))
+        current = os.path.dirname(current)
+    return repo, broken
+
+
 def clean_overflow_gates(entry: dict, table: dict | None) -> None:
     path = entry["path"]
     overflow = reap_overflow_home()
     if not overflow or path == overflow or not reap_inside(path, overflow) or reap_canon(path) != path:
         raise ReapRefused("outside-overflow")
+    home_repo, home_broken = clean_overflow_home_side(path, overflow)
+    if home_repo:   # the repository that stayed in home cannot be asked about a folder that is not under it: keep what it may track
+        raise ReapRefused("repository-in-home-above" + (":git-dir-gone" if home_broken else ""))
     if entry.get("regen"):
         for job in entry["jobs"]:   # a folder of a job that is not finished (it may be coming back) is never swept
             status, _, unknown = clean_coord_status(entry["command"], job, table is None)
@@ -2321,6 +2346,9 @@ def clean_overflow_gates(entry: dict, table: dict | None) -> None:
     retention = reap_cache_retention(path)
     if retention not in ("unmarked", REAP_DISPOSABLE, "evidence"):
         raise ReapRefused("retention:" + retention)
+    found = clean_release_like(path, levels=6)
+    if found:
+        raise ReapRefused("release-artifact:" + found)
     reap_protected_scan(path, expiring_evidence=True)   # a protected name or a preserving marker below keeps it
     clean_stale_tree(path, CLEAN_COORD_QUIET_HOURS, fresh=table is None)
     reap_holders(path, path, table)
