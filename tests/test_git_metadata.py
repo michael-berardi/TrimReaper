@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import contextlib
 import os
+import shutil
+from pathlib import Path
 from unittest import mock
 
 from helpers import Home
@@ -87,3 +89,68 @@ class GitMetadataBinding(Home):
                 self.assertEqual(out.strip(), str(repo))
                 code, out = core.reap_git_input(relative, "node_modules/example\0", "check-ignore", "-z", "--stdin")
                 self.assertEqual((code, out), (0, "node_modules/example\0"))
+
+
+class OffloadedGitdirBinding(Home):
+    """A scratch linked worktree whose repository and gitdir moved to the exact overflow mirror with it. The `.git`
+    pointer still names the home path, so the gate must bind the verified mirror, never an arbitrary symlink."""
+
+    def setUp(self):
+        super().setUp()
+        self.overflow = self.tmp / "Volumes" / "Drive" / "Overflow" / "home"
+        self.overflow.mkdir(parents=True)
+        overflow = mock.patch.object(core, "reap_overflow_home", lambda: str(self.overflow))
+        overflow.start()
+        self.addCleanup(overflow.stop)
+        self.folder = Path(core.reap_agent_scratch_root()) / "analytics-fix" / "liberty-design-studio"
+        repo = self.folder / "base"
+        repo.mkdir(parents=True)
+        self.git(repo, "init", "-q", "-b", "main")
+        (repo / "README.md").write_text("fixture\n")
+        self.git(repo, "add", "-A")
+        self.git(repo, "commit", "-qm", "init")
+        self.worktree = self.folder / "telemetry-lds"
+        self.git(repo, "worktree", "add", "-q", "--detach", str(self.worktree), "HEAD")
+        self.assertEqual((self.worktree / ".git").read_text().strip(),
+                         "gitdir: " + str(repo / ".git" / "worktrees" / self.worktree.name))
+        self.mirror = self.overflow / self.folder.relative_to(self.home)
+        shutil.copytree(self.folder, self.mirror, copy_function=shutil.copy2)
+        shutil.rmtree(self.folder)
+        os.symlink(self.mirror, self.folder)
+        self.mirrored = self.mirror / self.worktree.name
+
+    def test_the_offloaded_gitdir_pointer_is_bound_to_the_verified_mirror(self):
+        args = ("rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir")
+        expected = [str(self.mirror / "base" / ".git" / "worktrees" / self.worktree.name), str(self.mirror / "base" / ".git")]
+        for session in (False, True):
+            with self.subTest(session=session), core.reap_git_session(str(self.mirrored)) if session else contextlib.nullcontext():
+                with mock.patch.object(core, "reap_probe", wraps=core.reap_probe) as probe:
+                    code, out = core.reap_git(str(self.mirrored), *args)
+            self.assertEqual(code, 0, out)
+            self.assertEqual(out.splitlines(), expected)
+            bound = [call.args[0][1] for call in probe.call_args_list if call.args[0][1].startswith("--git-dir=")]
+            self.assertEqual(bound, ["--git-dir=" + expected[0]])
+
+    def test_a_pointer_through_an_unrecorded_link_is_still_refused(self):
+        alias = Path(core.reap_agent_scratch_root()) / "unrecorded-alias"
+        os.symlink(self.mirror, alias)
+        (self.mirrored / ".git").write_text(
+            "gitdir: " + str(alias / "base" / ".git" / "worktrees" / self.worktree.name) + "\n")
+        with self.assertRaisesRegex(core.ReapRefused, "^git-error:unsafe-metadata:symlink$"):
+            core.reap_git_metadata_gate(str(self.mirrored))
+
+    def test_a_foreign_owned_offload_link_cannot_canonicalize_the_pointer(self):
+        link = str(self.folder)
+        original = os.lstat
+
+        def foreign(path, *args, **kwargs):
+            info = original(path, *args, **kwargs)
+            if os.path.abspath(path) == link:
+                fields = list(info)
+                fields[4] = os.getuid() + 1
+                return os.stat_result(fields)
+            return info
+
+        with mock.patch.object(core.os, "lstat", side_effect=foreign):
+            with self.assertRaisesRegex(core.ReapRefused, "^git-error:unsafe-metadata:symlink$"):
+                core.reap_git_metadata_gate(str(self.mirrored))

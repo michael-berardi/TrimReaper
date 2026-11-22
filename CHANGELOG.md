@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.23.3 (2026-11-22)
+
+- The Git metadata gate binds a linked worktree's gitdir pointer through the exact, owner-verified offload link an offloaded
+  worktree was moved under, so an offloaded cold folder no longer reports `git-error:unsafe-metadata:symlink` on every pass.
+  Every other symlink is still refused; the canonical overflow path is used for the metadata walk and Git binding.
+
 ## 0.23.2 (2026-11-21)
 
 - Offload refuses every existing overflow destination, including one whose name ends in `.partial` (the interrupted-copy leftover is

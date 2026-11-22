@@ -750,10 +750,62 @@ def reap_config_stamp(roots: list[str]) -> list:
     return stamp
 
 
+def reap_path_has_symlink(path: str) -> bool:
+    """Whether any existing component of an absolute path is a symlink (lstat, never followed). A missing component
+    ends the scan: the caller's nofollow gate still names the absent path itself."""
+    current = "/"
+    for part in Path(os.path.abspath(path)).parts[1:]:
+        current = os.path.join(current, part)
+        try:
+            if stat.S_ISLNK(os.lstat(current).st_mode):
+                return True
+        except OSError:
+            return False
+    return False
+
+
+def reap_offloaded_gitdir(repo: str, pointer: str) -> str | None:
+    """The canonical overflow path for a linked-worktree gitdir pointer that crosses this engine's own verified
+    offload link, else None. A worktree's metadata may sit inside the folder TrimReaper moved while its `.git` file
+    still names the home path. Only the exact, one-hop home link this engine proves for THIS worktree can map it;
+    the link's own owner must be ours because an overflow mounted with ignored ownership reports every file as ours.
+    Every other symlink stays for safe_path to refuse."""
+    if not reap_path_has_symlink(pointer):
+        return None
+    try:
+        overflow = reap_overflow_home()
+        home = reap_canon(reap_home())
+        scratch = reap_canon(reap_agent_scratch_root())
+        if not overflow or scratch == home or not reap_inside(scratch, home):
+            return None
+        mirror_scratch = os.path.join(overflow, os.path.relpath(scratch, home))
+        absolute = os.path.abspath(pointer)
+        repo = os.path.abspath(repo)
+        if repo == mirror_scratch or not reap_inside(repo, mirror_scratch):
+            return None
+        parts = Path(os.path.relpath(repo, mirror_scratch)).parts
+        for depth in range(len(parts), 0, -1):
+            mirror = os.path.join(mirror_scratch, *parts[:depth])
+            link = os.path.join(scratch, *parts[:depth])
+            try:
+                if os.readlink(link) != mirror or reap_offloaded_mirror(link) != mirror:
+                    continue
+                if os.lstat(link).st_uid != os.getuid():
+                    continue
+            except OSError:
+                continue
+            if absolute == link or absolute.startswith(link + os.sep):
+                return os.path.join(mirror, os.path.relpath(absolute, link))
+        return None
+    except (OSError, ValueError, HostError):
+        return None
+
+
 def reap_git_metadata_gate(repo: str, allow_alternates: bool = False) -> dict:
     """Fence Git's metadata as well as its index: no protected paths, symlink metadata, include configs or executable
-    clean filters. Linked worktree pointers are bounded, nofollow reads of safe metadata only. No native exemption. The
-    git entry, resolved gitdir and common metadata must belong to our uid: explicit --git-dir bypasses Git's ownership
+    clean filters. Linked worktree pointers are bounded, nofollow reads of safe metadata only; a pointer crossing a
+    verified TrimReaper offload link is bound to that exact mirror first, never to an arbitrary symlink. No native
+    exemption. The git entry, resolved gitdir and common metadata must belong to our uid: explicit --git-dir bypasses Git's ownership
     check. The metadata tree is walked descriptor-relative; the config files are classified by Git's own parser. Returns the roots and
     the config stamp the verdict holds for. `allow_alternates` (the archive only, which reads objects and never proves a
     removal from them) admits an objects/info/alternates whose every line names a real `objects` directory outside protected state."""
@@ -802,7 +854,9 @@ def reap_git_metadata_gate(repo: str, allow_alternates: bool = False) -> dict:
         pointer = read_small(entry).strip()
         if not pointer.startswith("gitdir: ") or "\n" in pointer:
             raise ReapRefused("git-error:unsafe-metadata:gitdir-pointer")
-        entry = owned_path(os.path.join(repo, pointer[8:]))
+        gitdir_pointer = os.path.abspath(os.path.join(repo, pointer[8:]))
+        gitdir_pointer = reap_offloaded_gitdir(repo, gitdir_pointer) or gitdir_pointer
+        entry = owned_path(gitdir_pointer)
     roots = [entry]
     common = os.path.join(entry, "commondir")
     if os.path.lexists(common):
