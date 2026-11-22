@@ -811,8 +811,10 @@ def clean_leftover_roots() -> list[tuple[str, bool]]:
 # temp folder after three days. Names the system or a running app manages there are never candidates.
 CLEAN_TEMP_IDLE_HOURS = {"shared": 24, "user": 72}
 CLEAN_TEMP_ESCALATED_HOURS = 6   # from the first rung up
+# jiti is a TypeScript transpile cache that running Node tools import modules from by exact file name; removing it under a live
+# process makes the next import fail with ENOENT. It regenerates on demand and stays small, so it is never a candidate.
 CLEAN_TEMP_SYSTEM = re.compile(r"(?i)^(?:\.|com\.apple\.|TemporaryItems$|.*\.(?:sock|socket|pid|lock)$|launchd|tmux-|ssh-|powerlog|"
-                               r"CoreSimulator|xcrun_db|KSOutOfProcessFetcher)")
+                               r"CoreSimulator|xcrun_db|KSOutOfProcessFetcher|jiti$)")
 
 
 def clean_temp_roots(hours: dict | None = None) -> list[tuple[str, int]]:

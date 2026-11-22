@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.23.4 (2026-11-22)
+
+- The temp cleaner never removes `jiti`, the TypeScript transpile cache that running Node tools import modules from by exact file
+  name. Removing it under a live process made the next import fail with ENOENT. Names that only look like it (`jiti-old`) stay
+  candidates.
+
 ## 0.23.3 (2026-11-22)
 
 - The Git metadata gate binds a linked worktree's gitdir pointer through the exact, owner-verified offload link an offloaded
