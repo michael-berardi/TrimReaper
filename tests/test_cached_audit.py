@@ -15,7 +15,7 @@ from contextlib import closing
 from unittest import mock
 
 from trimreaper import core
-from helpers import Home
+from helpers import DAY, Home
 
 
 class CachedAudit(Home):
@@ -222,3 +222,151 @@ class CachedAudit(Home):
             self.assertIn("mtime", entry)
         self.assertEqual({entry["path"] for entry in entries},
                          {str(self.repo / "target"), str(self.repo / "node_modules")})
+
+
+class CachedRetentionIdentity(Home):
+    """A cached entry keeps the identity its retention is derived from, so the cached view states the retention a fresh pass
+    states now (J-4588: `<cache>/J-3814/evidence` was shown as `retention-preserved:unmarked` from a cached record for a day
+    while a fresh pass derived `disposable` and the guarded reap deleted it). The record that a pass writes carries the
+    audited item's owner, root and derived retention; a record of the old half-item shape is never read, so its stale verdict
+    cannot surface as a hold; and a stored hold whose retention no longer holds is renamed, never promoted to reapable."""
+
+    def setUp(self):
+        super().setUp()
+        self.cache = core.reap_cache_root() / "J-0200"
+        self.evidence = self.cache / "evidence"
+        self.file = self.put(self.cache, "evidence/review-diff.txt", b"x" * 1024)
+        self.add_job("J-0001", None, finished_ago=3 * DAY)  # audited first, so the job below is served from the cache
+        self.add_job("J-0200", None, finished_ago=30 * DAY)  # past evidenceExpiryDays (14 by default): the folder derives disposable
+        self.first = core.reap_audit(None, 40, True, 60, persist=True)  # the tick's pass writes the compact record
+
+    def record(self) -> dict:
+        with closing(self.state()) as conn:
+            stored = conn.execute("SELECT value FROM meta WHERE key='reap:audit:J-0200'").fetchone()
+        return json.loads(stored[0])
+
+    def store(self, record: dict) -> None:
+        with closing(self.state()) as conn, conn:
+            conn.execute("UPDATE meta SET value=? WHERE key='reap:audit:J-0200'", (json.dumps(record),))
+
+    def job(self, job: str = "J-0200") -> dict:
+        with core.db() as conn:
+            return core.row(conn, "SELECT * FROM jobs WHERE id=?", (job,))
+
+    def fresh_item(self, path, job: str = "J-0200") -> dict:
+        items, _ = core.reap_job_items(self.job(job), [])
+        return {i["path"]: i for i in items}[str(path)]
+
+    def entry(self, out: dict, path) -> dict | None:
+        for job in out["jobs"]:
+            for item in job["detail"] or []:
+                if item["path"] == str(path):
+                    return item
+        return None
+
+    def cached(self, out: dict, path) -> dict | None:
+        """One job's cached entry for `path`: a zero budget spends the pass before it audits the job."""
+        return self.entry(out, path)
+
+    def test_a_cached_entry_keeps_the_owner_and_root_and_derives_the_retention_a_fresh_item_derives(self):
+        record = self.record()
+        self.assertEqual(record["version"], core.REAP_AUDIT_RECORD_VERSION)
+        cached = {e["path"]: e for e in record["entries"]}[str(self.evidence)]
+
+        self.assertEqual(cached["owner"], "J-0200")
+        self.assertEqual(cached["root"], str(core.reap_canon(self.cache)))
+        self.assertEqual(cached["retention"], core.REAP_DISPOSABLE)
+        fresh = self.fresh_item(self.evidence)
+        self.assertEqual(core.reap_item_retention(dict(fresh)), core.reap_item_retention(dict(cached)))
+        self.assertEqual(core.reap_item_retention(dict(cached)), core.REAP_DISPOSABLE)
+
+    def test_the_cached_listing_states_the_same_retention_without_becoming_authority(self):
+        after = core.reap_audit(None, 40, True, 0)
+
+        self.assertGreaterEqual(after["summary"]["audit"]["cachedJobs"], 1)
+        self.assertTrue(after["jobs"][0]["cached"])
+        item = self.cached(after, self.evidence)
+        self.assertTrue(item["cached"])
+        self.assertEqual(item["retention"], core.REAP_DISPOSABLE)
+        self.assertEqual(item["owner"], "J-0200")
+        self.assertEqual(item["root"], str(core.reap_canon(self.cache)))
+        self.assertEqual(after["deleted"], 0, "a cached view never deletes")
+        self.assertTrue(self.file.exists())
+
+    def test_the_old_cached_shape_never_surfaces_as_an_unmarked_hold(self):
+        record = self.record()
+        record.pop("version")
+        for entry in record["entries"]:
+            for key in ("owner", "root", "jobs", "ownership", "retention"):
+                entry.pop(key, None)
+            entry.update({"state": "blocked", "blocking": "retention-preserved:unmarked"})
+        self.store(record)
+
+        after = core.reap_audit(None, 40, True, 0)
+
+        self.assertEqual(after["jobs"], [], "a half-item record is not a listing; the job is pending, never a hold")
+        self.assertEqual(after["summary"]["audit"]["pendingJobs"], 1)
+        self.assertNotIn("retention-preserved:unmarked", json.dumps(after))
+        rewritten = core.reap_audit(None, 40, True, 60, persist=True)  # the next pass audits it afresh and rewrites the record
+        self.assertEqual(rewritten["summary"]["audit"]["cachedJobs"], 0)
+        self.assertNotIn("retention-preserved:unmarked", json.dumps(rewritten))
+        self.assertEqual(self.record()["version"], core.REAP_AUDIT_RECORD_VERSION)
+
+    def test_a_stale_cached_hold_is_renamed_and_never_promoted_to_reapable(self):
+        record = self.record()
+        for entry in record["entries"]:
+            entry.update({"state": "blocked", "blocking": "retention-preserved:unmarked", "retention": "unmarked"})
+        self.store(record)
+
+        after = core.reap_audit(None, 40, True, 0)
+
+        item = self.cached(after, self.evidence)
+        self.assertIsNotNone(item)
+        self.assertEqual(item["state"], "blocked", "a cached entry never authorizes a deletion")
+        self.assertEqual(item["blocking"], "audit-retention-changed")
+        self.assertEqual(item["retention"], core.REAP_DISPOSABLE)
+        self.assertEqual(after["summary"]["reapableBytes"], 0)
+        self.assertNotIn("retention-preserved:unmarked", json.dumps(after))
+        self.assertTrue(self.file.exists())
+
+
+class CachedHoldStillRefused(Home):
+    """The guarded deletion path still refuses when retention is not disposable, whatever a cached record says (the repair
+    must never turn a cached hint into an authority)."""
+
+    def setUp(self):
+        super().setUp()
+        self.evidence = core.reap_cache_root() / "J-0201" / "evidence"
+        self.file = self.put(self.evidence.parent, "evidence/review-diff.txt", b"y" * 512)
+        self.add_job("J-0001", None, finished_ago=3600)  # audited first, so the job below is served from the cache
+        self.add_job("J-0201", None, finished_ago=3600)  # inside evidenceExpiryDays: no disposable marker, no derived proof
+
+    def test_the_guarded_deletion_of_an_unmarked_folder_is_still_refused(self):
+        item = {i["path"]: i for i in core.reap_job_items(self.job(), [])[0]}[str(self.evidence)]
+
+        self.assertEqual(item["retention"], "unmarked")
+        result = core.reap_item(item)
+
+        self.assertEqual(result["outcome"], "refused")
+        self.assertEqual(result["reason"], "retention-preserved:unmarked")
+        self.assertTrue(self.file.exists())
+        # refused at the declared-retention gate, before any boundary or git proof ran
+        self.assertEqual(result["checks"], ["single-cleanup-worker"])
+
+    def test_the_cached_identity_still_refuses_and_the_cached_view_says_blocked(self):
+        first = core.reap_audit(None, 40, True, 60, persist=True)
+        self.assertEqual({e["path"]: e for e in first["jobs"][0]["detail"]}[str(self.evidence)]["blocking"], "retention-preserved:unmarked")
+        after = core.reap_audit(None, 40, True, 0)
+        cached = [e for e in after["jobs"][0]["detail"] if e["path"] == str(self.evidence)][0]
+
+        self.assertEqual(cached["state"], "blocked")
+        self.assertEqual(cached["blocking"], "retention-preserved:unmarked")
+        result = core.reap_item(dict(cached))  # the cached identity alone, no fresh listing
+
+        self.assertEqual(result["outcome"], "refused")
+        self.assertEqual(result["reason"], "retention-preserved:unmarked")
+        self.assertTrue(self.file.exists())
+
+    def job(self) -> dict:
+        with core.db() as conn:
+            return core.row(conn, "SELECT * FROM jobs WHERE id=?", ("J-0201",))

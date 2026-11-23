@@ -9078,6 +9078,7 @@ def reap_audit_share(ctx: dict, deadline: float, items_left: int) -> float:
 
 def reap_audit_item(item: dict, blocker: str | None, ctx: dict, deadline: float, items_left: int = 1) -> dict:
     base = {"path": item["path"], "class": item["class"], "kind": item["kind"]}
+    base.update({k: item[k] for k in REAP_AUDIT_IDENTITY if k in item})  # the identity retention is derived from, so a cached entry keeps it
     try:
         info = os.lstat(item["path"])
     except OSError:
@@ -9144,7 +9145,8 @@ def reap_audit_item(item: dict, blocker: str | None, ctx: dict, deadline: float,
         entry["sizeReason"] = size_reason or "size-unknown"
         if size is not None:
             entry["bytesLowerBound"] = True  # what the walk saw before its limit: at least this many bytes, never "0 bytes"
-    return {**base, **entry, "mtime": iso(info.st_mtime), "dev": info.st_dev, "ino": info.st_ino}
+    settled = {k: item[k] for k in ("retention", "quietReason") if item.get(k) is not None}  # the pass's own re-derivation, not only the builder's hint
+    return {**base, **entry, **settled, "mtime": iso(info.st_mtime), "dev": info.st_dev, "ino": info.st_ino}
 
 
 # Every reason an item is kept, as an action the operator (or a later tick) can take. reap-status prints the line for each reason
@@ -9206,6 +9208,7 @@ REAP_REASON_ACTIONS = {
     "audit-path-unknown": "the path could not be proved again after the cached audit: kept; the next pass audits it anew",
     "audit-path-changed": "the path is a different object than the cached audit saw: kept; the next pass audits it anew",
     "audit-path-symlink": "the path is a link now, not the audited folder: kept; the next pass audits it anew",
+    "audit-retention-changed": "the cached audit kept this folder for a retention class that no longer holds: kept again (a cached entry never authorizes a deletion); the next pass re-derives it fresh",
 }
 
 
@@ -9236,6 +9239,11 @@ REAP_AUDIT_SCAN_FLOOR = 5              # least time a started job's name scan ge
 REAP_AUDIT_JOB_SECONDS = 60            # least time a started job's items get, whatever is left of the budget (the next call resumes after it)
 REAP_AUDIT_CURSOR = "reap:audit-cursor"
 REAP_AUDIT_PERSIST = threading.local()   # set by the tick's sizing pass: that pass (and only it) writes the cursor and the per-job cache
+# The compact record's own shape. 1 was the half-item (path, class, kind, state and size only): it dropped the audited item's
+# owner, root and derived retention, so nothing could re-derive what it said and a stale retention verdict could be shown for a day.
+# A record of another version is never read: the job is reported pending and audited afresh, never shown with a verdict nobody can prove.
+REAP_AUDIT_RECORD_VERSION = 2
+REAP_AUDIT_IDENTITY = ("owner", "root", "jobs", "ownership", "link", "source", "retention", "quietReason")
 
 
 def reap_audit_net(entries: list) -> None:
@@ -9265,9 +9273,11 @@ def reap_audit_cursor(conn) -> dict:
 
 def reap_audit_remember(conn, job: dict, blocker: str | None, entries: list) -> None:
     """The job's audit, compact, for the passes whose budget ends before they reach it (shown as cached, never as a block)."""
-    keep = ("path", "class", "kind", "state", "blocking", "bytes", "sizeIncomplete", "bytesLowerBound", "sizeReason", "archive", "mtime", "dev", "ino")
+    keep = ("path", "class", "kind", "state", "blocking", "bytes", "sizeIncomplete", "bytesLowerBound", "sizeReason", "archive",
+            "mtime", "dev", "ino") + REAP_AUDIT_IDENTITY
     conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", ("reap:audit:" + job["id"], json.dumps(
-        {"at": now(), "status": job["status"], "blocking": blocker, "entries": [{k: e[k] for k in keep if k in e} for e in entries]})))
+        {"version": REAP_AUDIT_RECORD_VERSION, "at": now(), "status": job["status"], "blocking": blocker,
+         "entries": [{k: e[k] for k in keep if k in e} for e in entries]})))
 
 
 def reap_audit_cached(conn, job: dict) -> dict | None:
@@ -9278,7 +9288,33 @@ def reap_audit_cached(conn, job: dict) -> dict | None:
         return None
     if not isinstance(found, dict) or found.get("status") != job["status"] or now() - found.get("at", 0) > REAP_AUDIT_CACHE_SECONDS:
         return None
+    if found.get("version") != REAP_AUDIT_RECORD_VERSION:
+        return None  # a record written before the identity was kept cannot be re-derived: audit the job afresh, never show its half-item
     return found
+
+
+def reap_audit_cached_retention(entry: dict) -> dict:
+    """A cached retention verdict is the earlier pass's answer; re-derive it from the entry's own identity, so the listing states the
+    retention the engine derives now (a retention clock such as evidenceExpiryDays moves inside the day-long cache window).
+
+    Only a stored hold can go stale in the direction that matters here: a folder that was kept by a retention class and is derivable
+    as disposable now. That entry is kept, named `audit-retention-changed` and never promoted to reapable from the cache, so a cached
+    entry still cannot authorize a deletion: the guarded reap re-proves every gate from a fresh item. A stored answer whose identity
+    cannot be re-derived is never rewritten."""
+    stored = entry.get("retention")
+    blocking = entry.get("blocking") or ""
+    if not blocking.startswith("retention-preserved:") or not entry.get("owner") or not entry.get("root") or not entry.get("class"):
+        return entry
+    item = {k: entry[k] for k in ("path", "class", "kind", "owner", "root", "jobs", "ownership", "link", "source") if k in entry}
+    try:
+        derived = reap_item_retention(item)
+    except (ReapRefused, OSError, KeyError, TypeError):
+        return entry
+    if derived == stored:
+        return entry
+    if derived == REAP_DISPOSABLE:
+        return {**entry, "retention": derived, "state": "blocked", "blocking": "audit-retention-changed"}
+    return {**entry, "retention": derived, "blocking": "retention-preserved:" + derived}
 
 
 def reap_audit_revalidate(entry: dict) -> dict | None:
@@ -9393,7 +9429,7 @@ def reap_audit_inner(only: str | None, limit: int, include_items: bool, budget: 
                     else:
                         if kept.get("state") != entry.get("state"):
                             unknown_paths += 1
-                        entries.append(kept)
+                        entries.append(reap_audit_cached_retention(kept))
                 cached_jobs += 1
             else:
                 fresh += 1

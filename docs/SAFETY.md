@@ -107,6 +107,13 @@ cannot be read, that was replaced or that is a link now is kept, is never report
 revalidation reads no content, enters no folder and spends no sizing budget. No removal gate changes: the audit never
 authorizes a removal, and every removal is proved again, freshly, by the reaper itself.
 
+A cached entry also keeps the identity its retention comes from (the owner, the root it sits in and the class), and the cached
+listing re-derives retention from that identity, so a clock that moves inside the cache window - a job's `finished_at` passing
+`evidenceExpiryDays` - cannot keep a folder shown as `retention-preserved:unmarked` while a fresh pass derives `disposable`.
+A stored hold that no longer holds is kept and renamed `audit-retention-changed`; it is never promoted to reapable from the
+cache. The record carries a shape version, and a record of another shape is never read: that job is reported pending and
+audited afresh rather than shown with a verdict nothing on hand can re-derive.
+
 ## Agent scratch: the idle proof
 
 An agent-scratch folder (`scratchRoot/<task>`) is disposable only when its own idle proof says so: nothing in it changed

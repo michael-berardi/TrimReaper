@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.23.5 (2026-11-23)
+
+- A cached per-job audit keeps the identity its retention is derived from (`owner`, `root`, `jobs`, `ownership`, `link`,
+  `source`, and the derived `retention`/`quietReason`), and a cached listing re-derives retention from that identity, so a
+  retention clock that moves inside the day-long cache window (`evidenceExpiryDays`, a job's `finished_at`) can no longer
+  leave a folder shown as `retention-preserved:unmarked` while a fresh pass derives `disposable`. A stored hold whose
+  retention no longer holds is renamed `audit-retention-changed` and stays kept: a cached entry still never authorizes a
+  deletion. The record now carries a shape version; a record of another shape is never read, so the job is reported
+  pending and audited afresh instead of surfacing a verdict nothing can re-derive.
+
 ## 0.23.4 (2026-11-22)
 
 - The temp cleaner never removes `jiti`, the TypeScript transpile cache that running Node tools import modules from by exact file
