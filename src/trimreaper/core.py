@@ -2193,6 +2193,13 @@ def reap_model_weight(name: str, size: int) -> bool:
     return reap_fold(name).endswith(REAP_MODEL_WEIGHT_SUFFIXES) and size > REAP_MODEL_WEIGHT_BYTES
 
 
+def reap_name_scan_deadline() -> float | None:
+    """When the retention this pass (<- `reap_audit_cached_retention`) may spend on a whole-folder name scan runs out, else None.
+    The sizing pass sets it for its own listing work; a cached listing exists to be cheap, so it gives each stored hold a few
+    seconds to prove itself and keeps the folder when that time is gone."""
+    return getattr(REAP_PROBE, "nameScan", None)
+
+
 def reap_fixture_expired(item: dict) -> bool:
     """The `fixtures` folder directly in a finished job's cache folder, once the job finished evidenceExpiryDays ago."""
     if item.get("class") != "job-cache-subdir" or not item.get("owner") or reap_fold(os.path.basename(item["path"])) != "fixtures":
@@ -2202,18 +2209,18 @@ def reap_fixture_expired(item: dict) -> bool:
     return reap_scratch_expired(item["owner"])
 
 
-def reap_no_retained_names(path: str) -> bool:
+def reap_no_retained_names(path: str, deadline: float | None = None) -> bool:
     """True only when no retained-class name (a record, signing or credential name, a key or certificate extension, an
     identity file) appears anywhere below a whole-folder candidate. A job-cache subdirectory is removed as a unit, so its
     top-level name alone cannot prove it holds no key material (2026-10-19 review). A walk that cannot complete, or a name
-    it cannot judge, keeps the folder: over-retention is the safe answer."""
+    it cannot judge, or a walk that runs past `deadline` (monotonic; default none), keeps the folder: over-retention is the safe answer, and a stored hold is never turned into a disposable answer on a partial scan."""
     hit = []
     def listing(rel, names):
         kept = [n for n in names if marked_evidence_keep(n)]
         if kept:
             hit.append(kept[0])
     try:
-        reap_fd_walk(path, lambda rel, name, info, level, device: True, REAP_WALK_ENTRIES, listing=listing)
+        reap_fd_walk(path, lambda rel, name, info, level, device: True, REAP_WALK_ENTRIES, deadline, listing=listing)
     except (OSError, ReapRefused):
         return False
     return not hit
@@ -2227,12 +2234,12 @@ REAP_SECRET_NAMES = re.compile(r"(?:id_(?:rsa|dsa|ecdsa|ed25519)(?:\.pub)?|known
                                r"\.env.*|\.dev\.vars.*|keychain.*|.*\.keychain(?:-db)?)", re.I)
 
 
-def reap_no_secret_material(path: str) -> bool:
+def reap_no_secret_material(path: str, deadline: float | None = None) -> bool:
     """True when nothing below the folder is key, credential, signing or release material. Unlike reap_no_retained_names
     this ignores words that only sound like a record ("tokenizer", "report.py", "runtime.js") and anything inside an
     installed package tree (a bundled CA file in a virtualenv is public). Used only for a job that finished past its
     expiry window (2026-10-29: 5.7 GB of expired dependency and download folders were kept for names like those).
-    A walk that cannot complete keeps the folder."""
+    A walk that cannot complete, or that runs past `deadline` (monotonic; default none), keeps the folder."""
     hit = []
     def listing(rel, names):
         parts = {reap_fold(p) for p in Path(rel).parts} if rel else set()
@@ -2244,7 +2251,7 @@ def reap_no_secret_material(path: str) -> bool:
                 hit.append(name)
                 return
     try:
-        reap_fd_walk(path, lambda rel, name, info, level, device: True, REAP_WALK_ENTRIES, listing=listing)
+        reap_fd_walk(path, lambda rel, name, info, level, device: True, REAP_WALK_ENTRIES, deadline, listing=listing)
     except (OSError, ReapRefused):
         return False
     return not hit
@@ -2301,7 +2308,7 @@ def reap_item_retention(item: dict, prove: bool = True) -> str:
                 break
             parent = os.path.dirname(parent)
     found = reap_cache_retention(item["path"])
-    if found == REAP_DISPOSABLE and item.get("class") == "job-cache-subdir" and not reap_no_retained_names(item["path"]):
+    if found == REAP_DISPOSABLE and item.get("class") == "job-cache-subdir" and not reap_no_retained_names(item["path"], reap_name_scan_deadline()):
         # A disposable marker never authorizes removing key material: a retained credential, key or record name inside
         # the folder keeps it, exactly as for an unmarked folder.
         return "ambiguous"
@@ -2341,11 +2348,11 @@ def reap_item_retention(item: dict, prove: bool = True) -> str:
         return REAP_DISPOSABLE
     if cls == "job-cache-subdir" and reap_fold(os.path.basename(item["path"])) not in EVIDENCE_KEEP_DIRS and item.get("owner") \
             and reap_cache_retention(str(reap_cache_root() / item["owner"])) in ("unmarked", REAP_DISPOSABLE):  # only a preserving parent marker keeps it all
-        if (reap_cachedir_tagged(item["path"]) or reap_standalone_target(item) or reap_scratch_expired(item["owner"])) and reap_no_retained_names(item["path"]):
+        if (reap_cachedir_tagged(item["path"]) or reap_standalone_target(item) or reap_scratch_expired(item["owner"])) and reap_no_retained_names(item["path"], reap_name_scan_deadline()):
             return REAP_DISPOSABLE
-        if reap_scratch_expired(item["owner"]) and reap_no_secret_material(item["path"]):
+        if reap_scratch_expired(item["owner"]) and reap_no_secret_material(item["path"], reap_name_scan_deadline()):
             return REAP_DISPOSABLE
-        if reap_job_unsaved_window(item["owner"]) and reap_no_retained_names(item["path"]):
+        if reap_job_unsaved_window(item["owner"]) and reap_no_retained_names(item["path"], reap_name_scan_deadline()):
             item["unsavedWindow"] = True  # reap_item_strict keeps the folder unless unsaved git work is what is left (archived first)
             return REAP_DISPOSABLE
     if cls == "scratch-regenerable":
@@ -9243,6 +9250,8 @@ REAP_AUDIT_PERSIST = threading.local()   # set by the tick's sizing pass: that p
 # owner, root and derived retention, so nothing could re-derive what it said and a stale retention verdict could be shown for a day.
 # A record of another version is never read: the job is reported pending and audited afresh, never shown with a verdict nobody can prove.
 REAP_AUDIT_RECORD_VERSION = 2
+REAP_AUDIT_CACHED_PROOF = 2.0   # seconds a cached listing gives one stored hold to re-derive its own retention, names only and never content
+REAP_AUDIT_CACHED_PROOF_PASS = 10.0  # and the whole cached listing gives all of them together (a listing may be cheap; it may not spend a budget)
 REAP_AUDIT_IDENTITY = ("owner", "root", "jobs", "ownership", "link", "source", "retention", "quietReason")
 
 
@@ -9305,16 +9314,30 @@ def reap_audit_cached_retention(entry: dict) -> dict:
     blocking = entry.get("blocking") or ""
     if not blocking.startswith("retention-preserved:") or not entry.get("owner") or not entry.get("root") or not entry.get("class"):
         return entry
+    if not isinstance(stored, str) or not stored:
+        return entry  # no stored retention to compare against: a label alone is never rewritten
     item = {k: entry[k] for k in ("path", "class", "kind", "owner", "root", "jobs", "ownership", "link", "source") if k in entry}
+    now_mono = time.monotonic()
+    shared = getattr(REAP_PROBE, "cachedProof", None)
+    if shared is None:
+        shared = now_mono + REAP_AUDIT_CACHED_PROOF_PASS  # first stored hold of this listing: starts the listing's own budget
+        REAP_PROBE.cachedProof = shared
+    deadline = min(now_mono + REAP_AUDIT_CACHED_PROOF, shared)
+    if deadline <= now_mono:
+        return entry  # the listing's proof budget is spent: the stored hold stands, never a disposable on a scan that did not run
+    previous = getattr(REAP_PROBE, "nameScan", None)
+    REAP_PROBE.nameScan = deadline
     try:
         derived = reap_item_retention(item)
     except (ReapRefused, OSError, KeyError, TypeError):
         return entry
+    finally:
+        REAP_PROBE.nameScan = previous
     if derived == stored:
         return entry
     if derived == REAP_DISPOSABLE:
         return {**entry, "retention": derived, "state": "blocked", "blocking": "audit-retention-changed"}
-    return {**entry, "retention": derived, "blocking": "retention-preserved:" + derived}
+    return {**entry, "retention": derived, "state": "blocked", "blocking": "retention-preserved:" + derived}
 
 
 def reap_audit_revalidate(entry: dict) -> dict | None:
@@ -9353,6 +9376,7 @@ def reap_audit(only: str | None, limit: int, include_items: bool, budget: int, p
     """The audit under its own wall-clock ceiling: budget x REAP_AUDIT_OVERRUN bounds the worktree scans, the git probes and the sizing."""
     previous = getattr(REAP_PROBE, "ceiling", None)
     REAP_PROBE.ceiling = time.monotonic() + budget * REAP_AUDIT_OVERRUN
+    REAP_PROBE.cachedProof = None  # the whole cached listing's own small budget, shared by every stored hold it re-derives
     try:
         return reap_audit_inner(only, limit, include_items, budget, persist, after)
     finally:

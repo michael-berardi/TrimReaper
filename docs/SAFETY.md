@@ -111,8 +111,11 @@ A cached entry also keeps the identity its retention comes from (the owner, the 
 listing re-derives retention from that identity, so a clock that moves inside the cache window - a job's `finished_at` passing
 `evidenceExpiryDays` - cannot keep a folder shown as `retention-preserved:unmarked` while a fresh pass derives `disposable`.
 A stored hold that no longer holds is kept and renamed `audit-retention-changed`; it is never promoted to reapable from the
-cache. The record carries a shape version, and a record of another shape is never read: that job is reported pending and
-audited afresh rather than shown with a verdict nothing on hand can re-derive.
+cache. That re-derivation is bounded work: a whole-folder candidate is proved by its names only, one stored hold may spend
+two seconds and a whole listing ten, and a hold the budget did not reach keeps its stored answer. A scan that runs out of time
+keeps the folder, so a listing can never turn a partial scan into a disposable answer. The record carries a shape version, and a
+record of another shape is never read: that job is reported pending and audited afresh rather than shown with a verdict nothing
+on hand can re-derive.
 
 ## Agent scratch: the idle proof
 

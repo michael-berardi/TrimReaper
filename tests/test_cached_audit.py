@@ -4,13 +4,15 @@ When the audit's sizing budget runs out, the jobs after the cursor show the comp
 (meta `reap:audit:<job>`) for up to a day. Every path in that view is proved again, metadata only, before it can
 count as reapable: a path that is gone counts for nothing, and a path that cannot be read, that was replaced or that
 is a link now is kept but never reapable. The revalidation reads no content, enters no folder and spends no sizing
-budget.
+budget. A stored retention hold is re-derived from that identity under a small names-only budget, and the stored hold
+stands when the budget is gone.
 """
 from __future__ import annotations
 
 import json
 import os
 import shutil
+import time
 from contextlib import closing
 from unittest import mock
 
@@ -328,6 +330,83 @@ class CachedRetentionIdentity(Home):
         self.assertEqual(after["summary"]["reapableBytes"], 0)
         self.assertNotIn("retention-preserved:unmarked", json.dumps(after))
         self.assertTrue(self.file.exists())
+
+
+class CachedProofIsBounded(Home):
+    """The cached listing stays cheap: re-deriving one stored hold is names-only work under a small budget, and when that budget
+    is gone the stored hold stands. A refused or unfinished scan must never become a disposable answer (J-4588 review)."""
+
+    def setUp(self):
+        super().setUp()
+        self.cache = core.reap_cache_root() / "J-0202"
+        self.evidence = self.cache / "evidence"
+        self.file = self.put(self.cache, "evidence/review-diff.txt", b"z" * 512)
+        self.add_job("J-0001", None, finished_ago=3 * DAY)  # audited first, so the job below is served from the cache
+        self.add_job("J-0202", None, finished_ago=30 * DAY)  # past evidenceExpiryDays: it derives disposable now
+        core.reap_audit(None, 40, True, 60, persist=True)
+
+    def record(self) -> dict:
+        with closing(self.state()) as conn:
+            return json.loads(conn.execute("SELECT value FROM meta WHERE key='reap:audit:J-0202'").fetchone()[0])
+
+    def store(self, record: dict) -> None:
+        with closing(self.state()) as conn, conn:
+            conn.execute("UPDATE meta SET value=? WHERE key='reap:audit:J-0202'", (json.dumps(record),))
+
+    def stale(self) -> None:
+        record = self.record()
+        for entry in record["entries"]:
+            entry.update({"state": "blocked", "blocking": "retention-preserved:unmarked", "retention": "unmarked"})
+        self.store(record)
+
+    def test_a_cached_hold_is_never_re_derived_without_time_left_to_prove_it(self):
+        self.stale()
+
+        def no_walk(*args, **kwargs):
+            raise AssertionError("the cached listing walked a folder")
+
+        with mock.patch.object(core, "REAP_AUDIT_CACHED_PROOF", 0.0), \
+                mock.patch.object(core, "reap_fd_walk", side_effect=no_walk), \
+                mock.patch.object(core, "reap_item_retention", side_effect=no_walk):
+            after = core.reap_audit(None, 40, True, 0)
+
+        item = after["jobs"][0]["detail"][0]
+        self.assertEqual(item["blocking"], "retention-preserved:unmarked", "out of time: the stored hold stands")
+        self.assertEqual(item["state"], "blocked")
+
+    def test_the_cached_re_derivation_spends_a_bounded_scan_and_no_more(self):
+        self.stale()
+
+        def names(path, deadline=None):
+            self.assertIsNotNone(deadline, "the cached re-derivation bounds its name scan")
+            self.assertLessEqual(deadline, time.monotonic() + core.REAP_AUDIT_CACHED_PROOF)
+            return True
+
+        with mock.patch.object(core, "reap_no_retained_names", side_effect=names), \
+                mock.patch.object(core, "reap_no_secret_material", return_value=True):
+            after = core.reap_audit(None, 40, True, 0)
+
+        self.assertEqual(after["jobs"][0]["detail"][0]["blocking"], "audit-retention-changed")
+
+    def test_a_listing_whose_proof_budget_is_spent_keeps_every_hold_it_did_not_prove(self):
+        self.stale()
+
+        with mock.patch.object(core, "REAP_AUDIT_CACHED_PROOF_PASS", 0.0), \
+                mock.patch.object(core, "reap_item_retention", side_effect=AssertionError("no proof budget left")):
+            after = core.reap_audit(None, 40, True, 0)
+
+        self.assertEqual(after["jobs"][0]["detail"][0]["blocking"], "retention-preserved:unmarked")
+
+    def test_a_stored_label_without_its_retention_is_never_rewritten(self):
+        record = self.record()
+        for entry in record["entries"]:
+            entry.update({"state": "blocked", "blocking": "retention-preserved:unmarked"})
+            entry.pop("retention", None)
+        self.store(record)
+
+        after = core.reap_audit(None, 40, True, 0)
+
+        self.assertEqual(after["jobs"][0]["detail"][0]["blocking"], "retention-preserved:unmarked")
 
 
 class CachedHoldStillRefused(Home):
