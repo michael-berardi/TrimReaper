@@ -144,17 +144,30 @@ class MoveOne(Base):
         holders.start()
         self.addCleanup(holders.stop)
 
-    def test_existing_real_destination_is_refused_without_deleting_it(self):
+    def test_existing_real_destination_is_set_aside_never_deleted(self):
         self.dest.parent.mkdir(parents=True)
         self.dest.mkdir()
         sentinel = self.dest / "only-copy.txt"
         sentinel.write_text("keep me")
-        with self.assertRaisesRegex(host.HostError, "offload-destination-exists:"):
-            offload.move_one(self.item, False)
-        self.assertEqual(sentinel.read_text(), "keep me")
-        self.assertTrue(self.path.is_dir())
-        self.assertFalse(self.path.is_symlink())
+        result = offload.move_one(self.item, False)
+        self.assertTrue(result["moved"])
+        aside = list(self.dest.parent.glob(".offload-old.superseded-*"))
+        self.assertEqual(len(aside), 1)
+        self.assertEqual((aside[0] / "only-copy.txt").read_text(), "keep me")
+        self.assertTrue(self.path.is_symlink())
+        self.assertEqual(os.readlink(self.path), str(self.dest))
         self.assertEqual(list(self.dest.parent.glob(".offload-*.partial")), [])
+
+    def test_appledouble_names_survive_the_copy(self):
+        (self.path / "__MACOSX").mkdir()
+        (self.path / "__MACOSX" / "._App.app").write_bytes(b"d" * 220)
+        (self.path / "App.app").mkdir()
+        (self.path / "._loose").write_bytes(b"e")
+        self.item["stats"] = self.fake_stats(self.path)
+        result = offload.move_one(self.item, False)
+        self.assertTrue(result["moved"])
+        self.assertTrue((self.dest / "__MACOSX" / "._App.app").is_file())
+        self.assertTrue((self.dest / "._loose").is_file())
 
     def test_holders_are_rechecked_when_regen_did_not_touch_the_folder(self):
         self.assertNotIn("regenDone", self.item)
@@ -181,10 +194,10 @@ class MoveOne(Base):
         self.dest.parent.mkdir(parents=True)
         self.dest.mkdir()
         (self.dest / "keep.txt").write_text("only copy")
-        with self.assertRaises(Exception) as caught:
-            offload.move_one(self.item, False)
-        self.assertIn("offload-destination-exists", str(caught.exception))
-        self.assertEqual((self.dest / "keep.txt").read_text(), "only copy")
+        offload.move_one(self.item, False)
+        aside = list(self.dest.parent.glob(".offload-old.partial.superseded-*"))
+        self.assertEqual(len(aside), 1)
+        self.assertEqual((aside[0] / "keep.txt").read_text(), "only copy")
 
 
 class KeepFolder(Base):

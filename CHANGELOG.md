@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.23.9 (2026-11-24)
+
+- Offload moves a tree that holds AppleDouble files. The copy used `ditto`, which folds a `._name` file (an unpacked zip's `__MACOSX`
+  folder) into the copy's metadata, so the copy never matched the original's signature: the folder was planned and refused on every pass
+  (36 times a day for each of four folders on the operator's Mac) and never moved. The copy is now `cp -pPR`, which keeps every name,
+  extended attributes (resource forks included), modes, times and symlinks as links.
+- An existing overflow destination is set aside, never deleted and never a reason to stop. 0.23.2 refused it, so a folder whose link had
+  been replaced by a real folder was re-planned and refused forever. The older copy now moves to `.offload-<name>.superseded-<time>`
+  beside it (dot names are never pruned), a `offload-superseded` receipt records where it went, and the home folder moves.
+- A repository's own test data named `fixtures` no longer pins the repository on the internal disk. Only job scaffolding counts: a
+  `fixtures` folder directly inside a job folder (`J-1234/fixtures`) or one holding a `ut-fixture-*` folder. A repository's `tests/fixtures`
+  or `scripts/fixtures` moves with it; 15 repositories and worktrees (34.7 GB) were held as `holds-fixtures-never-moved` before.
+
 ## 0.23.8 (2026-11-24)
 
 - The shipped-copy rule reads the folder being swept, not the volume above it. `clean_regen_shipped` tested every component of the absolute

@@ -487,19 +487,33 @@ def split_link(folder: Path, cfg: dict) -> None:
     core.reap_receipt({"kind": "offload-split", "path": str(folder), "from": str(dest)})
 
 
+def scaffolding_fixtures(folder: Path) -> bool:
+    """A `fixtures` folder is job test scaffolding (the coordinator's fixture tools own it) when it sits directly in a job folder
+    or holds a `ut-fixture-*` folder. A repository's own `tests/fixtures` (source test data, tracked by git) is neither: it moves
+    with its repository (0.23.9: 35 GB of repositories and worktrees were kept for holding their source test data)."""
+    if folder.name.lower() != "fixtures" or not folder.is_dir() or folder.is_symlink():
+        return False
+    if JOB_NAME.fullmatch(folder.parent.name):
+        return True
+    with os.scandir(folder) as entries:
+        return any(e.name.startswith("ut-fixture-") for e in entries)
+
+
 def fixture_refusal(path: Path) -> str | None:
     """A fixture folder is delete-or-keep, never moved: test scaffolding the reaper expires, and a moved copy only hid it from
     the fixture tools (J-4302: 14.7 GB of model weights moved to the overflow disk, then `path-not-canonical`)."""
-    if path.name.lower() == "fixtures" or path.name.startswith("ut-fixture-"):
+    if path.name.startswith("ut-fixture-"):
         return "fixture-never-moved"
     try:
+        if scaffolding_fixtures(path):
+            return "fixture-never-moved"
         children = [c for c in path.iterdir() if c.is_dir() and not c.is_symlink()]
         if len(children) > 2000:
             return "fixtures-unreadable"  # too many children to prove none holds fixtures: keep
         for child in [path, *children]:  # the folder and its children
-            if child is not path and (child.name.lower() == "fixtures" or child.name.startswith("ut-fixture-")):
+            if child is not path and (child.name.startswith("ut-fixture-") or scaffolding_fixtures(child)):
                 return "holds-fixtures-never-moved"
-            if (child / "fixtures").is_dir() and not (child / "fixtures").is_symlink():
+            if scaffolding_fixtures(child / "fixtures"):
                 return "holds-fixtures-never-moved"
     except FileNotFoundError:
         return None
@@ -557,8 +571,12 @@ def copy_tree(source: Path, partial: Path) -> None:
     if partial.exists():
         shutil.rmtree(partial)
     partial.parent.mkdir(parents=True, exist_ok=True)
-    result = subprocess.run(["ditto", str(source), str(partial)], capture_output=True, text=True)
+    # `cp -pPR`, not `ditto`: ditto folds AppleDouble `._name` files into the copy's metadata, so a tree holding one (an
+    # unpacked zip's __MACOSX) never matched its signature and was re-planned every pass and never moved (0.23.9). cp keeps
+    # every name, extended attributes (resource forks included), modes, times and symlinks as links.
+    result = subprocess.run(["cp", "-pPR", str(source), str(partial)], capture_output=True, text=True)
     if result.returncode:
+        shutil.rmtree(partial, ignore_errors=True)
         raise host.HostError(f"copy of {source} failed: {result.stderr.strip()[:300]}")
 
 
@@ -600,11 +618,17 @@ def move_one(item: dict, dry_run: bool) -> dict:
     if active:  # the copy can take minutes: look at the kept folder again before the original is swapped
         shutil.rmtree(partial, ignore_errors=True)
         raise host.HostError(f"{path} was not moved, the kept folder became active during the copy ({active})")
-    if dest.exists():
+    if os.path.lexists(dest):
         # A home symlink can be replaced by a real folder of the same name. That folder is the only copy left in home;
-        # the overflow folder is the older copy. Deleting it here would destroy the only surviving copy.
-        shutil.rmtree(partial, ignore_errors=True)
-        raise host.HostError(f"offload-destination-exists:{dest}: refusing to delete an existing overflow folder; nothing was moved")
+        # the overflow folder is the older copy. Never delete it: set it aside under a dot name (mirrors_of skips
+        # `.offload-*`, so no rule prunes it) and record where it went. Refusing instead left the folder planned and
+        # never moved on every pass (0.23.9).
+        aside = dest.parent / f".offload-{dest.name}.superseded-{time.strftime('%Y%m%d-%H%M%S')}"
+        if os.path.lexists(aside):
+            shutil.rmtree(partial, ignore_errors=True)
+            raise host.HostError(f"offload-destination-exists:{dest}: {aside} is taken too; nothing was moved")
+        os.rename(dest, aside)
+        core.reap_receipt({"kind": "offload-superseded", "path": str(dest), "to": str(aside), "for": str(path)})
     os.rename(partial, dest)
     holding = path.parent / f".offload-{path.name}.old"
     os.rename(path, holding)

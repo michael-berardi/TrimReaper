@@ -98,6 +98,28 @@ class FixtureExpiry(Home):
         (base / "J-0071" / "fixtures").mkdir(parents=True)
         self.assertEqual(offload.fixture_refusal(base), "holds-fixtures-never-moved")
 
+    def test_repository_test_data_named_fixtures_moves(self):
+        repo = self.home / "dev" / "app"
+        (repo / "tests" / "fixtures").mkdir(parents=True)
+        (repo / "tests" / "fixtures" / "case.json").write_text("{}")
+        (repo / "fixtures").mkdir()
+        (repo / "fixtures" / "seed.sql").write_text("")
+        self.assertIsNone(offload.fixture_refusal(repo))
+        self.assertIsNone(offload.fixture_refusal(repo / "tests"))
+        worktree = self.home / "jobs" / "J-0072" / "wt"
+        (worktree / "scripts" / "fixtures").mkdir(parents=True)
+        self.assertIsNone(offload.fixture_refusal(worktree))
+
+    def test_job_scaffolding_fixtures_still_never_move(self):
+        holder = self.home / "dev" / "other"
+        (holder / "fixtures" / "ut-fixture-J-0073-ab").mkdir(parents=True)
+        self.assertEqual(offload.fixture_refusal(holder), "holds-fixtures-never-moved")
+        self.assertEqual(offload.fixture_refusal(holder / "fixtures"), "fixture-never-moved")
+        job = self.home / "jobs" / "J-0074"
+        (job / "fixtures").mkdir(parents=True)
+        self.assertEqual(offload.fixture_refusal(job / "fixtures"), "fixture-never-moved")
+        self.assertEqual(offload.fixture_refusal(job), "holds-fixtures-never-moved")
+
     def test_offload_refuses_child_named_fixtures_and_oversized_folders(self):
         base = self.home / "many"
         (base / "ut-fixture-x").mkdir(parents=True)
