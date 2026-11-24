@@ -2229,11 +2229,19 @@ def clean_regen_cargo(target: str) -> list[str]:
     return found
 
 
-def clean_regen_shipped(path: str) -> str | None:
+def clean_regen_shipped(path: str, root: str | None = None) -> str | None:
     """The path component that makes this a shipped copy rather than build output: a macOS bundle (`.app`, `.framework`, …), its
     `Contents` folder, or a vendored tree. Everything below one of those is shipped, not built here (core's REAP_BUNDLE_SUFFIXES rule),
-    so a `node_modules` or `__pycache__` inside it is never swept."""
-    for part in Path(path).parts:
+    so a `node_modules` or `__pycache__` inside it is never swept. Only the components BELOW `root` (the folder being swept) decide:
+    the same rule as the derived sweep (core's reap_derived_placement reads the parts below the item's root), so a folder that merely
+    sits under an ancestor named like a bundle or a vendored tree is judged by its own path, not by where the volume happens to be."""
+    parts = Path(path).parts[:-1]   # the candidate's own name is never the evidence: it is the folder that would be swept
+    if root is not None:
+        try:
+            parts = Path(path).relative_to(root).parts[:-1]
+        except ValueError:   # outside the root being swept there is no narrower path to read than the absolute one
+            pass
+    for part in parts:
         folded = reap_fold(part)
         if folded.endswith(REAP_BUNDLE_SUFFIXES) or folded == "contents" or folded in REAP_VENDORED_NAMES:
             return folded
@@ -2285,13 +2293,13 @@ def clean_repo_above(path: str, stop: str) -> tuple[str | None, bool]:
     return None, False
 
 
-def clean_regen_gates(path: str, kind: str, table: dict | None, repo: str | None = None) -> None:
+def clean_regen_gates(path: str, kind: str, table: dict | None, repo: str | None = None, root: str | None = None) -> None:
     """Why one regenerable folder stays, as ReapRefused: protected names and retention markers (clean_folder_gates), the manifest that
     makes a `node_modules` an install, no release artifact, git ignoring it and tracking none of it (a repository whose git dir is gone
     proves nothing and is skipped), no build tool running and no process holding it."""
     if reap_canon(path) != path:
         raise ReapRefused("not-canonical")
-    if clean_regen_shipped(path):   # a shipped bundle or vendored tree holds copies nothing rebuilds, whatever its owner's state
+    if clean_regen_shipped(path, root):   # a shipped bundle or vendored tree holds copies nothing rebuilds, whatever its owner's state
         raise ReapRefused("vendored-path")
     clean_folder_gates(path)
     manifests = CLEAN_REGEN_MANIFESTS.get(kind)
@@ -2319,6 +2327,9 @@ def clean_overflow_home_side(path: str, overflow: str) -> tuple[str | None, bool
     steps = os.path.relpath(original, home).split(os.sep)
     for index in range(len(steps)):   # a link in home holds nothing here: below it is the overflow copy, so the probe starts above the first link
         if os.path.islink(os.path.join(home, *steps[:index + 1])):
+            link, mirror = os.path.join(home, *steps[:index + 1]), os.path.join(overflow, *steps[:index + 1])
+            if os.path.realpath(link) != os.path.realpath(mirror):   # a link that points somewhere else says nothing about this item
+                raise ReapRefused("home-link-not-overflow")
             current = os.path.join(home, *steps[:index])
             break
     while reap_inside(current, home) and current != home:
@@ -2354,7 +2365,7 @@ def clean_overflow_gates(entry: dict, table: dict | None) -> None:
         repo, broken = clean_repo_above(path, overflow)
         if broken:
             raise ReapRefused("git-dir-gone:cannot-prove-untracked")
-        clean_regen_gates(path, entry["regen"], table, repo)
+        clean_regen_gates(path, entry["regen"], table, repo, root=overflow)
         clean_stale_tree(path, CLEAN_COORD_QUIET_HOURS, fresh=table is None)
         return
     for job in entry["jobs"]:

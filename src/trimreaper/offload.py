@@ -659,7 +659,7 @@ def regen_first(items: list, statuses: dict, dry_run: bool, now: float, only: st
                 nonlocal table
                 if not fresh and table is None:
                     table = core.reap_process_table()
-                clean.clean_regen_gates(target, kind, None if fresh else table, repo)
+                clean.clean_regen_gates(target, kind, None if fresh else table, repo, root=str(path))
                 clean.clean_stale_tree(target, window, fresh=True)
             try:
                 gates(False)

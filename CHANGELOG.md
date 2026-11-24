@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.23.8 (2026-11-24)
+
+- The shipped-copy rule reads the folder being swept, not the volume above it. `clean_regen_shipped` tested every component of the absolute
+  path, so a bundle-named ancestor of the sweep root (an overflow volume mounted under `Something.app`, a home folder inside a vendored tree)
+  made every candidate below it `vendored-path`; it now reads only the components below the root being swept, exactly as the derived sweep's
+  `reap_derived_placement` reads the parts below its item root, and the overflow and offload callers pass their root through
+  `clean_regen_gates`. (Review of 0.23.7, J-4653.)
+- A home-side link must point into the overflow copy to start the proof. `clean_overflow_home_side` stopped at the first link on the item's
+  home path and read the folders above it, without checking where the link went: a link to some third place would have proved the item from
+  the wrong tree. It now compares the link's real target with the overflow counterpart and refuses the item by name
+  (`home-link-not-overflow`) when they differ, which keeps it rather than sweeping it. (Review of 0.23.7, J-4653.)
+- The shipped-bundle test carries a positive control: a plain install beside the bundle in the same job folder that the same pass does sweep,
+  plus a test that a bundle-named ancestor of the sweep root is not evidence and a test for the home-link mismatch. Both new behaviour tests
+  fail against 0.23.7. (Review of 0.23.7, J-4653.)
+
 ## 0.23.7 (2026-11-23)
 
 - The overflow sweep never calls a shipped copy build output. A `node_modules` or `__pycache__` inside an application bundle (`.app`,

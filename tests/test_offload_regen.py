@@ -302,11 +302,15 @@ class OverflowRetention(Home):
         self.put(app, "ultrabot/__pycache__/a.pyc", b"p" * 100)
         self.put(self.mirror / "J-0102" / "wt" / "lib" / "App.framework" / "Versions" / "A", "package.json", b"{}")
         self.put(self.mirror / "J-0102" / "wt" / "lib" / "App.framework" / "Versions" / "A", "node_modules/x.js", b"n" * 8192)
+        # the positive control: a plain install BESIDE the bundle, in the same job folder, which the same pass does sweep
+        self.put(self.mirror / "J-0102" / "wt" / "site", "package.json", b"{}")
+        self.put(self.mirror / "J-0102" / "wt" / "site", "node_modules/x.js", b"n" * 8192)
         self.age(self.mirror / "J-0102", 3)   # quiet: every other gate would release it
         self.clean()
         self.assertTrue((app / "node" / "lib" / "node_modules" / "x" / "index.js").exists())
         self.assertTrue((app / "ultrabot" / "__pycache__" / "a.pyc").exists())
         self.assertTrue((self.mirror / "J-0102" / "wt" / "lib" / "App.framework" / "Versions" / "A" / "node_modules" / "x.js").exists())
+        self.assertFalse((self.mirror / "J-0102" / "wt" / "site" / "node_modules").exists(), "the pass must still sweep a plain install")
         self.assertFalse((self.mirror / "J-0102" / "wt" / "node_modules").exists())
 
     def test_the_gates_refuse_a_shipped_bundle_or_a_vendored_tree_by_name(self):
@@ -341,6 +345,34 @@ class OverflowRetention(Home):
         self.age(self.mirror / "J-0102" / "wt", 3)
         self.clean()
         self.assertTrue((nested / "node_modules" / "x.js").exists())
+
+    def test_a_bundle_name_above_the_swept_root_is_not_evidence(self):
+        # The absolute path is not the evidence: the rule reads the parts below the folder being swept (core's
+        # reap_derived_placement does the same), so a bundle-named ancestor of the overflow root cannot keep everything.
+        app_root = self.tmp / "Volumes" / "Drive" / "App.app" / "home"
+        self.put(app_root, ".cache/ut-coordinator/J-0102/wt/package.json", b"{}")
+        self.put(app_root, ".cache/ut-coordinator/J-0102/wt/node_modules/x.js", b"n" * 8192)
+        self.age(app_root / ".cache", 3)
+        entry = {"path": os.path.realpath(app_root / ".cache" / "ut-coordinator" / "J-0102" / "wt" / "node_modules"),
+                 "regen": "node_modules", "jobs": [], "command": []}
+        with mock.patch.object(clean, "reap_overflow_home", lambda: os.path.realpath(app_root)):
+            clean.clean_overflow_gates(entry, None)   # no vendored-path: nothing below the overflow root is a bundle
+            with self.assertRaisesRegex(core.ReapRefused, "vendored-path"):   # and a bundle below it still is
+                clean.clean_overflow_gates({"path": os.path.realpath(app_root / "App.app" / "x" / "node_modules"),
+                                            "regen": "node_modules", "jobs": [], "command": []}, None)
+
+    def test_a_home_link_that_points_somewhere_else_keeps_the_item(self):
+        home_job = self.home / ".cache" / "ut-coordinator" / "J-0102"
+        home_job.mkdir(parents=True)
+        elsewhere = self.home / "dev" / "elsewhere"
+        elsewhere.mkdir(parents=True)
+        os.symlink(str(elsewhere), str(home_job / "wt"))   # not into the overflow copy: below it proves nothing
+        nested = self.mirror / "J-0102" / "wt" / "packages" / "web"
+        self.put(nested, "package.json", b"{}")
+        self.put(nested, "node_modules/x.js", b"n" * 8192)
+        with self.assertRaisesRegex(core.ReapRefused, "home-link-not-overflow"):
+            clean.clean_overflow_gates({"path": os.path.realpath(nested / "node_modules"), "regen": "node_modules",
+                                        "jobs": [], "command": []}, None)
 
     def test_rule_is_part_of_the_steady_pass(self):
         self.assertIn("overflow-retention", clean.CLEAN_STEADY_NAMES)
