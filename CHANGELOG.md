@@ -2,10 +2,12 @@
 
 ## 0.23.6 (2026-11-23)
 
-- The cached retention re-derivation is bounded work. Proving a whole-folder candidate walks names only, one stored hold
-  may spend two seconds of it and a whole listing ten, and a hold the budget did not reach keeps its stored answer: a
-  scan that runs out of time keeps the folder, so a listing can never turn a partial scan into a disposable answer, and
-  a cached listing cannot spell a 120 s status guard from walks no one bounded. (Review of 0.23.5.)
+- The cached retention re-derivation is bounded work. Proving a whole-folder candidate walks names only, under a name-scan
+  deadline of two seconds for one stored hold and ten for a whole listing (the other cached checks keep their own entry
+  caps), and a hold the budget did not reach keeps its stored answer; a scan that runs out of time keeps the folder (it may
+  be relabelled to the hold that stopped it, `retention-preserved:ambiguous`, never to a disposable answer), so a listing
+  can never turn a partial scan into a reapable one and a cached listing cannot spell a 120 s status guard from walks no
+  one bounded. (Review of 0.23.5.)
 
 ## 0.23.5 (2026-11-23)
 
