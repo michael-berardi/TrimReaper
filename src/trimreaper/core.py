@@ -2764,7 +2764,10 @@ def reap_job_concluded(conn, job: dict) -> bool:
         allowed = reap_policy().get("concludedSources")
         if not isinstance(allowed, list) or not allowed or not all(isinstance(p, str) and p for p in allowed):
             return False
-        if not str(record.get("source") or "").startswith(tuple(allowed)):
+        source = str(record.get("source") or "")
+        if not source.startswith(tuple(allowed)):
+            return False
+        if source.startswith("verifier:") and not reap_verifier_accepted(conn, source):
             return False
     if reap_chain_clock(conn, job) is None:
         return False
@@ -2808,6 +2811,26 @@ def reap_release_output_inside(root: str) -> bool:
     except (OSError, ReapRefused):
         return True
     return False
+
+
+REAP_VERIFIER_ACCEPTED = re.compile(r"(?i)^\s*(?:verified|accepted)\b")
+
+
+def reap_verifier_accepted(conn, source: str) -> bool:
+    """A `verifier:<job> ...` cleanup source counts as acceptance only once that verifier job is done and its own summary leads with
+    an acceptance (verified:/accepted:). A verifier records before it reports, so a running one, one that later reported a rejection,
+    or one this store does not know proves nothing (0.24.3, review of the UltraTerm integration)."""
+    parts = source.split(":", 1)[1].split() if ":" in source else []
+    if not parts:
+        return False
+    try:
+        verifier = row(conn, "SELECT * FROM jobs WHERE id=?", (parts[0],))
+    except sqlite3.Error:
+        return False
+    if not verifier or verifier.get("status") != "done":
+        return False
+    summary = str(verifier.get("summary") or "")
+    return bool(REAP_VERIFIER_ACCEPTED.match(summary)) and not re.search(r"(?i)\brejected\b", summary[:200])
 
 
 def reap_recent_unconcluded(conn, scope: str, ids: list, seconds: float) -> list[str]:

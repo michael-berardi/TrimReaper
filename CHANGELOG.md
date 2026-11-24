@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.24.3 (2026-11-24)
+
+- A `verifier:<job>` cleanup source makes a job concluded only once that verifier job is done and its own summary leads with an
+  acceptance (`verified:`/`accepted:`). A verifier records before it reports, so a running verifier, one that later rejected, or one the
+  store does not know proves nothing. (Review of the UltraTerm integration.)
+
 ## 0.24.2 (2026-11-24)
 
 Re-review of 0.24.1:
