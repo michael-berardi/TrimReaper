@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.24.2 (2026-11-24)
+
+Re-review of 0.24.1:
+
+- `concludedSources` fails closed. With a cleanup store that records a `source`, an empty, missing or malformed allowlist concludes
+  nothing (a string is not iterated as characters), and a record that names no job (`job_id` empty) says nothing about any job.
+- Release output is looked for at every depth the clone scan reaches (a workspace package's `dist`, a nested Cargo `target`); a scan
+  that did not finish keeps the clone.
+- An evidence pass that lost its result receipt stops as `result-receipt-unavailable`, so the dead-owner review leaves it to a person.
+
 ## 0.24.1 (2026-11-24)
 
 Review of 0.24.0 (four blocking findings, all closed):

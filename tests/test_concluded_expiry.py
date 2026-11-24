@@ -9,6 +9,8 @@ from __future__ import annotations
 import contextlib
 import time
 
+from unittest import mock
+
 from trimreaper import core
 
 from helpers import Home
@@ -94,18 +96,42 @@ class ConcludedExpiry(Home):
                                   ("parked:J-0111", False), (None, False), ("verifier-done:J-0112", True), ("verifier:J-0112", True)):
             with self.subTest(source=source):
                 with contextlib.closing(self.state()) as conn, conn:
-                    conn.execute("UPDATE cleanup_records SET source=? WHERE terminal_id='t-11'", (source,))
+                    conn.execute("UPDATE cleanup_records SET source=?, job_id='J-0111' WHERE terminal_id='t-11'", (source,))
                 self.assertEqual(self.concluded("J-0111"), concluded)
 
     def test_another_jobs_record_on_a_shared_terminal_does_not_conclude(self):
         self.job("J-0113", terminal="t-13")
         self.source_column()
+        self.write_config({"policy": {"evidenceExpiryDays": 14, "cloneExpiryDays": 3, "concludedSources": ["verifier:"]}})
+        with contextlib.closing(self.state()) as conn, conn:
+            conn.execute("UPDATE cleanup_records SET source='verifier:J-0200' WHERE terminal_id='t-13'")
+        self.assertFalse(self.concluded("J-0113"))  # a record naming no job says nothing about this one
         with contextlib.closing(self.state()) as conn, conn:
             conn.execute("UPDATE cleanup_records SET job_id='J-0999' WHERE terminal_id='t-13'")
         self.assertFalse(self.concluded("J-0113"))
         with contextlib.closing(self.state()) as conn, conn:
             conn.execute("UPDATE cleanup_records SET job_id='J-0113' WHERE terminal_id='t-13'")
         self.assertTrue(self.concluded("J-0113"))
+
+    def test_a_store_with_sources_and_no_allowlist_concludes_nothing(self):
+        self.job("J-0120", terminal="t-20")
+        self.source_column()
+        with contextlib.closing(self.state()) as conn, conn:
+            conn.execute("UPDATE cleanup_records SET source='verifier:J-0121', job_id='J-0120' WHERE terminal_id='t-20'")
+        self.assertFalse(self.concluded("J-0120"))
+        for bad in ("verifier:", [], [""], [1]):
+            with self.subTest(bad=bad):
+                with mock.patch.object(core, "reap_policy", return_value={"concludedSources": bad}):
+                    self.assertFalse(self.concluded("J-0120"))
+        with mock.patch.object(core, "reap_policy", return_value={"concludedSources": ["verifier:"]}):
+            self.assertTrue(self.concluded("J-0120"))
+
+    def test_nested_release_output_keeps_the_clone(self):
+        self.job("J-0122")
+        clone = self.home / "dev" / "mono-J-0122"
+        (clone / "packages" / "app" / "dist").mkdir(parents=True)
+        (clone / "packages" / "app" / "dist" / "App-2.0.0.dmg").write_bytes(b"x")
+        self.assertFalse(core.reap_clone_expired(["J-0122"], str(clone)))
 
     def test_a_fresh_close_has_to_settle_too(self):
         self.job("J-0114", terminal="t-14")

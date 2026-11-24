@@ -2755,15 +2755,16 @@ def reap_job_concluded(conn, job: dict) -> bool:
     recorded = record.get("recorded_at")
     if not isinstance(recorded, (int, float)) or isinstance(recorded, bool) or now() - recorded < REAP_SETTLE_SECONDS:
         return False  # the close itself must have settled too, not only the finish
-    if "job_id" in record and record.get("job_id") not in (None, job["id"]):
-        return False  # the terminal's record is another job's: it says nothing about this one
-    allowed = reap_policy().get("concludedSources")
-    if allowed:
-        # A host that records why a worker was closed names the reasons that mean the work is over and accepted (a verifier's
-        # acceptance, a read-only finish). Anything else (a rejection with a finding still open, a deferred review, a parked
-        # worker) keeps the ordinary windows, and so does a store that cannot say why.
-        text = str(record.get("source") or "")
-        if not any(text.startswith(prefix) for prefix in allowed):
+    if "job_id" in record and record.get("job_id") != job["id"]:
+        return False  # the terminal's record is another job's, or names none: it says nothing about this one
+    if "source" in record:
+        # A host that records why a worker was closed must name the reasons that mean the work is over and accepted (a verifier's
+        # acceptance, a read-only finish). Anything else (a rejection with a finding still open, a deferred review, a parked worker)
+        # keeps the ordinary windows, and so does a missing or malformed allowlist: fail closed (0.24.2).
+        allowed = reap_policy().get("concludedSources")
+        if not isinstance(allowed, list) or not allowed or not all(isinstance(p, str) and p for p in allowed):
+            return False
+        if not str(record.get("source") or "").startswith(tuple(allowed)):
             return False
     if reap_chain_clock(conn, job) is None:
         return False
@@ -2786,18 +2787,25 @@ def reap_release_output_inside(root: str) -> bool:
     down, as in a workspace package) that is not provably plain web output, or a release-bearing Cargo target. Names and metadata
     only; anything unreadable counts as release output (keeps the clone)."""
     try:
+        found, incomplete = reap_scan_clone(root)
+        if incomplete:
+            return True  # a scan that did not finish cannot prove there is no release output
+        folders = {path for path, _ in found}
         tops = [root] + [os.path.join(root, n) for n in os.listdir(root) if not n.startswith(".") and os.path.isdir(os.path.join(root, n))
                          and not os.path.islink(os.path.join(root, n))][:200]
         for top in tops:
-            for name in REAP_RELEASE_OUTPUT_DIRS:
+            for name in REAP_RELEASE_OUTPUT_DIRS + ("target",):
                 folder = os.path.join(top, name)
-                if os.path.isdir(folder) and not os.path.islink(folder) and reap_dist_keep_reason(folder) is not None:
+                if os.path.isdir(folder) and not os.path.islink(folder):
+                    folders.add(folder)
+        for folder in sorted(folders):
+            name = os.path.basename(folder)
+            if name == "target":
+                if reap_target_release_bearing(folder) and not reap_target_release_superseded(folder):
                     return True
-            target = os.path.join(top, "target")
-            if os.path.isdir(target) and not os.path.islink(target) and reap_target_release_bearing(target) \
-                    and not reap_target_release_superseded(target):
+            elif name in REAP_RELEASE_OUTPUT_DIRS and reap_dist_keep_reason(folder) is not None:
                 return True
-    except OSError:
+    except (OSError, ReapRefused):
         return True
     return False
 
@@ -8027,7 +8035,8 @@ def evidence_parent(root_fd: int, rel: str, marked: bool | None = None) -> int:
 def evidence_stop(job_id: str, out: dict) -> None:
     held = getattr(REAP_CLEANUP_OWNER, "held", None)
     if held:
-        held["stopped"] = held.get("stopped") or f"evidence-interrupted:{job_id}:after-{out['expired']}-files"
+        lost = out.get("stopped") == "result-receipt-unavailable"  # named as such, so the dead-owner review leaves it to a person
+        held["stopped"] = held.get("stopped") or ("result-receipt-unavailable" if lost else f"evidence-interrupted:{job_id}:after-{out['expired']}-files")
 
 
 def evidence_expire_job(conn, job: dict, days: int, dry_run: bool, actor: str) -> dict:

@@ -62,8 +62,9 @@ DEFAULT_POLICY = {
     # continuation) loses its worktrees, clones and cache folders at once instead of after cloneExpiryDays/evidenceExpiryDays.
     # Every other gate still applies and unsaved work is archived first. false = the day windows apply to every job.
     "concludedExpiry": True,
-    # For a host whose cleanup records say why a worker was closed (`source`): only these prefixes make a job concluded, e.g.
-    # ["verifier:", "verifier-done:", "readonly-done:"]. Empty: any `closed` record of the job's own terminal does.
+    # For a host whose cleanup records say why a worker was closed (a `source` column): only these prefixes make a job concluded,
+    # e.g. ["verifier:", "readonly-done:"]. Empty or missing with such a store: nothing is concluded (fail closed). A store without
+    # a `source` column (standalone TrimReaper) needs none: a `closed` record of the job's own terminal does.
     "concludedSources": [],
     # "remove": a whole clone's .env*/.dev.vars*/.wrangler/.vercel copies are archived owner-only and go with it.
     # Anything else (the default "keep") keeps every clone that holds one.
