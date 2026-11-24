@@ -295,6 +295,53 @@ class OverflowRetention(Home):
         self.assertFalse((self.mirror / "J-0101").exists())
         self.assertFalse(os.path.lexists(home_job / "wt"))
 
+    def test_regenerable_output_inside_a_shipped_bundle_on_the_overflow_is_not_swept(self):
+        app = self.mirror / "J-0102" / "wt" / "App.app" / "Contents" / "Resources"
+        self.put(app, "node/lib/package.json", b"{}")   # every other gate would pass: only the bundle keeps it
+        self.put(app, "node/lib/node_modules/x/index.js", b"n" * 8192)
+        self.put(app, "ultrabot/__pycache__/a.pyc", b"p" * 100)
+        self.put(self.mirror / "J-0102" / "wt" / "lib" / "App.framework" / "Versions" / "A", "package.json", b"{}")
+        self.put(self.mirror / "J-0102" / "wt" / "lib" / "App.framework" / "Versions" / "A", "node_modules/x.js", b"n" * 8192)
+        self.age(self.mirror / "J-0102", 3)   # quiet: every other gate would release it
+        self.clean()
+        self.assertTrue((app / "node" / "lib" / "node_modules" / "x" / "index.js").exists())
+        self.assertTrue((app / "ultrabot" / "__pycache__" / "a.pyc").exists())
+        self.assertTrue((self.mirror / "J-0102" / "wt" / "lib" / "App.framework" / "Versions" / "A" / "node_modules" / "x.js").exists())
+        self.assertFalse((self.mirror / "J-0102" / "wt" / "node_modules").exists())
+
+    def test_the_gates_refuse_a_shipped_bundle_or_a_vendored_tree_by_name(self):
+        app = self.mirror / "J-0102" / "wt" / "App.app" / "Contents" / "Resources" / "node_modules"
+        self.put(app, "x/index.js")
+        bundled = self.mirror / "J-0102" / "wt" / "third_party" / "node_modules"
+        self.put(bundled, "x/index.js")
+        for path in (app, bundled):
+            with self.assertRaisesRegex(core.ReapRefused, "vendored-path"):
+                clean.clean_overflow_gates({"path": os.path.realpath(path), "regen": "node_modules", "jobs": [], "command": []}, None)
+
+    def test_regenerable_output_below_a_home_link_is_proven_not_held(self):
+        home_job = self.home / ".cache" / "ut-coordinator" / "J-0102"
+        home_job.mkdir(parents=True)
+        os.symlink(str(self.mirror / "J-0102" / "wt"), str(home_job / "wt"))
+        nested = self.mirror / "J-0102" / "wt" / "packages" / "web"
+        self.put(nested, "package.json", b"{}")
+        self.put(nested, "node_modules/x.js", b"n" * 8192)
+        self.age(self.mirror / "J-0102" / "wt", 3)
+        self.clean()
+        self.assertFalse((nested / "node_modules").exists())
+        self.assertTrue((nested / "package.json").exists())
+
+    def test_a_marker_above_a_home_link_still_keeps_regenerable_output_below_it(self):
+        home_job = self.home / ".cache" / "ut-coordinator" / "J-0102"
+        home_job.mkdir(parents=True)
+        (home_job / ".ut-retention-customer").write_bytes(b"")
+        os.symlink(str(self.mirror / "J-0102" / "wt"), str(home_job / "wt"))
+        nested = self.mirror / "J-0102" / "wt" / "packages" / "web"
+        self.put(nested, "package.json", b"{}")
+        self.put(nested, "node_modules/x.js", b"n" * 8192)
+        self.age(self.mirror / "J-0102" / "wt", 3)
+        self.clean()
+        self.assertTrue((nested / "node_modules" / "x.js").exists())
+
     def test_rule_is_part_of_the_steady_pass(self):
         self.assertIn("overflow-retention", clean.CLEAN_STEADY_NAMES)
         self.assertIn("overflow-retention", clean.CLEAN_NAMES)

@@ -2229,9 +2229,21 @@ def clean_regen_cargo(target: str) -> list[str]:
     return found
 
 
+def clean_regen_shipped(path: str) -> str | None:
+    """The path component that makes this a shipped copy rather than build output: a macOS bundle (`.app`, `.framework`, …), its
+    `Contents` folder, or a vendored tree. Everything below one of those is shipped, not built here (core's REAP_BUNDLE_SUFFIXES rule),
+    so a `node_modules` or `__pycache__` inside it is never swept."""
+    for part in Path(path).parts:
+        folded = reap_fold(part)
+        if folded.endswith(REAP_BUNDLE_SUFFIXES) or folded == "contents" or folded in REAP_VENDORED_NAMES:
+            return folded
+    return None
+
+
 def clean_regen_find(top: str, errors: list) -> list[tuple[str, str]]:
     """(path, kind) of every regenerable folder below `top`, names only, never entering one, a repository's .git, a protected name, a
-    vendored copy or a link. Bounded by entries and time; a bound hit is named in `errors` and what was found stays."""
+    vendored copy, a shipped bundle's Contents tree or a link. Bounded by entries and time; a bound hit is named in `errors` and what
+    was found stays."""
     found, count, deadline = [], 0, time.monotonic() + CLEAN_REGEN_SECONDS
     stack = [(top, 0)]
     while stack:
@@ -2245,8 +2257,9 @@ def clean_regen_find(top: str, errors: list) -> list[tuple[str, str]]:
             break
         for entry in entries:
             name = entry.name
-            if reap_protected(name) or reap_is_git(name) or name.lower() in REAP_VENDORED_NAMES or entry.is_symlink() \
-                    or not clean_directory(entry, "regenerable-output", errors):
+            folded = reap_fold(name)
+            if reap_protected(name) or reap_is_git(name) or folded in REAP_VENDORED_NAMES or folded.endswith(REAP_BUNDLE_SUFFIXES) \
+                    or folded == "contents" or entry.is_symlink() or not clean_directory(entry, "regenerable-output", errors):
                 continue
             if name == "target":
                 found += [(path, "target") for path in clean_regen_cargo(entry.path)]
@@ -2278,6 +2291,8 @@ def clean_regen_gates(path: str, kind: str, table: dict | None, repo: str | None
     proves nothing and is skipped), no build tool running and no process holding it."""
     if reap_canon(path) != path:
         raise ReapRefused("not-canonical")
+    if clean_regen_shipped(path):   # a shipped bundle or vendored tree holds copies nothing rebuilds, whatever its owner's state
+        raise ReapRefused("vendored-path")
     clean_folder_gates(path)
     manifests = CLEAN_REGEN_MANIFESTS.get(kind)
     if manifests and not any(os.path.isfile(os.path.join(os.path.dirname(path), m)) for m in manifests):
@@ -2301,6 +2316,11 @@ def clean_overflow_home_side(path: str, overflow: str) -> tuple[str | None, bool
     home = reap_canon(reap_home())
     original = os.path.join(home, os.path.relpath(path, overflow))
     current, repo, broken = original, None, False   # the home folder itself too: a keepFolder job root stays a real folder in home
+    steps = os.path.relpath(original, home).split(os.sep)
+    for index in range(len(steps)):   # a link in home holds nothing here: below it is the overflow copy, so the probe starts above the first link
+        if os.path.islink(os.path.join(home, *steps[:index + 1])):
+            current = os.path.join(home, *steps[:index])
+            break
     while reap_inside(current, home) and current != home:
         if os.path.isdir(current) and not os.path.islink(current):
             retention = reap_cache_retention(current)

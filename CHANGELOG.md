@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.23.7 (2026-11-23)
+
+- The overflow sweep never calls a shipped copy build output. A `node_modules` or `__pycache__` inside an application bundle (`.app`,
+  `.framework`, `.xcframework`, `.appex`, `.bundle`), its `Contents` tree, or a vendored tree (`vendor`, `third_party`, `runtime`, …) is no
+  longer discovered there, and a gate refuses such a path by name (`vendored-path`) should discovery ever name one; the rule is the one the
+  reaper already applies to a worktree's derived dirs. 2,509 items (592 MB) of an unzipped UltraTerm build on an overflow volume were held as
+  `retention:ambiguous`; the real cause was the second fix below, and sweeping them would have broken the staged app.
+- A home-side link no longer makes the proof of what stayed in home unreadable. A keepFolder job keeps its overflow folder as a symlink in
+  home; the proof walks the folder's home path to look for a repository or a retention marker above it, and it used to open the components
+  *below* that link, which are the overflow copy's own folders: a link anywhere on the path (the reader refuses every symlink component, by
+  design) made every such folder unprovable, so each regenerable folder under a keepFolder link stayed `retention:ambiguous` for good. The walk
+  now starts at the first link's parent and reads only the real home folders above it; a marker there still keeps the folder, and an item
+  inside a shipped bundle is not discovered at all.
+
 ## 0.23.6 (2026-11-23)
 
 - The cached retention re-derivation is bounded work. Proving a whole-folder candidate walks names only, under a name-scan
