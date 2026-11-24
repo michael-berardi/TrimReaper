@@ -58,6 +58,10 @@ DEFAULT_POLICY = {
     "compressLogsRoots": [],
     # "archive": save work no remote holds before an expired folder goes; anything else keeps such folders.
     "cloneArchive": "archive",
+    # A job whose work is conclusively over (finished, settled, its worker's cleanup record closed after verification, no live
+    # continuation) loses its worktrees, clones and cache folders at once instead of after cloneExpiryDays/evidenceExpiryDays.
+    # Every other gate still applies and unsaved work is archived first. false = the day windows apply to every job.
+    "concludedExpiry": True,
     # "remove": a whole clone's .env*/.dev.vars*/.wrangler/.vercel copies are archived owner-only and go with it.
     # Anything else (the default "keep") keeps every clone that holds one.
     "cloneProtectedCopies": "keep",
@@ -235,6 +239,8 @@ def check_policy(policy: dict) -> None:
     if unknown:
         raise HostError(f"unknown policy keys: {', '.join(unknown)}", "see docs/CONFIGURATION.md for the policy keys")
     merged = {**DEFAULT_POLICY, **policy}
+    if not isinstance(merged["concludedExpiry"], bool):
+        raise HostError(f"policy concludedExpiry must be true or false, not {json.dumps(merged['concludedExpiry'])}")
     if not isinstance(merged["autoReap"], bool):
         raise HostError(f"policy autoReap must be true or false, not {json.dumps(merged['autoReap'])}")
     if not isinstance(merged["compressLogsRoots"], list) or not all(isinstance(r, str) and r for r in merged["compressLogsRoots"]):

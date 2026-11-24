@@ -2728,9 +2728,41 @@ def reap_jobs_finished_before(ids: list, seconds: float) -> bool:
             if not job:
                 return False
             clock = reap_job_finished_clock(conn, job)
-            if not clock or now() - clock < seconds:
+            if not clock or (now() - clock < seconds and not reap_job_concluded(conn, job)):
                 return False
     return True
+
+
+def reap_job_concluded(conn, job: dict) -> bool:
+    """`concludedExpiry` (default on): a job whose work is conclusively over needs no waiting window. Its folders (worktrees, clones,
+    cache subfolders) age out at once instead of after cloneExpiryDays / evidenceExpiryDays, which kept 30 GB of finished jobs'
+    worktrees on a 90%-full disk (0.24.0). Concluded means all of: the job is done, failed or cancelled (an interrupted job only through
+    its finished continuation chain); it settled (REAP_SETTLE_SECONDS); its worker terminal has a `closed` cleanup record (written once a
+    verifier accepted or rejected the job, or the job ended and its worker was closed through the guarded cleanup; a job with no
+    terminal never earns this shortcut); and its continuation chain has no live job. Every other gate still runs on every folder
+    (holders, claims, pins, retention markers, protected names, git proofs; unsaved work is archived first)."""
+    if not reap_policy().get("concludedExpiry", True):
+        return False
+    clock = reap_job_finished_clock(conn, job)
+    if not clock or now() - clock < REAP_SETTLE_SECONDS:
+        return False
+    terminal = job.get("terminal_id")
+    if not terminal:
+        return False
+    record = row(conn, "SELECT status FROM cleanup_records WHERE terminal_id=?", (terminal,))
+    if not record or record.get("status") != "closed":
+        return False
+    return reap_chain_clock(conn, job) is not None
+
+
+def reap_recent_unconcluded(conn, scope: str, ids: list, seconds: float) -> list[str]:
+    """reap_recent_users, minus the later users that concluded (reap_job_concluded)."""
+    out = []
+    for job_id in reap_recent_users(scope, ids, seconds):
+        job = row(conn, "SELECT * FROM jobs WHERE id=?", (job_id,))
+        if not job or not reap_job_concluded(conn, job):
+            out.append(job_id)
+    return out
 
 
 def reap_scratch_unsaved_ready(item: dict) -> bool:
@@ -4175,12 +4207,19 @@ def reap_clone_expired(ids: list, scope: str | None = None) -> bool:
         return False
     with db() as conn:
         found = [row(conn, "SELECT * FROM jobs WHERE id=?", (i,)) for i in ids]
+        early = False
         for job in found:
             if not job:
                 return False
             clock = reap_job_finished_clock(conn, job)
-            if not clock or now() - clock < days * 86400:
+            if not clock:
                 return False
+            if now() - clock < days * 86400:
+                if not reap_job_concluded(conn, job):
+                    return False
+                early = True
+        if early:  # a later user of the clone must have concluded too, or be past the window
+            return not (scope and reap_recent_unconcluded(conn, scope, ids, days * 86400))
     return not (scope and reap_recent_users(scope, ids, days * 86400))
 
 
@@ -5048,7 +5087,7 @@ def reap_job_unsaved_window(job_id: str | None) -> bool:
         if not job:
             return False
         clock = reap_job_finished_clock(conn, job)
-    return bool(clock) and now() - clock >= days * 86400
+        return bool(clock) and (now() - clock >= days * 86400 or reap_job_concluded(conn, job))
 
 
 def reap_scratch_expired(job_id: str | None) -> bool:
@@ -5062,7 +5101,7 @@ def reap_scratch_expired(job_id: str | None) -> bool:
         if not job:
             return False
         clock = reap_job_finished_clock(conn, job)
-    return bool(clock) and now() - clock >= days * 86400
+        return bool(clock) and (now() - clock >= days * 86400 or reap_job_concluded(conn, job))
 
 
 # ---- protected leaves: identities before and after, from lstat and listings only -------------------------------------
@@ -6202,7 +6241,8 @@ def reap_authority(item: dict) -> dict:
             chain = successors.get(chain)
     if item["class"] == "job-clone-root":
         window = reap_policy().get("cloneExpiryDays", 3)
-        recent = reap_recent_users(scope, ids, window * 86400) if isinstance(window, int) and not isinstance(window, bool) and window > 0 else []
+        with db() as conn:
+            recent = reap_recent_unconcluded(conn, scope, ids, window * 86400) if isinstance(window, int) and not isinstance(window, bool) and window > 0 else []
         if recent:
             raise ReapRefused(f"recently-used-by:{recent[0]}")  # a later job worked in this clone: it expires cloneExpiryDays after that job finished
     broad = reap_collection_roots()
@@ -6629,8 +6669,10 @@ def reap_dead_owner_report(previous: dict | None, phase: str, state: str | None 
     The report lists what the receipts prove; paths the run never reached have no receipt and are re-gated by the next sweep.
     A 'started' run killed after it wrote receipts (no final note: a timeout, a crash, a reboot) is reviewed the same way
     (0.23.10: one tick killed at 11:10 with 7 refused receipts blocked 125 automatic cleans for five hours at 90% disk); a
-    'started' run without receipts is reap_dead_owner_note's."""
-    if phase not in ("interrupted", "started") or not isinstance(previous, dict):
+    'started' run without receipts is reap_dead_owner_note's. A 'stopped' run (it stopped itself: an evidence pass that hit a changed
+    file, a partial removal) whose owner is gone is reviewed the same way: 0.23.10 still left every clean refused after one stopped
+    evidence pass. Its unfinished paths are listed and preserved; the next sweep re-gates them."""
+    if phase not in ("interrupted", "started", "stopped") or not isinstance(previous, dict):
         return None
     state = state or reap_owner_pid_state(previous)
     if state not in ("gone", "reused"):

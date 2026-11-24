@@ -197,14 +197,25 @@ class DeadOwnerAcknowledge(unittest.TestCase):
                     self.fail("entered with an unknown owner")
         self.assertFalse([n for n in self.journal() if n.get("auto")])
 
-    def test_a_stopped_handoff_still_needs_a_person_even_with_a_dead_owner(self):
+    def test_a_stopped_handoff_of_a_dead_owner_is_reviewed_from_its_receipts(self):
+        # 0.23.11: a stopped run (an evidence pass that met a changed file) blocked every clean until a person acknowledged it
         run = self.interrupted_run(self.dead_pid())
         fd = os.open(self.lock, os.O_WRONLY | os.O_APPEND)
         os.write(fd, (json.dumps({"run": run, "pid": self.dead_pid(), "scope": "clean", "phase": "stopped", "at": core.iso()}) + "\n").encode())
         os.close(fd)
-        with self.assertRaisesRegex(core.ReapRefused, "cleanup-handoff-incomplete"):
-            with core.reap_cleanup_owner("clean"):
-                self.fail("a deliberate stop was auto-acknowledged")
+        with core.reap_cleanup_owner("clean"):
+            pass
+        self.assertTrue([n for n in self.journal() if n.get("auto") and n.get("run") == run])
+
+    def test_a_stopped_handoff_of_a_live_or_unknown_owner_still_needs_a_person(self):
+        run = self.interrupted_run(self.dead_pid())
+        fd = os.open(self.lock, os.O_WRONLY | os.O_APPEND)
+        os.write(fd, (json.dumps({"run": run, "pid": os.getpid(), "scope": "clean", "phase": "stopped", "at": core.iso()}) + "\n").encode())
+        os.close(fd)
+        with mock.patch.object(core, "reap_owner_pid_state", return_value="unknown"):
+            with self.assertRaisesRegex(core.ReapRefused, "cleanup-handoff-incomplete"):
+                with core.reap_cleanup_owner("clean"):
+                    self.fail("a stop by an owner not proved dead was auto-acknowledged")
 
 
 class NoteEpochOffsetForms(unittest.TestCase):

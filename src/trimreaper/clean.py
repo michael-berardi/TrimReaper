@@ -642,6 +642,19 @@ def clean_jobs_finished(ids: list, path: str) -> bool:
         return False
 
 
+def clean_jobs_concluded(ids: list) -> bool:
+    """Every job named is concluded (reap_job_concluded). Read without raising: anything unreadable is not concluded."""
+    try:
+        with db() as conn:
+            for job_id in ids:
+                job = row(conn, "SELECT * FROM jobs WHERE id=?", (job_id,))
+                if not job or not reap_job_concluded(conn, job):
+                    return False
+        return True
+    except Exception:
+        return False
+
+
 def clean_job_claims(path: str) -> None:
     """No unfinished job declares the folder, a folder inside it, or a folder around it (job add --cwd/--worktree)."""
     with db() as conn:
@@ -678,6 +691,8 @@ def clean_worktree_gates(entry: dict, idle_days: float, table: dict | None, arch
     own_ids = reap_job_ids(os.path.basename(path))
     if own_ids and clean_jobs_finished(own_ids, path):
         limit = min(idle_days, CLEAN_PROJECT_JOB_IDLE_HOURS / 24)
+        if clean_jobs_concluded(own_ids):
+            limit = min(limit, REAP_SETTLE_SECONDS / 86400)  # concluded work: only a short quiet check, no hours-long wait (0.24.0)
     if idle < limit:
         raise ReapRefused(f"recent:{idle:.1f}d-of-{limit:g}d")
     clean_job_claims(path)
@@ -3034,7 +3049,7 @@ def clean_job_sweep(rung: dict, dry_run: bool, run_id: str, goal_met=None) -> di
         try:
             with reap_escalated(windows, spec["pinned"] or None, spec["keepUnsaved"]), db() as conn:
                 clock = reap_job_finished_clock(conn, job)
-                if not clock or now() - clock < spec["hours"] * 3600:
+                if not clock or (now() - clock < spec["hours"] * 3600 and not reap_job_concluded(conn, job)):
                     continue
                 blocker = reap_job_blocker(conn, job, live_ids, live_idle)
                 if blocker:  # sized from the audit the tick last made (an estimate, never a walk): this is what the job holds back

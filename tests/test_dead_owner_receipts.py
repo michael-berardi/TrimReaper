@@ -65,6 +65,14 @@ class DeadOwnerReceipts(unittest.TestCase):
         self.assertEqual((summary["deleted"], summary["retained"]), (1, 1))
         self.assertIsNone(core.reap_ack_report_problem("a701f519f965", text.encode()))
 
+    def test_stopped_run_of_a_dead_owner_gets_a_generated_report(self):
+        self.previous["run"] = "796f0bbd3e7c"
+        self._result("796f0bbd3e7c", "refused", "/home/x/J-2/kept")
+        generated = core.reap_dead_owner_report(self.previous, "stopped")
+        self.assertIsNotNone(generated)
+        self.assertIsNone(core.reap_ack_report_problem("796f0bbd3e7c", generated[0].encode()))
+        self.assertIsNone(core.reap_dead_owner_report(self.previous, "stopped", state="alive"))
+
     def test_live_started_owner_is_never_reviewed(self):
         self.previous["run"] = "a701f519f965"
         self._result("a701f519f965", "refused", "/home/x/J-1/kept")

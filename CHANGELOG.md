@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.24.0 (2026-11-24)
+
+- Concluded jobs lose their folders at once (`concludedExpiry`, default on). A finished job's worktrees, clones and cache folders waited
+  `cloneExpiryDays` (3) or `evidenceExpiryDays` (14), and the clean pass's worktree rule a further day of quiet, even after a verifier
+  had accepted or rejected the job and its worker was closed: about 30 GB of such folders sat on a 90%-full disk. A job counts as
+  concluded when it is done, failed or cancelled (an interrupted one only through its finished continuation chain), has settled, its
+  worker terminal's cleanup record is `closed`, and no job in its continuation chain is live. Its folders then go in the next pass;
+  every other gate still runs (open handles, claims, pins, retention markers, protected names, git proofs, unsaved work archived first).
+  `concludedExpiry: false` restores the day windows.
+- A `stopped` cleanup handoff whose owner process is gone is reviewed from its receipts like an `interrupted` one, instead of blocking
+  every later clean until a person acknowledges it (30 such manual acknowledgments so far; one stopped evidence pass blocked cleaning
+  again within the hour after 0.23.10). A live or unknown owner still needs a person.
+
 ## 0.23.10 (2026-11-24)
 
 - A killed cleanup run no longer blocks every later clean. A `started` handoff whose owner process is gone was auto-reviewed only when

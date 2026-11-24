@@ -28,6 +28,7 @@ Paths are absolute or start with `~/`. Here `~` is the reap home (`home`), not t
 |---|---|---|
 | `autoReap` | `true` | `trimreaper tick` reaps only while this is on. |
 | `cloneExpiryDays` | `3` | A whole clone goes this many days after every job named in it finished, and after any later job that worked in it finished. `0`: clones never expire. |
+| `concludedExpiry` | `true` | A job that is done, failed or cancelled, settled, whose worker terminal's cleanup record is `closed` (verified or rejected, worker closed) and whose continuation chain has no live job, loses its worktrees, clones and cache folders in the next pass instead of after `cloneExpiryDays`/`evidenceExpiryDays`. Every other gate still applies; unsaved work is archived first. `false` = the day windows for every job. |
 | `evidenceExpiryDays` | `14` | Screenshots, recordings, traces and logs of a finished job expire after this many days. Also the idle time for scratch folders. `0` turns both off. |
 | `markedEvidenceExpiryDays` | `5` | Marked bulky job-cache evidence expires strictly after this many days from terminal completion, only with an existing regular, owned `report.md`. Keeps reports, summary/outcome, handoffs, receipts and retained material. Uses the guarded folder reaper and automatic ticks. `0` disables marked expiry without changing unmarked expiry. |
 | `archiveExpiryDays` | `30` | A job's archive goes this many days after it became the only copy of its clone. `0`: archives are kept. |
