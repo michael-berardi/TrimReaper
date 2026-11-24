@@ -407,7 +407,13 @@ class ParentActive(KeepFolder):
             if str(path) == str(self.base / "J-0001"):
                 raise PermissionError("denied")
             return real(path)
-        with mock.patch.object(offload.os, "listdir", side_effect=listing):
+        # Python 3.12's Path.iterdir calls os.listdir, while older versions use os.scandir. Keep candidate
+        # discovery version-independent so the mock reaches only parent_active's listing of the unreadable parent.
+        def iterdir_via_scandir(path):
+            with os.scandir(path) as it:
+                return [Path(entry.path) for entry in it]
+        with mock.patch.object(Path, "iterdir", iterdir_via_scandir), \
+             mock.patch.object(offload.os, "listdir", side_effect=listing):
             _, kept = self.moved_and_kept()
         self.assertEqual(kept[str(self.base / "J-0001" / "wt")], "parent-active: unreadable PermissionError")
 
