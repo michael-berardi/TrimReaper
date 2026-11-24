@@ -641,3 +641,23 @@ class HolderBoundaries(Base):
         core.reap_holders(root, root, self.table(files=files))
         with self.assertRaisesRegex(core.ReapRefused, "cwd:5"):
             core.reap_holders(root, root, self.table(files=[("5", "zsh", "cwd", "/jobs/J-0001/wt")]))
+
+
+class OffloadGoal(Base):
+    """Delete first: offload is the fallback, so its own goal (offload.toPercent) may sit above cleanToPercent (0.23.10)."""
+
+    def test_to_percent_overrides_clean_to_percent(self):
+        disk = {"usedBytes": 80, "freeBytes": 20, "usedPercent": 80}
+        with mock.patch.object(host, "disk_state", return_value=disk), \
+                mock.patch.object(host, "load_policy", return_value={"cleanToPercent": 60}):
+            self.assertFalse(offload.goal_met(0))
+            self.assertTrue(offload.goal_met(0, 80))
+            self.assertFalse(offload.goal_met(0, 79))
+            self.assertTrue(offload.goal_met(5, 75))
+
+    def test_to_percent_is_checked(self):
+        for bad in (0, 101, "80", True):
+            with self.subTest(bad=bad):
+                with self.assertRaisesRegex(host.HostError, "offload.toPercent"):
+                    offload.check({"root": "/Volumes/X/Overflow", "toPercent": bad}, Path("config.json"))
+        offload.check({"root": "/Volumes/X/Overflow", "toPercent": 80}, Path("config.json"))

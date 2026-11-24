@@ -64,7 +64,7 @@ RELEASE_ARTIFACTS = ["out", "dist", "release", "unz"]  # children holding built 
 RELEASE_MARKERS = ["wt"]  # a sibling that marks a folder as a release workspace (its worktree)
 RELEASE_NAME = r"(?i)^(rel|release)([-_.\d]|$)|^v\d+\.\d+"  # folder names that read as a release
 MAX_REPOS = 50  # more git repositories than this inside one folder cannot all be proved idle in a pass: it stays
-SETTING_KEYS = {"root", "minFreeGB", "quietMinutes", "jobStatusCommand", "sources", "releaseArtifacts", "releaseMarkers", "releaseNamePattern"}
+SETTING_KEYS = {"root", "minFreeGB", "toPercent", "quietMinutes", "jobStatusCommand", "sources", "releaseArtifacts", "releaseMarkers", "releaseNamePattern"}
 
 
 def settings() -> dict | None:
@@ -72,6 +72,7 @@ def settings() -> dict | None:
     if not cfg:
         return None
     return {"root": host.expand(cfg["root"]), "minFreeGB": cfg.get("minFreeGB", 20), "quietMinutes": cfg.get("quietMinutes", 60),
+            "toPercent": cfg.get("toPercent"),
             "jobStatusCommand": cfg.get("jobStatusCommand"), "sources": cfg.get("sources", []),
             "release": {"artifacts": [n.lower() for n in cfg.get("releaseArtifacts", RELEASE_ARTIFACTS)],
                         "markers": [n.lower() for n in cfg.get("releaseMarkers", RELEASE_MARKERS)],
@@ -110,7 +111,7 @@ def job_of(name: str) -> str | None:
 def check(cfg: dict, path: Path) -> None:
     """Config shape, named failures."""
     if not isinstance(cfg, dict) or set(cfg) - SETTING_KEYS:
-        raise host.HostError(f"{path}: offload takes root, minFreeGB, quietMinutes, jobStatusCommand, sources, releaseArtifacts, "
+        raise host.HostError(f"{path}: offload takes root, minFreeGB, toPercent, quietMinutes, jobStatusCommand, sources, releaseArtifacts, "
                              "releaseMarkers and releaseNamePattern only")
     for key in ("releaseArtifacts", "releaseMarkers"):
         names = cfg.get(key, [])
@@ -130,6 +131,9 @@ def check(cfg: dict, path: Path) -> None:
     if not isinstance(cfg.get("root"), str):
         raise host.HostError(f"{path}: offload.root must be a path")
     host.path_form(cfg["root"])
+    goal = cfg.get("toPercent")
+    if goal is not None and (isinstance(goal, bool) or not isinstance(goal, (int, float)) or not 0 < goal <= 100):
+        raise host.HostError(f"{path}: offload.toPercent must be a used percent above 0 and at most 100, not {json.dumps(goal)}")
     free = cfg.get("minFreeGB", 20)
     if isinstance(free, bool) or not isinstance(free, (int, float)) or free < 0:
         raise host.HostError(f"{path}: offload.minFreeGB must be a number of at least 0")
@@ -748,7 +752,7 @@ def offload_pass(dry_run: bool = False, limit_bytes: int | None = None, only: st
             continue
         if free - planned - item["bytes"] < floor:
             judged[item["path"]] = "overflow-volume-would-drop-below-minFreeGB"
-        elif not everything and goal_met(planned):
+        elif not everything and goal_met(planned, cfg.get("toPercent")):
             judged[item["path"]] = "disk-goal-met"
         elif limit_bytes is not None and planned >= limit_bytes:
             judged[item["path"]] = "pass-limit-reached"
@@ -877,12 +881,14 @@ def prune_orphans(cfg: dict, statuses: dict, dry_run: bool) -> dict:
     return {"pruned": pruned, "prunedBytes": freed, "kept": kept[:60], "keptCount": len(kept), "errors": errors}
 
 
-def goal_met(planned_bytes: int) -> bool:
-    """True once the home disk is at or under cleanToPercent, counting what this pass already planned to move."""
+def goal_met(planned_bytes: int, to_percent: float | None = None) -> bool:
+    """True once the home disk is at or under the offload goal, counting what this pass already planned to move. The goal is
+    `offload.toPercent` when set, else cleanToPercent. Deleting comes first (the clean pass runs before offload and goes to
+    cleanToPercent); a higher toPercent makes offload a fallback that only moves what deletion could not free (0.23.10)."""
     disk = host.disk_state()
     if not disk or not disk.get("usedBytes") or disk.get("freeBytes") is None:
         return False
-    goal = host.load_policy()["cleanToPercent"]
+    goal = to_percent if to_percent is not None else host.load_policy()["cleanToPercent"]
     return (disk["usedBytes"] - planned_bytes) / (disk["usedBytes"] + disk["freeBytes"]) * 100 <= goal
 
 

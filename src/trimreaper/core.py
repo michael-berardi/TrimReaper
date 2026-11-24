@@ -6626,8 +6626,11 @@ def reap_dead_owner_report(previous: dict | None, phase: str, state: str | None 
     """An interrupted cleanup run whose owner process is provably gone (no such process, or the pid now belongs to a process that started
     later) gets a generated acknowledgment report built from the run's own receipts, with the same checklist fields the manual
     reap-acknowledge requires. Returns (report text, summary) or None (alive/unknown owner, unreadable receipts: a person decides).
-    The report lists what the receipts prove; paths the run never reached have no receipt and are re-gated by the next sweep."""
-    if phase != "interrupted" or not isinstance(previous, dict):
+    The report lists what the receipts prove; paths the run never reached have no receipt and are re-gated by the next sweep.
+    A 'started' run killed after it wrote receipts (no final note: a timeout, a crash, a reboot) is reviewed the same way
+    (0.23.10: one tick killed at 11:10 with 7 refused receipts blocked 125 automatic cleans for five hours at 90% disk); a
+    'started' run without receipts is reap_dead_owner_note's."""
+    if phase not in ("interrupted", "started") or not isinstance(previous, dict):
         return None
     state = state or reap_owner_pid_state(previous)
     if state not in ("gone", "reused"):

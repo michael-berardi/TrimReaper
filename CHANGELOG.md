@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.23.10 (2026-11-24)
+
+- A killed cleanup run no longer blocks every later clean. A `started` handoff whose owner process is gone was auto-reviewed only when
+  it had written no receipt; one that had (even only refusals) needed a person, so a tick killed at 11:10 with seven refused receipts
+  made 125 automatic cleans refuse with `cleanup-handoff-incomplete:previous-worker` for five hours with the disk at 90%. Such a run
+  now gets the same generated, receipt-backed acknowledgment report an `interrupted` one gets; a live owner or unreadable receipts
+  still wait for a person.
+- Delete first, offload as the fallback. `offload.toPercent` sets offload's own goal (default: cleanToPercent). With it above
+  cleanToPercent, the clean pass deletes down to cleanToPercent first and offload moves folders only while the disk is still above
+  toPercent.
+
 ## 0.23.9 (2026-11-24)
 
 - Offload moves a tree that holds AppleDouble files. The copy used `ditto`, which folds a `._name` file (an unpacked zip's `__MACOSX`

@@ -50,6 +50,30 @@ class DeadOwnerReceipts(unittest.TestCase):
         (self.dir / "receipts-20261031.jsonl").write_text('{"cleanupOwnerRun": "run-dead", "pa\n')
         self.assertIsNotNone(core.reap_dead_owner_note(self.previous, "started"))
 
+    def _result(self, run, outcome, path):
+        line = {"v": 2, "phase": "result", "outcome": outcome, "cleanupOwnerRun": run, "path": path}
+        with (self.dir / "receipts-20261124.jsonl").open("a") as handle:
+            handle.write(json.dumps(line) + "\n")
+
+    def test_killed_started_run_with_receipts_gets_a_generated_report(self):
+        self.previous["run"] = "a701f519f965"
+        self._result("a701f519f965", "refused", "/home/x/J-1/kept")
+        self._result("a701f519f965", "deleted", "/home/x/J-1/gone")
+        generated = core.reap_dead_owner_report(self.previous, "started")
+        self.assertIsNotNone(generated)
+        text, summary = generated
+        self.assertEqual((summary["deleted"], summary["retained"]), (1, 1))
+        self.assertIsNone(core.reap_ack_report_problem("a701f519f965", text.encode()))
+
+    def test_live_started_owner_is_never_reviewed(self):
+        self.previous["run"] = "a701f519f965"
+        self._result("a701f519f965", "refused", "/home/x/J-1/kept")
+        self.assertIsNone(core.reap_dead_owner_report(self.previous, "started", state="alive"))
+
+    def test_unreadable_receipts_keep_a_started_run_for_a_person(self):
+        (self.dir / "receipts-20261031.jsonl").mkdir()
+        self.assertIsNone(core.reap_dead_owner_report(self.previous, "started"))
+
 
 if __name__ == "__main__":
     unittest.main()
