@@ -62,6 +62,9 @@ DEFAULT_POLICY = {
     # continuation) loses its worktrees, clones and cache folders at once instead of after cloneExpiryDays/evidenceExpiryDays.
     # Every other gate still applies and unsaved work is archived first. false = the day windows apply to every job.
     "concludedExpiry": True,
+    # For a host whose cleanup records say why a worker was closed (`source`): only these prefixes make a job concluded, e.g.
+    # ["verifier:", "verifier-done:", "readonly-done:"]. Empty: any `closed` record of the job's own terminal does.
+    "concludedSources": [],
     # "remove": a whole clone's .env*/.dev.vars*/.wrangler/.vercel copies are archived owner-only and go with it.
     # Anything else (the default "keep") keeps every clone that holds one.
     "cloneProtectedCopies": "keep",
@@ -239,6 +242,8 @@ def check_policy(policy: dict) -> None:
     if unknown:
         raise HostError(f"unknown policy keys: {', '.join(unknown)}", "see docs/CONFIGURATION.md for the policy keys")
     merged = {**DEFAULT_POLICY, **policy}
+    if not isinstance(merged["concludedSources"], list) or not all(isinstance(v, str) and v for v in merged["concludedSources"]):
+        raise HostError(f"policy concludedSources must be a list of non-empty prefixes, not {json.dumps(merged['concludedSources'])}")
     if not isinstance(merged["concludedExpiry"], bool):
         raise HostError(f"policy concludedExpiry must be true or false, not {json.dumps(merged['concludedExpiry'])}")
     if not isinstance(merged["autoReap"], bool):

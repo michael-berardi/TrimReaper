@@ -212,10 +212,9 @@ class DeadOwnerAcknowledge(unittest.TestCase):
         fd = os.open(self.lock, os.O_WRONLY | os.O_APPEND)
         os.write(fd, (json.dumps({"run": run, "pid": os.getpid(), "scope": "clean", "phase": "stopped", "at": core.iso()}) + "\n").encode())
         os.close(fd)
-        with mock.patch.object(core, "reap_owner_pid_state", return_value="unknown"):
-            with self.assertRaisesRegex(core.ReapRefused, "cleanup-handoff-incomplete"):
-                with core.reap_cleanup_owner("clean"):
-                    self.fail("a stop by an owner not proved dead was auto-acknowledged")
+        with self.assertRaisesRegex(core.ReapRefused, "cleanup-handoff-incomplete"):  # this test process is the (live) owner
+            with core.reap_cleanup_owner("clean"):
+                self.fail("a stop by a live owner was auto-acknowledged")
 
 
 class NoteEpochOffsetForms(unittest.TestCase):

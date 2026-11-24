@@ -2402,7 +2402,7 @@ def reap_item_retention(item: dict, prove: bool = True) -> str:
     if cls == "job-clone-root" and item.get("kind") == "clone" and reap_clone_expired(item.get("jobs") or [], item["path"]):
         return REAP_DISPOSABLE
     if cls == "job-clone-regenerable" and item.get("kind") == "dist" and os.path.basename(item["path"]) == "dist" \
-            and reap_clone_expired(item.get("jobs") or [], item["root"]):
+            and reap_clone_expired(item.get("jobs") or [], item["root"], concluded=False):
         return REAP_DISPOSABLE  # dist can hold a release while its job may still ship; not once every job finished cloneExpiryDays ago
     if cls == "job-archive" and reap_archive_expired(item["path"]):
         return REAP_DISPOSABLE
@@ -2717,7 +2717,7 @@ def reap_archive_on() -> bool:
     return reap_policy().get("cloneArchive", "archive") == "archive"
 
 
-def reap_jobs_finished_before(ids: list, seconds: float) -> bool:
+def reap_jobs_finished_before(ids: list, seconds: float, concluded: bool = True) -> bool:
     """Every job named finished (done/failed/cancelled, or interrupted with a durable continuation) at least `seconds` ago."""
     ids = [i for i in ids if i]
     if not ids:
@@ -2728,7 +2728,7 @@ def reap_jobs_finished_before(ids: list, seconds: float) -> bool:
             if not job:
                 return False
             clock = reap_job_finished_clock(conn, job)
-            if not clock or (now() - clock < seconds and not reap_job_concluded(conn, job)):
+            if not clock or (now() - clock < seconds and not (concluded and reap_job_concluded(conn, job))):
                 return False
     return True
 
@@ -2749,10 +2749,57 @@ def reap_job_concluded(conn, job: dict) -> bool:
     terminal = job.get("terminal_id")
     if not terminal:
         return False
-    record = row(conn, "SELECT status FROM cleanup_records WHERE terminal_id=?", (terminal,))
+    record = row(conn, "SELECT * FROM cleanup_records WHERE terminal_id=?", (terminal,))
     if not record or record.get("status") != "closed":
         return False
-    return reap_chain_clock(conn, job) is not None
+    recorded = record.get("recorded_at")
+    if not isinstance(recorded, (int, float)) or isinstance(recorded, bool) or now() - recorded < REAP_SETTLE_SECONDS:
+        return False  # the close itself must have settled too, not only the finish
+    if "job_id" in record and record.get("job_id") not in (None, job["id"]):
+        return False  # the terminal's record is another job's: it says nothing about this one
+    allowed = reap_policy().get("concludedSources")
+    if allowed:
+        # A host that records why a worker was closed names the reasons that mean the work is over and accepted (a verifier's
+        # acceptance, a read-only finish). Anything else (a rejection with a finding still open, a deferred review, a parked
+        # worker) keeps the ordinary windows, and so does a store that cannot say why.
+        text = str(record.get("source") or "")
+        if not any(text.startswith(prefix) for prefix in allowed):
+            return False
+    if reap_chain_clock(conn, job) is None:
+        return False
+    # A job that is not yet finished and names this one as what it continues, repairs or depends on may still read this job's
+    # folders (J-4657 repairing J-4590): the shortcut waits for it. The ordinary windows are unchanged.
+    for other in rows(conn, "SELECT id, status, meta FROM jobs WHERE status NOT IN ('done','failed','cancelled')"):
+        meta = job_meta(other)
+        depends = meta.get("dependsOn")
+        named = [meta.get("continuationOf"), meta.get("repairFor"), *(depends if isinstance(depends, list) else [depends])]
+        if job["id"] in [n for n in named if isinstance(n, str)]:
+            return False
+    return True
+
+
+REAP_RELEASE_OUTPUT_DIRS = ("dist", "out", "build", "release", "releases", "unz")
+
+
+def reap_release_output_inside(root: str) -> bool:
+    """True when a clone holds output that may be a release still to ship: a dist/out/build/release folder (at the top or one level
+    down, as in a workspace package) that is not provably plain web output, or a release-bearing Cargo target. Names and metadata
+    only; anything unreadable counts as release output (keeps the clone)."""
+    try:
+        tops = [root] + [os.path.join(root, n) for n in os.listdir(root) if not n.startswith(".") and os.path.isdir(os.path.join(root, n))
+                         and not os.path.islink(os.path.join(root, n))][:200]
+        for top in tops:
+            for name in REAP_RELEASE_OUTPUT_DIRS:
+                folder = os.path.join(top, name)
+                if os.path.isdir(folder) and not os.path.islink(folder) and reap_dist_keep_reason(folder) is not None:
+                    return True
+            target = os.path.join(top, "target")
+            if os.path.isdir(target) and not os.path.islink(target) and reap_target_release_bearing(target) \
+                    and not reap_target_release_superseded(target):
+                return True
+    except OSError:
+        return True
+    return False
 
 
 def reap_recent_unconcluded(conn, scope: str, ids: list, seconds: float) -> list[str]:
@@ -3983,8 +4030,11 @@ def reap_archive_state(item: dict, repos: list, git_dirs: list) -> tuple[list, d
         # unsaved git work of an idle scratch folder (not protected copies): archived exactly like a job folder's
     units = reap_archive_units(item, repos, git_dirs)
     days = evidence_expiry_days(reap_policy())
-    cutoff = now() - days * 86400 if days and reap_jobs_finished_before(item.get("jobs") or [item.get("owner")], days * 86400) else None
-    collected = reap_archive_collect(item, units, cutoff, reap_archive_protected(item), loose=bool(item.get("unsavedWindow")))
+    owners = item.get("jobs") or [item.get("owner")]
+    windowed = bool(days) and reap_jobs_finished_before(owners, days * 86400, concluded=False)
+    cutoff = now() - days * 86400 if windowed else None
+    # Before the evidence window has really passed (a concluded job), nothing outside a repository may be left out of the archive.
+    collected = reap_archive_collect(item, units, cutoff, reap_archive_protected(item), loose=bool(item.get("unsavedWindow")) or not windowed)
     for unit in units:
         if unit["kind"] == "git" and unit.get("visited"):
             unit["lfsFiles"] = reap_archive_lfs_scan(unit)
@@ -4198,7 +4248,7 @@ def reap_release_keep_lapsed(conn, source: str, value: str) -> bool:
     return True
 
 
-def reap_clone_expired(ids: list, scope: str | None = None) -> bool:
+def reap_clone_expired(ids: list, scope: str | None = None, concluded: bool = True) -> bool:
     """Every job the clone is named for finished (done/failed/cancelled, or interrupted with a durable continuation) at least
     cloneExpiryDays ago, and (with `scope`, the clone's path) no other job that declared that folder as its cwd or worktree
     finished more recently than that."""
@@ -4215,10 +4265,12 @@ def reap_clone_expired(ids: list, scope: str | None = None) -> bool:
             if not clock:
                 return False
             if now() - clock < days * 86400:
-                if not reap_job_concluded(conn, job):
+                if not concluded or not reap_job_concluded(conn, job):
                     return False
                 early = True
         if early:  # a later user of the clone must have concluded too, or be past the window
+            if scope and reap_release_output_inside(scope):
+                return False  # built release output may still ship: the clone waits for the full window
             return not (scope and reap_recent_unconcluded(conn, scope, ids, days * 86400))
     return not (scope and reap_recent_users(scope, ids, days * 86400))
 
@@ -6601,9 +6653,9 @@ def reap_owner_pid_state(previous: dict) -> str:
 
 def reap_dead_owner_note(previous: dict | None, phase: str) -> str | None:
     """Why an unfinished cleanup handoff may be recorded as reviewed without a person, else None: the note is a well-formed
-    'started' record (the sweep was killed: timeout, crash, reboot) whose owner process no longer exists. An error
-    ('interrupted'), a deliberate stop ('stopped'), a fragment, an invalid journal or a live or unknown owner still needs
-    the explicit acknowledgment (an interrupted note is reviewed by reap_dead_owner_report instead)."""
+    'started' record (the sweep was killed: timeout, crash, reboot) whose owner process no longer exists and that wrote no
+    receipt. Interrupted runs, started runs with receipts and stopped runs without a partial removal are reviewed by
+    reap_dead_owner_report; a fragment, an invalid journal, a live or unknown owner or a partial removal needs a person."""
     if phase != "started" or not isinstance(previous, dict):
         return None
     state = reap_owner_pid_state(previous)
@@ -6619,6 +6671,7 @@ def reap_dead_owner_note(previous: dict | None, phase: str) -> str | None:
 
 
 REAP_ACK_REPORT_LIMIT = 200
+REAP_STOP_NEEDS_PERSON = ("partial:", "changed:", "preserved-state-changed", "result-receipt-unavailable", "removal-", "compaction-archive-failed")
 
 
 def reap_run_receipt_records(run: str) -> list | None:
@@ -6677,9 +6730,13 @@ def reap_dead_owner_report(previous: dict | None, phase: str, state: str | None 
     state = state or reap_owner_pid_state(previous)
     if state not in ("gone", "reused"):
         return None
+    if phase == "stopped" and str(previous.get("outcome") or "").startswith(REAP_STOP_NEEDS_PERSON):
+        return None  # a removal that did not finish, a preserved state that changed, or a lost receipt: a person reviews it
     run = str(previous.get("run"))
     records = reap_run_receipt_records(run)
     if records is None:
+        return None
+    if phase != "interrupted" and any(r.get("phase") == "result" and r.get("outcome") in ("partial", "preserved-state-changed") for r in records):
         return None
     last: dict[str, dict] = {}
     planned: dict[str, dict] = {}
@@ -6710,6 +6767,7 @@ def reap_dead_owner_report(previous: dict | None, phase: str, state: str | None 
         f"Unresolved paths: {len(unresolved)} planned without a result receipt; preserved, never deleted from this report" + ("" if unresolved else " (none)"), *listing(unresolved),
         f"Receipt references: {', '.join(files) or 'none written'} in {reap_receipt_dir()} (records naming cleanupOwnerRun {run}); {len(records)} records",
         f"Active consumers: none; owner pid {previous.get('pid')} {why} (scope {previous.get('scope')}, last note {previous.get('at')})",
+        f"Stop reason: {previous.get('outcome') or 'none recorded'} (phase {phase})",
         "Next safe step: the next sweep re-runs every normal gate (owner, retention, git proof, locks, open handles, protected leaves) on every path, including those this run never reached",
         ""])
     return text, {"deleted": len(deleted), "retained": len(retained), "unresolved": len(unresolved), "receiptFiles": files,

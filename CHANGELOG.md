@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.24.1 (2026-11-24)
+
+Review of 0.24.0 (four blocking findings, all closed):
+
+- A `closed` cleanup record alone no longer makes a job concluded when the host says why it closed the worker. `concludedSources`
+  (prefixes of the record's `source`) names the reasons that mean the work is over and accepted, e.g. `verifier:`, `verifier-done:`,
+  `readonly-done:`; a rejection with its finding still open, a deferred review or a parked worker keeps the day windows. A record that
+  names another job (`job_id`) on a shared terminal says nothing about this one, and the close itself must have settled 15 minutes.
+  A concluded job also keeps its folders while an unfinished job names it in `continuationOf`, `repairFor` or `dependsOn` (a list or
+  one id).
+- Release output keeps its window. A whole clone that expires only through conclusion stays while it holds a `dist`, `out`, `build`,
+  `release` or `unz` folder that is not provably plain web output, or a release-bearing Cargo target; the `dist` rule itself uses the
+  real `cloneExpiryDays`.
+- A stopped cleanup run is reviewed automatically only when nothing in it was half done: a `partial:`/`changed:` stop, a lost receipt
+  or a `partial`/`preserved-state-changed` result keeps it for a person, and the generated report names the stop reason.
+- The archive of a concluded job's folder keeps everything: the evidence cutoff uses the real `evidenceExpiryDays`, and files outside
+  any repository are archived while the window has not passed.
+
 ## 0.24.0 (2026-11-24)
 
 - Concluded jobs lose their folders at once (`concludedExpiry`, default on). A finished job's worktrees, clones and cache folders waited

@@ -73,6 +73,23 @@ class DeadOwnerReceipts(unittest.TestCase):
         self.assertIsNone(core.reap_ack_report_problem("796f0bbd3e7c", generated[0].encode()))
         self.assertIsNone(core.reap_dead_owner_report(self.previous, "stopped", state="alive"))
 
+    def test_stopped_run_with_a_partial_removal_waits_for_a_person(self):
+        self.previous["run"] = "796f0bbd3e7d"
+        self._result("796f0bbd3e7d", "partial", "/home/x/J-3/half")
+        self.assertIsNone(core.reap_dead_owner_report(self.previous, "stopped"))
+        self.assertIsNone(core.reap_dead_owner_report(self.previous, "started"))
+
+    def test_stopped_run_whose_note_names_a_partial_cause_waits_for_a_person(self):
+        self.previous.update(run="796f0bbd3e7e", outcome="partial:removal-error:OSError:ENOTEMPTY")
+        self._result("796f0bbd3e7e", "refused", "/home/x/J-4/kept")
+        self.assertIsNone(core.reap_dead_owner_report(self.previous, "stopped"))
+
+    def test_report_names_the_stop_reason(self):
+        self.previous.update(run="796f0bbd3e7f", outcome="evidence-interrupted:J-4497:after-8-files")
+        self._result("796f0bbd3e7f", "refused", "/home/x/J-5/kept")
+        text, _ = core.reap_dead_owner_report(self.previous, "stopped")
+        self.assertIn("Stop reason: evidence-interrupted:J-4497:after-8-files", text)
+
     def test_live_started_owner_is_never_reviewed(self):
         self.previous["run"] = "a701f519f965"
         self._result("a701f519f965", "refused", "/home/x/J-1/kept")

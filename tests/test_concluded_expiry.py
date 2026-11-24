@@ -26,7 +26,7 @@ class ConcludedExpiry(Home):
                          (terminal, time.time() - finished_ago - 7200, time.time() - finished_ago - 3600, job_id))
             if terminal and record:
                 conn.execute("INSERT OR REPLACE INTO cleanup_records(terminal_id,status,recorded_at) VALUES(?,?,?)",
-                             (terminal, record, time.time() - 60))
+                             (terminal, record, time.time() - 1800))
 
     def concluded(self, job_id: str) -> bool:
         with core.db() as conn:
@@ -59,6 +59,89 @@ class ConcludedExpiry(Home):
         self.add_job("J-0106", status="running")
         self.assertFalse(self.concluded("J-0106"))
         self.assertFalse(core.reap_clone_expired(["J-0106"]))
+
+    def test_live_repair_continuation_or_dependant_keeps_the_windows(self):
+        import json
+        for key, value in (("repairFor", "J-0109"), ("continuationOf", "J-0109"), ("dependsOn", ["J-0109"])):
+            with self.subTest(key=key):
+                self.job("J-0109")
+                self.assertTrue(self.concluded("J-0109"))
+                self.add_job("J-0110", status="running")
+                with contextlib.closing(self.state()) as conn, conn:
+                    conn.execute("UPDATE jobs SET meta=? WHERE id='J-0110'", (json.dumps({key: value}),))
+                self.assertFalse(self.concluded("J-0109"))
+                self.assertFalse(core.reap_clone_expired(["J-0109"]))
+                with contextlib.closing(self.state()) as conn, conn:
+                    conn.execute("UPDATE jobs SET status='done', finished_at=? WHERE id='J-0110'", (time.time() - 60,))
+                self.assertTrue(self.concluded("J-0109"))
+                with contextlib.closing(self.state()) as conn, conn:
+                    conn.execute("DELETE FROM jobs WHERE id IN ('J-0109','J-0110')")
+                    conn.execute("DELETE FROM cleanup_records WHERE terminal_id='t-1'")
+
+    def source_column(self):
+        with contextlib.closing(self.state()) as conn, conn:
+            columns = [r[1] for r in conn.execute("PRAGMA table_info(cleanup_records)")]
+            for name in ("source", "job_id"):
+                if name not in columns:
+                    conn.execute(f"ALTER TABLE cleanup_records ADD COLUMN {name} TEXT")
+
+    def test_only_allowed_sources_conclude_when_the_host_names_them(self):
+        self.job("J-0111", terminal="t-11")
+        self.source_column()
+        policy = {"evidenceExpiryDays": 14, "cloneExpiryDays": 3, "concludedSources": ["verifier:", "verifier-done:"]}
+        self.write_config({"policy": policy})
+        for source, concluded in (("rejected:J-0111:J-0112", False), ("policy:review-deferred:J-0111", False),
+                                  ("parked:J-0111", False), (None, False), ("verifier-done:J-0112", True), ("verifier:J-0112", True)):
+            with self.subTest(source=source):
+                with contextlib.closing(self.state()) as conn, conn:
+                    conn.execute("UPDATE cleanup_records SET source=? WHERE terminal_id='t-11'", (source,))
+                self.assertEqual(self.concluded("J-0111"), concluded)
+
+    def test_another_jobs_record_on_a_shared_terminal_does_not_conclude(self):
+        self.job("J-0113", terminal="t-13")
+        self.source_column()
+        with contextlib.closing(self.state()) as conn, conn:
+            conn.execute("UPDATE cleanup_records SET job_id='J-0999' WHERE terminal_id='t-13'")
+        self.assertFalse(self.concluded("J-0113"))
+        with contextlib.closing(self.state()) as conn, conn:
+            conn.execute("UPDATE cleanup_records SET job_id='J-0113' WHERE terminal_id='t-13'")
+        self.assertTrue(self.concluded("J-0113"))
+
+    def test_a_fresh_close_has_to_settle_too(self):
+        self.job("J-0114", terminal="t-14")
+        with contextlib.closing(self.state()) as conn, conn:
+            conn.execute("UPDATE cleanup_records SET recorded_at=? WHERE terminal_id='t-14'", (time.time() - 30,))
+        self.assertFalse(self.concluded("J-0114"))
+
+    def test_dependson_as_a_string_counts(self):
+        import json
+        self.job("J-0115")
+        self.add_job("J-0116", status="running")
+        with contextlib.closing(self.state()) as conn, conn:
+            conn.execute("UPDATE jobs SET meta=? WHERE id='J-0116'", (json.dumps({"dependsOn": "J-0115"}),))
+        self.assertFalse(self.concluded("J-0115"))
+
+    def test_a_clone_with_unshipped_release_output_waits_for_the_window(self):
+        self.job("J-0117")
+        clone = self.home / "dev" / "app-J-0117"
+        (clone / "dist").mkdir(parents=True)
+        (clone / "dist" / "App-1.2.0.dmg").write_bytes(b"x")
+        self.assertTrue(core.reap_clone_expired(["J-0117"]))
+        self.assertFalse(core.reap_clone_expired(["J-0117"], str(clone)))
+        (clone / "dist" / "App-1.2.0.dmg").unlink()
+        (clone / "package.json").write_text('{"scripts": {"build": "vite build"}}')
+        (clone / "dist" / "index.html").write_text("<p>")
+        self.assertTrue(core.reap_clone_expired(["J-0117"], str(clone)))
+
+    def test_dist_rule_keeps_the_real_window(self):
+        self.job("J-0118")
+        self.assertFalse(core.reap_clone_expired(["J-0118"], concluded=False))
+        self.assertTrue(core.reap_clone_expired(["J-0118"]))
+
+    def test_archive_evidence_cutoff_ignores_conclusion(self):
+        self.job("J-0119")
+        self.assertTrue(core.reap_jobs_finished_before(["J-0119"], 14 * 86400))
+        self.assertFalse(core.reap_jobs_finished_before(["J-0119"], 14 * 86400, concluded=False))
 
     def test_policy_switch_turns_it_off(self):
         self.job("J-0107")
