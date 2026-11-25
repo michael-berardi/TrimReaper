@@ -961,6 +961,69 @@ def bring_back_live(cfg: dict, statuses: dict, dry_run: bool) -> list:
     return back
 
 
+def prune_dangling(dry_run: bool = False) -> dict:
+    """Remove broken offload symlinks in home whose leaf target inside a verified, initialized `offload.root/home`
+    no longer exists. Fails closed if the overflow volume is unmounted, `offload.root` (or its `home/` mirror and
+    `README.txt` marker) is missing/renamed, the target's parent directory is absent, or the link target is relative/`..`."""
+    cfg = settings()
+    if not cfg:
+        return {"skipped": "offload is not configured (config key `offload`)", "dryRun": dry_run, "pruned": [], "kept": [], "errors": []}
+    root = cfg["root"]
+    cause = volume_ready(root)
+    if cause:
+        return {"skipped": cause, "dryRun": dry_run, "pruned": [], "kept": [], "errors": []}
+    mirror_home = root / "home"
+    if root.is_symlink() or not root.is_dir() or mirror_home.is_symlink() or not mirror_home.is_dir() or not (root / "README.txt").is_file():
+        return {"skipped": f"overflow root {root} is missing or uninitialized (refusing to prune links)", "dryRun": dry_run,
+                "pruned": [], "kept": [], "errors": []}
+    table = core.reap_process_table()
+    home_prefix = os.path.normpath(str(mirror_home)).rstrip(os.sep) + os.sep
+    pruned, kept, errors = [], [], []
+    try:
+        discovered = list(links_of(cfg))
+    except OSError as error:
+        return {"root": str(root), "dryRun": dry_run, "prunedCount": 0, "pruned": [], "keptCount": 0, "kept": [],
+                "errors": [f"scan failed: {error}"]}
+    for _, link, _ in discovered:
+        try:
+            if not link.is_symlink():
+                continue
+            target = os.readlink(link)
+        except OSError:
+            continue
+        if not os.path.isabs(target) or ".." in Path(target).parts:
+            kept.append({"path": str(link), "to": target, "why": "unsafe-link-target"})
+            continue
+        norm = os.path.normpath(target)
+        if not norm.startswith(home_prefix):
+            kept.append({"path": str(link), "to": target, "why": "outside-overflow-home"})
+            continue
+        if os.path.lexists(norm):
+            continue  # target exists: live offload link
+        parent = os.path.dirname(norm)
+        if os.path.islink(parent) or not os.path.isdir(parent):
+            kept.append({"path": str(link), "to": target, "why": "target-parent-missing"})
+            continue
+        try:
+            core.reap_holders(str(link), str(link), table)
+        except core.ReapRefused as refused:
+            kept.append({"path": str(link), "to": target, "why": str(refused)})
+            continue
+        if dry_run:
+            pruned.append({"path": str(link), "to": target, "pruned": False})
+            continue
+        try:
+            if not link.is_symlink() or os.readlink(link) != target or os.path.lexists(norm) or not os.path.isdir(parent):
+                kept.append({"path": str(link), "to": target, "why": "link-changed-or-target-appeared"})
+                continue
+            os.unlink(link)
+            core.reap_receipt({"kind": "offload-dangling-unlink", "path": str(link), "to": target})
+            pruned.append({"path": str(link), "to": target, "pruned": True})
+        except OSError as error:
+            errors.append(f"{link}: {error}")
+    return {"root": str(root), "dryRun": dry_run, "prunedCount": len(pruned), "pruned": pruned, "keptCount": len(kept), "kept": kept[:60], "errors": errors}
+
+
 def status() -> dict:
     cfg = settings()
     if not cfg:

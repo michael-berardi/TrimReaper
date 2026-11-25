@@ -142,7 +142,8 @@ def clean_installed(program: str) -> str | None:
 def clean_cargo_roots() -> list[str]:
     base = os.environ.get("CARGO_HOME")
     base = os.path.expanduser(base) if base else clean_home(".cargo")
-    return [os.path.join(base, "registry", "cache"), os.path.join(base, "registry", "src")]
+    return [os.path.join(base, "registry", "cache"), os.path.join(base, "registry", "src"),
+            os.path.join(base, "git", "checkouts")]
 
 
 # A tool cache is cleaned by its own tool. `busy`: process names that keep it as it is. `deep` runs only when asked for.
@@ -171,10 +172,17 @@ CLEAN_FOLDERS = (
     {"name": "cargo-xwin", "busy": ("cargo", "cargo-xwin", "xwin", "rustc", "clang-cl", "lld-link"), "minBytes": 512 << 20,
      "roots": lambda: [os.path.expanduser(os.environ["XWIN_CACHE_DIR"])] if os.environ.get("XWIN_CACHE_DIR")
      else [clean_home("Library", "Caches", "cargo-xwin"), clean_home(".cache", "cargo-xwin")]},
+    # SwiftPM's regenerable download/manifest/repository cache (never touches Library/org.swift.swiftpm security/configuration/SDKs).
+    {"name": "swiftpm-cache", "busy": ("swift", "swift-build", "swift-package", "swift-frontend", "xcodebuild", "sourcekit-lsp"),
+     "roots": lambda: [clean_home("Library", "Caches", "org.swift.swiftpm"), clean_home(".cache", "org.swift.swiftpm")]},
+    # Xcode CoreSimulator download/dyld caches only (never Devices, Runtimes, Archives or DeviceSupport).
+    {"name": "core-simulator-caches", "busy": ("simulator", "com.apple.coresimulator.coresimulatorservice", "xcodebuild", "simctl"),
+     "roots": lambda: [clean_home("Library", "Developer", "CoreSimulator", "Caches")] if os.uname().sysname == "Darwin" else []},
 )
 CLEAN_WORKTREES = "worktrees"
-CLEAN_EXTRA_NAMES = ("rust-build-output", "project-dependencies", "agent-leftovers", "browser-clones", "playwright", "finished-jobs", "dedupe-clones",
-                     "compress-logs", "tagged-caches", "cli-releases", "coordinator-outputs", "release-scratch", "temp-build-caches", "overflow-retention")
+CLEAN_EXTRA_NAMES = ("rust-build-output", "project-dependencies", "agent-leftovers", "browser-clones", "playwright", "dev-tool-caches",
+                     "darwin-user-caches", "finished-jobs", "dedupe-clones", "compress-logs", "tagged-caches", "cli-releases",
+                     "coordinator-outputs", "release-scratch", "temp-build-caches", "overflow-retention")
 CLEAN_RUST_BUSY = ("cargo", "rustc", "rust-analyzer", "clippy", "clippy-driver", "cargo-clippy")
 CLEAN_NAMES = tuple(t["name"] for t in CLEAN_TOOLS) + tuple(f["name"] for f in CLEAN_FOLDERS) + (CLEAN_WORKTREES,) + CLEAN_EXTRA_NAMES
 
@@ -192,6 +200,7 @@ CLEAN_POLICY = {"cleanEscalate": True, "cleanEscalateRepoHours": 2, "cleanEscala
                 "worktreeIdleDays": 7, "projectIdleHours": 48, "taggedCacheIdleHours": 6,
                 "cleanEmergencyPercent": 90, "cleanEmergencyHours": 6,
                 "cliReleasesKeep": 3, "coordinatorRoots": [".cache/ut-coordinator"], "coordinatorJobCommand": ["ut-coordinator", "job-get"],
+                "coordinatorJobListCommand": None, "compressLogsMode": "apfs",
                 "releaseScratchRoots": [".cache/agent-scratch"]}   # the fallbacks of a host whose policy predates a key
 CLEAN_OUTPUT_PROOF = ("clean", "pushed", "ignored", "untracked")
 CLEAN_IGNORED_PROOF = ("ignored", "untracked")      # regenerable output needs git to ignore it and track none of it, not a clean tree
@@ -715,7 +724,9 @@ def clean_worktree_gates(entry: dict, idle_days: float, table: dict | None, arch
             raise refusal
         unsaved.append(str(refusal))
     repos, git_dirs = [], [] if archive else None  # archive mode: a git directory with no `.git` entry is saved whole, not a reason to keep
-    reap_protected_scan(path, allow_git=True, markers=True, repos=repos, git_dirs=git_dirs, nested_disposable=True)
+    templates = reap_repo_templates(path, False)
+    reap_protected_scan(path, allow_git=True, markers=True, repos=repos, git_dirs=git_dirs, nested_disposable=True, templates=templates)
+    entry["templates"] = templates
     if {reap_canon(r) for r in repos} != {path}:
         raise ReapRefused("nested-repository")
     if git_dirs:
@@ -1009,8 +1020,8 @@ def clean_playwright_needed(root: str) -> set[str]:
 
 # Folders that never hold a Rust crate's target: dependency stores, virtual environments, generated web output and tool caches.
 # (A walk of the dev and .cache homes listed 2.3 million entries, mostly these, and gave up at the 500,000-entry budget.)
-CLEAN_RUST_SCAN_SKIP = frozenset({".git", "node_modules", "Library", ".cache", ".local", ".Trash", "dist", "build", "vendor", ".venv", "venv", "__pycache__",
-                            "site-packages", ".next", ".astro", ".turbo", ".wrangler", ".svelte-kit", ".vercel", ".output", "coverage", ".pnpm-store",
+CLEAN_RUST_SCAN_SKIP = frozenset({".git", "node_modules", "Library", ".cache", ".local", ".Trash", "dist", "build", ".build", "vendor", ".venv", "venv", "__pycache__",
+                            "site-packages", ".next", ".open-next", ".astro", ".turbo", ".wrangler", ".cloudflare", ".svelte-kit", ".vercel", ".output", "coverage", ".pnpm-store",
                             "Pods", "DerivedData", ".gradle", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox", "screenshots"})
 CLEAN_RUST_SCAN_TOOL_CACHES = frozenset({"uv", "pip", "npm", "pnpm", "yarn", "bun", "cargo", "go-build", "huggingface", "codex-runtimes", "ms-playwright",
                                    "puppeteer", "node-gyp", "typescript", "prisma", "turbo", "pre-commit", "deno", "electron", "selenium"})
@@ -1025,10 +1036,119 @@ def clean_rust_targets(errors: list) -> list[tuple[str, str]]:
     return [(path, repo) for path, repo in clean_repo_walk(errors, frozenset({"target"}), "rust-build-output")]
 
 
+def clean_detached_rust_targets(errors: list) -> list[tuple[str, str]]:
+    """Find detached Cargo target directories (CARGO_TARGET_DIR with valid CACHEDIR.TAG, e.g. `*-cargo-target` or `target`
+    outside a git repo) under agent scratch and the per-user temp folder, up to 4 levels deep. Only their `debug` and
+    `<profile>/incremental` subdirs are candidates; `release` binaries and bundles always stay."""
+    key = ("detached-rust-targets",)
+    known = clean_memo_get(key)
+    if known is not None:
+        return [(path, root) for path, root in known if os.path.lexists(path)]
+    roots = []
+    for candidate in (reap_agent_scratch_root(), *(r for r, _ in clean_temp_roots() if r != os.path.realpath("/tmp"))):
+        try:
+            canon = reap_canon(candidate)
+            if os.path.isdir(canon) and not os.path.islink(str(candidate)) and os.lstat(canon).st_uid == os.getuid() and canon not in roots:
+                roots.append(canon)
+        except (OSError, HostError):
+            continue
+    temps = clean_tagged_temp_roots()
+    found, seen, count = [], set(), 0
+    for root in roots:
+        stack = [(root, 0)]
+        while stack:
+            folder, depth = stack.pop()
+            if folder in seen:
+                continue
+            seen.add(folder)
+            try:
+                with os.scandir(folder) as scan:
+                    entries = list(scan)
+            except OSError:
+                continue
+            count += len(entries)
+            if count > CLEAN_RUST_SCAN_ENTRIES:
+                errors.append({"clean": "rust-build-output", "path": clean_tilde(root), "error": "discovery-incomplete:detached-targets"})
+                break
+            if folder != root and any(e.name == CACHEDIR_TAG for e in entries) and reap_cachedir_tagged(folder) and clean_tagged_cargo_target(folder):
+                found.append((folder, root))
+                continue
+            if depth >= 4:
+                continue
+            for entry in entries:
+                if entry.name in CLEAN_TAGGED_SKIP or reap_protected(entry.name):
+                    continue
+                if folder == root and root in temps and CLEAN_TEMP_SYSTEM.match(entry.name):
+                    continue
+                if clean_directory(entry, "rust-build-output", errors):
+                    stack.append((entry.path, depth + 1))
+    found = sorted(set(found))
+    clean_memo_put(key, found)
+    return found
+
+
+# Recognized regenerable developer tool caches under the home cache and Library/Caches, each guarded by its own busy processes and idle window.
+CLEAN_DEV_CACHE_IDLE_HOURS = 6
+CLEAN_DEV_TOOL_CACHES = (
+    {"tool": "puppeteer", "busy": ("chrome", "chromium", "node"), "paths": ((".cache", "puppeteer"),)},
+    {"tool": "cypress", "busy": ("cypress", "node"), "paths": ((".cache", "Cypress"), ("Library", "Caches", "Cypress"))},
+    {"tool": "electron", "busy": ("electron", "node"), "paths": ((".cache", "electron"), ("Library", "Caches", "electron"))},
+    {"tool": "ruff", "busy": ("ruff",), "paths": ((".cache", "ruff"),)},
+    {"tool": "mypy", "busy": ("mypy",), "paths": ((".cache", "mypy"),)},
+    {"tool": "node-gyp", "busy": ("node-gyp", "npm", "pnpm", "yarn", "bun"), "paths": ((".cache", "node-gyp"), ("Library", "Caches", "node-gyp"))},
+    {"tool": "typescript", "busy": ("tsc", "tsserver", "node"), "paths": ((".cache", "typescript"), ("Library", "Caches", "typescript"))},
+)
+# Recognized regenerable dev/test caches inside macOS per-user Darwin cache dir ($DARWIN_USER_CACHE_DIR, sibling `C` of `TMPDIR`).
+CLEAN_DARWIN_USER_CACHES = (
+    {"name": "clang", "busy": ("clang", "clang++", "swiftc", "swift-frontend", "xcodebuild", "ld")},
+    {"name": "com.google.chrome.for.testing.helper", "busy": ("google chrome for testing", "chrome", "playwright")},
+    {"name": "org.swift.swiftpm", "busy": ("swift", "swift-build", "swift-package", "xcodebuild")},
+    {"name": "node-compile-cache", "busy": ("node",)},
+)
+CLEAN_DARWIN_CACHE_PATTERN = re.compile(r"^/private/var/folders/[a-z0-9]{2}/[a-z0-9_+-]+/C$")
+
+
+def clean_darwin_cache_dir() -> str | None:
+    """macOS per-user Darwin cache dir (`/private/var/folders/<xx>/<id>/C` with sibling `T`), queried from
+    `_CS_DARWIN_USER_CACHE_DIR` (falling back to TMPDIR only when strictly matching the Darwin per-user layout)."""
+    if os.uname().sysname != "Darwin":
+        return None
+    raw = None
+    try:
+        raw = os.confstr("CS_DARWIN_USER_CACHE_DIR")
+    except (AttributeError, ValueError, OSError):
+        try:
+            raw = os.confstr(65538)  # _CS_DARWIN_USER_CACHE_DIR on macOS
+        except (AttributeError, ValueError, OSError):
+            raw = None
+    if not raw:
+        tmp = os.environ.get("TMPDIR")
+        if tmp:
+            raw = os.path.join(os.path.dirname(os.path.realpath(tmp).rstrip("/")), "C")
+    if not raw:
+        return None
+    base = os.path.realpath(raw).rstrip("/")
+    if not CLEAN_DARWIN_CACHE_PATTERN.fullmatch(base):
+        return None
+    sibling_t = os.path.join(os.path.dirname(base), "T")
+    try:
+        info = os.lstat(base)
+        t_info = os.lstat(sibling_t)
+        if stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and stat.S_ISDIR(t_info.st_mode) and t_info.st_uid == os.getuid():
+            return base
+    except OSError:
+        pass
+    return None
+
+
 # Dependency stores and generated output a project recreates with one install or build. Each is removed only when git ignores it,
 # its manifest is beside it, and the project is idle (clean_project_gates). `dist` and `build` are never here: some projects commit them.
-CLEAN_PROJECT_OUTPUTS = {"node_modules": ("package.json",), ".next": ("package.json",), ".astro": ("package.json",), ".turbo": ("package.json",),
-                         ".svelte-kit": ("package.json",), ".nuxt": ("package.json",), ".parcel-cache": ("package.json",), ".vite": ("package.json",),
+CLEAN_PROJECT_OUTPUTS = {"node_modules": ("package.json",), ".next": ("package.json",), ".open-next": ("package.json", "wrangler.toml", "wrangler.json", "wrangler.jsonc"),
+                         ".cloudflare": ("package.json", "wrangler.toml", "wrangler.json", "wrangler.jsonc"),
+                         ".output": ("package.json", "nuxt.config.ts", "nuxt.config.js", "nitro.config.ts"),
+                         ".astro": ("package.json",), ".turbo": ("package.json",), ".svelte-kit": ("package.json",),
+                         ".nuxt": ("package.json",), ".parcel-cache": ("package.json",), ".vite": ("package.json",),
+                         ".build": ("Package.swift",),
                          ".venv": ("pyproject.toml", "requirements.txt", "requirements-dev.txt", "uv.lock", "Pipfile", "setup.py"),
                          ".pytest_cache": (), ".mypy_cache": (), ".ruff_cache": ()}
 
@@ -1615,7 +1735,7 @@ def clean_extra_gates(entry: dict, table: dict | None = None) -> None:
         return clean_tagged_gates(entry, table)
     if kind in CLEAN_RECLAIM_NAMES:   # each with its own windows and proofs (the reclaim rules), not a job folder's evidence window
         return clean_reclaim_gates(entry, table)
-    if not clean_job_idle_scope(path, entry):
+    if not clean_job_idle_scope(path, entry) and not (kind == "rust-build-output" and entry.get("detached")):
         clean_scratch_debris_gates(entry, table)
     if kind == "project-dependencies":
         clean_project_gates(entry, table)
@@ -1624,15 +1744,36 @@ def clean_extra_gates(entry: dict, table: dict | None = None) -> None:
     if kind == "project-dependencies":
         pass
     elif kind == "rust-build-output":
-        clean_repository_output_gates(entry, table)
-        if "clean" not in (entry.get("proof") or CLEAN_OUTPUT_PROOF) and entry.get("idleHours"):  # a dirty or stashed repo: only an idle one
-            idle = clean_repo_idle_hours(entry["repo"], table is None)
-            if idle < entry["idleHours"]:
-                raise ReapRefused(f"recent:{idle:.0f}h-of-{entry['idleHours']}h")
-        busy = sorted(set(CLEAN_RUST_BUSY) & clean_running())
+        if entry.get("detached"):
+            target = entry["target"]
+            if not reap_cachedir_tagged(target) or not clean_tagged_cargo_target(target):
+                raise ReapRefused("not-a-cargo-target")
+            clean_tagged_live_job(target)
+            busy = sorted(set(CLEAN_RUST_BUSY) & clean_running())
+            if busy:
+                raise ReapRefused("in-use:" + ",".join(busy))
+            clean_stale_tree(path, entry.get("idleHours", CLEAN_POLICY["taggedCacheIdleHours"]), fresh=table is None, strict=True)
+            clean_once(("folder", path), lambda: clean_folder_gates(path), table is None)
+            clean_once(("folder", target), lambda: clean_folder_gates(target), table is None)
+        else:
+            clean_repository_output_gates(entry, table)
+            if "clean" not in (entry.get("proof") or CLEAN_OUTPUT_PROOF) and entry.get("idleHours"):  # a dirty or stashed repo: only an idle one
+                idle = clean_repo_idle_hours(entry["repo"], table is None)
+                if idle < entry["idleHours"]:
+                    raise ReapRefused(f"recent:{idle:.0f}h-of-{entry['idleHours']}h")
+            busy = sorted(set(CLEAN_RUST_BUSY) & clean_running())
+            if busy:
+                raise ReapRefused("in-use:" + ",".join(busy))
+            clean_once(("folder", entry["target"]), lambda: clean_folder_gates(entry["target"]), table is None)
+    elif kind in ("dev-tool-caches", "darwin-user-caches"):
+        info = os.lstat(path)
+        if info.st_uid != os.getuid():
+            raise ReapRefused("not-owned-by-user")
+        busy = sorted(set(entry.get("busy") or ()) & clean_running())
         if busy:
             raise ReapRefused("in-use:" + ",".join(busy))
-        clean_once(("folder", entry["target"]), lambda: clean_folder_gates(entry["target"]), table is None)
+        clean_stale_tree(path, entry.get("idleHours", CLEAN_DEV_CACHE_IDLE_HOURS), fresh=table is None)
+        clean_once(("folder", path), lambda: clean_folder_gates(path), table is None)
     elif kind == "agent-leftovers":
         clean_stale_tree(path, entry.get("idleHours", 6), fresh=table is None)
     elif kind == "browser-clones":
@@ -1662,7 +1803,9 @@ def clean_extra_entries(only: set, errors: list, idle_hours: int = 48, rung: dic
         entries.append({"name": name, "kind": "debris", "path": path, "root": root, "paths": [path], "tier": "safe", **extra})
     if "rust-build-output" in only:
         relaxed = {"proof": proof, "idleHours": idle_hours} if proof != CLEAN_OUTPUT_PROOF else {}
+        seen_targets = set()
         for target, repo in clean_rust_targets(errors):
+            seen_targets.add(reap_canon(target))
             debug = os.path.join(target, "debug")
             if os.path.isdir(debug) and not os.path.islink(debug):
                 add("rust-build-output", debug, target, target=target, repo=repo, **relaxed)
@@ -1671,6 +1814,19 @@ def clean_extra_entries(only: set, errors: list, idle_hours: int = 48, rung: dic
                 if profile.name != "debug" and clean_directory(profile, "rust-build-output", errors) and not reap_protected(profile.name) \
                         and os.path.isdir(path) and not os.path.islink(path):
                     add("rust-build-output", path, target, target=target, repo=repo, **relaxed)
+        detached_hours = rung["taggedHours"] if rung else CLEAN_POLICY["taggedCacheIdleHours"]
+        if detached_hours:
+            for target, _ in clean_detached_rust_targets(errors):
+                if reap_canon(target) in seen_targets:
+                    continue
+                debug = os.path.join(target, "debug")
+                if os.path.isdir(debug) and not os.path.islink(debug):
+                    add("rust-build-output", debug, target, target=target, detached=True, idleHours=detached_hours)
+                for profile in clean_scan(target, "rust-build-output", errors):
+                    path = os.path.join(profile.path, "incremental")
+                    if profile.name != "debug" and clean_directory(profile, "rust-build-output", errors) and not reap_protected(profile.name) \
+                            and os.path.isdir(path) and not os.path.islink(path):
+                        add("rust-build-output", path, target, target=target, detached=True, idleHours=detached_hours)
     if "project-dependencies" in only and idle_hours:
         for path, repo in clean_project_outputs(errors, wide):
             add("project-dependencies", path, os.path.dirname(path), repo=repo, idleHours=idle_hours, proof=proof)
@@ -1731,6 +1887,31 @@ def clean_extra_entries(only: set, errors: list, idle_hours: int = 48, rung: dic
         for path, browser, build in clean_browser_builds(root, errors):
             if os.path.basename(path) not in needed:
                 add("playwright", path, root, browser=browser, build=build)
+    if "dev-tool-caches" in only:
+        dev_hours = min(CLEAN_DEV_CACHE_IDLE_HOURS, 2) if (rung and isinstance(rung.get("rung"), int) and rung["rung"] >= 1) else CLEAN_DEV_CACHE_IDLE_HOURS
+        for spec in CLEAN_DEV_TOOL_CACHES:
+            for rel in spec["paths"]:
+                if rel[0] == "Library" and os.uname().sysname != "Darwin":
+                    continue
+                cache_root = clean_home(*rel)
+                if not os.path.isdir(cache_root) or os.path.islink(cache_root):
+                    continue
+                try:
+                    cache_root = reap_canon(cache_root)
+                except OSError as error:
+                    errors.append({"clean": "dev-tool-caches", "path": clean_tilde(cache_root), "error": clean_os_refusal(error)})
+                    continue
+                for child in sorted(clean_scan(cache_root, "dev-tool-caches", errors), key=lambda c: c.name):
+                    if not reap_protected(child.name) and clean_directory(child, "dev-tool-caches", errors):
+                        add("dev-tool-caches", child.path, cache_root, tool=spec["tool"], busy=spec["busy"], idleHours=dev_hours)
+    if "darwin-user-caches" in only:
+        darwin_root = clean_darwin_cache_dir()
+        if darwin_root:
+            darwin_hours = 1 if (rung and isinstance(rung.get("rung"), int) and rung["rung"] >= 1) else CLEAN_DEV_CACHE_IDLE_HOURS
+            for spec in CLEAN_DARWIN_USER_CACHES:
+                target = os.path.join(darwin_root, spec["name"])
+                if os.path.isdir(target) and not os.path.islink(target):
+                    add("darwin-user-caches", target, darwin_root, tool=spec["name"], busy=spec["busy"], idleHours=darwin_hours)
     table = reap_process_table() if entries else None
     for entry in entries:
         if "keep" in entry:   # kept at discovery (the newest releases or outputs, an unproved reference search): nothing to probe
@@ -1738,8 +1919,12 @@ def clean_extra_entries(only: set, errors: list, idle_hours: int = 48, rung: dic
         try:
             with ExitStack() as stack:
                 if entry["name"] in ("rust-build-output", "project-dependencies", "tagged-caches"):
-                    locks = clean_rust_lock_paths(entry["target"], entry["repo"]) if entry["name"] == "rust-build-output" \
-                        else clean_tagged_lock_paths(entry["path"]) if entry["name"] == "tagged-caches" else [reap_queue_lock(entry["repo"])]
+                    if entry["name"] == "rust-build-output":
+                        locks = clean_tagged_lock_paths(entry["target"]) if entry.get("detached") else clean_rust_lock_paths(entry["target"], entry["repo"])
+                    elif entry["name"] == "tagged-caches":
+                        locks = clean_tagged_lock_paths(entry["path"])
+                    else:
+                        locks = [reap_queue_lock(entry["repo"])]
                     stack.enter_context(reap_locks(locks, create=False))
                 clean_extra_gates(entry, table)
         except (ReapRefused, OSError) as error:
@@ -1784,7 +1969,8 @@ CLEAN_TEMP_BUILD_HOURS = 1
 
 def clean_reclaim_settings(policy: dict | None) -> dict:
     policy = policy or {}
-    return {key: clean_setting(policy, key) for key in ("cliReleasesKeep", "coordinatorRoots", "coordinatorJobCommand", "releaseScratchRoots")}
+    return {key: clean_setting(policy, key) for key in ("cliReleasesKeep", "coordinatorRoots", "coordinatorJobCommand",
+                                                        "coordinatorJobListCommand", "releaseScratchRoots")}
 
 
 def clean_semver(name: str):
@@ -1952,13 +2138,71 @@ def clean_cli_release_entries(errors: list, keep: int, add) -> None:
             add("cli-releases", os.path.join(releases, name), releases, **extra)
 
 
-def clean_coord_status(command: list, job: str, fresh: bool) -> tuple[str | None, float | None, str | None]:
-    """(status, newest activity time, why unknown) of one coordinator job, from `<command> <job>` printing JSON (`{"job": {...}}` or
-    the job itself). Asked once per pass; the removal's last look asks again. Anything but a clean answer is unknown, and keeps."""
+CLEAN_COORD_FALLBACK_LIMIT = 20
+
+
+def clean_coord_batch(list_command: list | None, fresh: bool) -> dict | None:
+    """Batch-fetch coordinator job statuses in one subprocess call (`coordinatorJobListCommand`), returning
+    `{job_id: (status, active_epoch)}` or None when unconfigured/failed. Avoids N+1 per-job spawns across thousands of dirs."""
+    if not list_command:
+        return None
+    key = ("coord-batch", tuple(list_command))
+    if not fresh:
+        known = clean_memo_get(key)
+        if known is not None:
+            return known if known else None
+    argv = [os.path.expanduser(part) if not index else part for index, part in enumerate(list_command)]
+    program = argv[0] if os.path.isabs(argv[0]) else shutil.which(argv[0])
+    parsed: dict = {}
+    if program:
+        code, out = clean_run([program, *argv[1:]], CLEAN_COORD_STATUS_SECONDS * 3)
+        try:
+            data = json.loads(out) if code == 0 else None
+        except ValueError:
+            data = None
+        if isinstance(data, dict) and isinstance(data.get("jobs"), list):
+            for record in data["jobs"]:
+                if isinstance(record, dict) and isinstance(record.get("id"), str) and isinstance(record.get("status"), str):
+                    stamps = [reap_note_epoch(v) for f, v in record.items() if f.endswith(("_at", "At")) and isinstance(v, str)]
+                    stamps = [s for s in stamps if s]
+                    parsed[record["id"].upper()] = (record["status"], max(stamps) if stamps else None)
+        elif isinstance(data, dict):
+            for k, val in data.items():
+                if not isinstance(k, str):
+                    continue
+                if isinstance(val, str):
+                    parsed[k.upper()] = (val, None)
+                elif isinstance(val, dict) and isinstance(val.get("status"), str):
+                    stamps = [reap_note_epoch(v) for f, v in val.items() if f.endswith(("_at", "At")) and isinstance(v, str)]
+                    stamps = [s for s in stamps if s]
+                    parsed[k.upper()] = (val["status"], max(stamps) if stamps else None)
+    if not fresh:
+        clean_memo_put(key, parsed)
+    return parsed or None
+
+
+def clean_coord_status(command: list, job: str, fresh: bool, list_command: list | None = None) -> tuple[str | None, float | None, str | None]:
+    """(status, newest activity time, why unknown) of one coordinator job. Uses `list_command` in one batch call during
+    planning when configured, falling back to `<command> <job>` only for misses (bounded per pass) and for fresh pre-removal
+    verification. Anything but a clean answer is unknown, and keeps."""
     key = ("coord-status", job)
     known = None if fresh else clean_memo_get(key)
     if known is not None:
         return tuple(known)
+    if list_command and not fresh:
+        batch = clean_coord_batch(list_command, False)
+        if batch is not None:
+            hit = batch.get(job.upper())
+            if hit is not None:
+                found = (hit[0], hit[1], None)
+                clean_memo_put(key, list(found))
+                return found
+            misses = clean_memo_get(("coord-batch-misses",)) or 0
+            if misses >= CLEAN_COORD_FALLBACK_LIMIT:
+                found = (None, None, "job-status-unknown:not-in-list")
+                clean_memo_put(key, list(found))
+                return found
+            clean_memo_put(("coord-batch-misses",), misses + 1)
     argv = [os.path.expanduser(part) if not index else part for index, part in enumerate(command)] + [job]
     program = argv[0] if os.path.isabs(argv[0]) else shutil.which(argv[0])
     found: tuple = (None, None, "job-status-unknown:command-missing")
@@ -2022,7 +2266,10 @@ def clean_coord_gates(entry: dict, table: dict | None) -> None:
     rel = os.path.relpath(path, job_dir).split(os.sep)
     if any(part.lower() in CLEAN_COORD_NEVER or reap_protected(part) for part in rel):
         raise ReapRefused("protected-ancestor")
-    status, active, unknown = clean_coord_status(entry["command"], job, table is None)
+    why = clean_coord_regenerable(path)
+    if why:
+        raise ReapRefused(why)
+    status, active, unknown = clean_coord_status(entry["command"], job, table is None, entry.get("listCommand"))
     if unknown:
         raise ReapRefused(unknown)
     if status in CLEAN_COORD_IDLE:
@@ -2033,9 +2280,6 @@ def clean_coord_gates(entry: dict, table: dict | None) -> None:
         quiet = CLEAN_COORD_QUIET_HOURS
     else:
         raise ReapRefused("job-live:" + status[:40])
-    why = clean_coord_regenerable(path)
-    if why:
-        raise ReapRefused(why)
     repo, broken = clean_coord_repo(path, job_dir)
     if repo and not broken:   # in a worktree: only output git ignores and tracks nothing of
         clean_once(("coord-git", path), lambda: reap_git_proof(repo, path, CLEAN_IGNORED_PROOF), table is None)
@@ -2078,7 +2322,9 @@ def clean_coord_entries(errors: list, settings: dict, add) -> None:
                             or not clean_directory(entry, "coordinator-outputs", errors):
                         continue
                     if CLEAN_COORD_OUTPUT.match(entry.name):
-                        add("coordinator-outputs", entry.path, job.path, job=job.name, command=list(settings["coordinatorJobCommand"]))
+                        list_cmd = list(settings["coordinatorJobListCommand"]) if settings.get("coordinatorJobListCommand") else None
+                        add("coordinator-outputs", entry.path, job.path, job=job.name, command=list(settings["coordinatorJobCommand"]),
+                            listCommand=list_cmd)
                     elif depth < CLEAN_COORD_DEPTH and entry.name not in CLEAN_JOB_OUTPUT_SKIP:
                         stack.append((entry.path, depth + 1))
 
@@ -2773,7 +3019,7 @@ def clean_size_all(entries: list[dict]) -> None:
     jobs = [(entry, path) for entry in entries for path in entry["paths"]]
     def size_one(job):
         try:
-            return reap_metadata_size(job[1], CLEAN_SIZE_SECONDS)
+            return reap_metadata_size(job[1], CLEAN_SIZE_SECONDS, templates=job[0].get("templates") or frozenset())
         except OSError as error:
             return {"bytes": None, "complete": False, "reason": clean_os_refusal(error)}
     with ThreadPoolExecutor(max_workers=16) as pool:
@@ -2845,7 +3091,7 @@ def clean_remove_folder(entry: dict, run_id: str, root: str, allow_git: bool, la
         reason = str(refusal) if isinstance(refusal, ReapRefused) else clean_os_refusal(refusal)
         clean_receipt("result", entry, run_id, outcome="refused", reason=reason)
         raise ReapRefused(reason)
-    reap_remove_and_verify(fence, path, before, result, allow_git)
+    reap_remove_and_verify(fence, path, before, result, allow_git, templates=entry.get("templates") or frozenset())
     if result["outcome"] == "deleted" and entry["kind"] == "worktree":
         result["checks"].append(reap_worktree_forget(os.path.join(entry["repo"], ".git"), entry["gitdir"], path))
     after = clean_free()
@@ -2866,12 +3112,15 @@ def clean_act(entry: dict, run_id: str, days: int) -> None:
     if entry["kind"] == "debris":
         with ExitStack() as stack:
             if entry["name"] in ("rust-build-output", "project-dependencies"):
-                held = stack.enter_context(reap_locks([reap_queue_lock(entry["repo"])], create=True))
-                if held != 1:
-                    raise ReapRefused("lock-unavailable:project-queue")
-                if entry["name"] == "rust-build-output":
-                    # The canonical queue flock is already held; take only Cargo's existing locks here.
-                    stack.enter_context(reap_locks(clean_rust_lock_paths(entry["target"], entry["repo"])[1:], create=False))
+                if entry["name"] == "rust-build-output" and entry.get("detached"):
+                    stack.enter_context(reap_locks(clean_tagged_lock_paths(entry["target"]), create=False))
+                else:
+                    held = stack.enter_context(reap_locks([reap_queue_lock(entry["repo"])], create=True))
+                    if held != 1:
+                        raise ReapRefused("lock-unavailable:project-queue")
+                    if entry["name"] == "rust-build-output":
+                        # The canonical queue flock is already held; take only Cargo's existing locks here.
+                        stack.enter_context(reap_locks(clean_rust_lock_paths(entry["target"], entry["repo"])[1:], create=False))
             if entry["name"] == "tagged-caches":  # Cargo's own build locks, held through the removal
                 stack.enter_context(reap_locks(clean_tagged_lock_paths(entry["path"]), create=False))
             clean_remove_folder(entry, run_id, entry["root"], False, lambda: clean_extra_gates(entry))
@@ -2995,6 +3244,58 @@ def clean_swap_inventory() -> dict | None:
     return entry
 
 
+def clean_apfs_purgeable(volume: str = "/System/Volumes/Data") -> dict | None:
+    """macOS APFS purgeable capacity via CoreFoundation NSURLResourceValues (stdlib ctypes only; read-only).
+    Returns {availableBytes, importantAvailableBytes, opportunisticAvailableBytes, purgeableBytes} or None."""
+    if os.uname().sysname != "Darwin":
+        return None
+    try:
+        cf = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+        cf.CFURLCreateFromFileSystemRepresentation.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_bool]
+        cf.CFURLCreateFromFileSystemRepresentation.restype = ctypes.c_void_p
+        cf.CFStringCreateWithCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
+        cf.CFStringCreateWithCString.restype = ctypes.c_void_p
+        cf.CFURLCopyResourcePropertyForKey.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p)]
+        cf.CFURLCopyResourcePropertyForKey.restype = ctypes.c_bool
+        cf.CFNumberGetValue.argtypes = [ctypes.c_void_p, ctypes.c_long, ctypes.POINTER(ctypes.c_int64)]
+        cf.CFNumberGetValue.restype = ctypes.c_bool
+        cf.CFRelease.argtypes = [ctypes.c_void_p]
+        raw_path = volume.encode("utf-8")
+        url = cf.CFURLCreateFromFileSystemRepresentation(None, raw_path, len(raw_path), True)
+        if not url:
+            return None
+        try:
+            values = {}
+            keys = (("availableBytes", b"NSURLVolumeAvailableCapacityKey"),
+                    ("importantAvailableBytes", b"NSURLVolumeAvailableCapacityForImportantUsageKey"),
+                    ("opportunisticAvailableBytes", b"NSURLVolumeAvailableCapacityForOpportunisticUsageKey"))
+            for field, key_bytes in keys:
+                key = cf.CFStringCreateWithCString(None, key_bytes, 0x08000100)
+                if not key:
+                    continue
+                val, err = ctypes.c_void_p(), ctypes.c_void_p()
+                try:
+                    ok = cf.CFURLCopyResourcePropertyForKey(url, key, ctypes.byref(val), ctypes.byref(err))
+                    if ok and val.value:
+                        num = ctypes.c_int64(0)
+                        if cf.CFNumberGetValue(val, 4, ctypes.byref(num)):
+                            values[field] = int(num.value)
+                finally:
+                    if val.value:
+                        cf.CFRelease(val)
+                    if err.value:
+                        cf.CFRelease(err)
+                    cf.CFRelease(key)
+        finally:
+            cf.CFRelease(url)
+        if "availableBytes" in values and "importantAvailableBytes" in values:
+            values["purgeableBytes"] = max(0, values["importantAvailableBytes"] - values["availableBytes"])
+            return values
+    except (OSError, AttributeError, ValueError):
+        return None
+    return None
+
+
 def clean_inventory() -> list[dict]:
     """Read-only size report; older browser builds have a separate cleanup target, models and disk images do not."""
     found = []
@@ -3009,6 +3310,7 @@ def clean_inventory() -> list[dict]:
     hub = os.environ.get("HF_HUB_CACHE") or (os.path.join(os.environ["HF_HOME"], "hub") if os.environ.get("HF_HOME") else None) \
         or os.path.join(os.environ.get("XDG_CACHE_HOME") or clean_home(".cache"), "huggingface", "hub")
     redownload = "removing it means downloading it again"
+    children("model", clean_home("Models"), redownload)
     children("model", hub, redownload, lambda n: n.split("--", 1)[-1].replace("--", "/"))
     children("model", clean_home(".lmstudio", "models"), redownload, depth=2)
     ollama = os.environ.get("OLLAMA_MODELS") or clean_home(".ollama", "models")
@@ -3026,10 +3328,15 @@ def clean_inventory() -> list[dict]:
         pass
     if shutil.which("tmutil"):
         code, out = clean_run(["tmutil", "listlocalsnapshots", "/"], 30)
-        count = sum(1 for line in out.splitlines() if line.startswith("com.apple")) if code == 0 else 0
-        if count:
-            found.append({"kind": "snapshots", "name": "local snapshots", "count": count, "bytes": None,
+        snaps = [line.strip() for line in out.splitlines() if line.strip() and not line.lower().startswith("snapshots for ")] if code == 0 else []
+        if snaps:
+            found.append({"kind": "snapshots", "name": "local snapshots", "count": len(snaps), "snapshots": snaps[:20], "bytes": None,
                           "note": "macOS frees them when space runs low; `sudo tmutil deletelocalsnapshots /` removes them now"})
+    purgeable = clean_apfs_purgeable()
+    if purgeable and purgeable.get("purgeableBytes", 0) > 0:
+        found.append({"kind": "purgeable", "name": "macOS APFS purgeable", "path": "/System/Volumes/Data",
+                      "bytes": purgeable["purgeableBytes"], "sizeComplete": True, **purgeable,
+                      "note": "space macOS marks reclaimable on demand; reported separately from strict free bytes"})
     found.extend(clean_vm_inventory())
     swap = clean_swap_inventory()
     if swap:
@@ -3047,7 +3354,7 @@ def clean_inventory() -> list[dict]:
 # ---- entry points ---------------------------------------------------------------------------------------------------
 
 def clean_shown(entry: dict) -> dict:
-    out = {k: v for k, v in entry.items() if k not in ("spec", "git", "gitdir", "paths", "sizePaths", "root", "repo")}
+    out = {k: v for k, v in entry.items() if k not in ("spec", "git", "gitdir", "paths", "sizePaths", "root", "repo", "templates", "listCommand")}
     for key in ("path",):
         if out.get(key):
             out[key] = clean_tilde(out[key])
@@ -3625,7 +3932,7 @@ def clean_compress_candidates(roots: list[str], idle_days: float, at: float):
                 flags = getattr(info, "st_flags", 0)
                 if (not stat.S_ISREG(info.st_mode) or info.st_dev != device or info.st_nlink != 1 or info.st_mode & 0o111
                         or info.st_uid != os.getuid() or info.st_size < CLEAN_COMPRESS_MIN_BYTES
-                        or flags & (CLEAN_UF_COMPRESSED | CLEAN_LOCKED_FLAGS) or max(info.st_mtime, info.st_ctime) > cutoff):
+                        or flags & (CLEAN_UF_COMPRESSED | CLEAN_LOCKED_FLAGS) or reap_scratch_changed(info) > cutoff):
                     continue
                 yield full, info
 
@@ -3633,7 +3940,7 @@ def clean_compress_candidates(roots: list[str], idle_days: float, at: float):
 def clean_compress_stale_temp(path: str) -> None:
     """A temporary clone left by a compress-logs run that was killed: its writer's pid is in its name; once that process is gone the
     clone (never the original) goes."""
-    pid = path.rpartition(f".{CLEAN_COMPRESS_TEMP}-")[2]
+    pid = path.rpartition(f".{CLEAN_COMPRESS_TEMP}-")[2].removesuffix(".gz")
     if not pid.isdigit() or int(pid) == os.getpid():
         return
     try:
@@ -3715,10 +4022,78 @@ def clean_compress_one(tool: str, path: str, info, deadline: float) -> str | Non
             pass
 
 
+def clean_compress_gzip_one(tool: str, path: str, info, deadline: float) -> str | None:
+    """Losslessly gzip `path` to `path + '.gz'`, verified byte-for-byte by decompressing before unlinking the original."""
+    dest = path + ".gz"
+    if os.path.lexists(dest):
+        return "gzip-target-exists"
+    temp = f"{path}.{CLEAN_COMPRESS_TEMP}-{os.getpid()}.gz"
+    try:
+        if clean_compress_identity(os.lstat(path)) != clean_compress_identity(info):
+            return "changed-before-compression"
+        left = max(5.0, deadline - time.monotonic())
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        with os.fdopen(fd, "wb") as out_handle:
+            try:
+                done = subprocess.run([tool, "-c", path], stdin=subprocess.DEVNULL, stdout=out_handle, stderr=subprocess.PIPE, timeout=left)
+            except subprocess.TimeoutExpired:
+                return "timeout"
+        if done.returncode != 0:
+            return f"gzip-exit-{done.returncode}:{(done.stderr or b'').decode('utf-8', 'replace').strip()[:160]}"
+        left = max(5.0, deadline - time.monotonic())
+        try:
+            orig_hash, orig_len = hashlib.sha256(), 0
+            with open(path, "rb") as orig:
+                for chunk in iter(lambda: orig.read(1 << 20), b""):
+                    orig_hash.update(chunk)
+                    orig_len += len(chunk)
+            proc = subprocess.Popen([tool, "-dc", temp], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            dec_hash, dec_len = hashlib.sha256(), 0
+            try:
+                assert proc.stdout is not None
+                for chunk in iter(lambda: proc.stdout.read(1 << 20), b""):
+                    dec_hash.update(chunk)
+                    dec_len += len(chunk)
+                if proc.wait(timeout=max(5.0, deadline - time.monotonic())) != 0:
+                    return f"gzip-verify-exit-{proc.returncode}"
+            finally:
+                if proc.stdout:
+                    proc.stdout.close()
+                if proc.stderr:
+                    proc.stderr.close()
+            if dec_len != orig_len or dec_hash.digest() != orig_hash.digest():
+                return "bytes-differ"
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+            return "timeout"
+        os.utime(temp, ns=(info.st_atime_ns, info.st_mtime_ns), follow_symlinks=False)
+        os.chmod(temp, stat.S_IMODE(info.st_mode))
+        if clean_compress_held(path):
+            return "held"
+        if clean_compress_identity(os.lstat(path)) != clean_compress_identity(info):
+            return "changed-during-compression"
+        try:
+            os.link(temp, dest)
+        except FileExistsError:
+            return "gzip-target-exists"
+        os.unlink(temp)
+        os.unlink(path)
+        return None
+    except OSError as error:
+        return "os-error:" + clean_os_refusal(error)
+    finally:
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+
+
 def clean_compress(chosen: set, dry_run: bool, policy: dict | None = None) -> dict:
-    """Transparent, lossless APFS compression of idle history files (see above). Removes nothing."""
+    """Transparent, lossless APFS compression (default `apfs`) or opt-in verified `.gz` compression (`gzip`) of idle history files."""
     policy = policy if policy is not None else load_policy()
-    result = {"name": CLEAN_COMPRESS_NAME, "dryRun": dry_run, "planned": 0, "files": 0, "bytes": 0, "kept": {}, "errors": []}
+    mode = policy.get("compressLogsMode", "apfs")
+    result = {"name": CLEAN_COMPRESS_NAME, "mode": mode, "dryRun": dry_run, "planned": 0, "files": 0, "bytes": 0, "kept": {}, "errors": []}
     days = policy.get("compressLogsIdleDays", 2)
     if not isinstance(days, (int, float)) or isinstance(days, bool) or days <= 0:
         result["skipped"] = "compressLogsIdleDays is 0 (off)"
@@ -3727,10 +4102,16 @@ def clean_compress(chosen: set, dry_run: bool, policy: dict | None = None) -> di
     if not roots:
         result["skipped"] = "no compressLogsRoots configured"
         return result
-    tool = clean_compress_tool()
-    if not tool:
-        result["skipped"] = "needs macOS and afsctool (brew install afsctool)"
-        return result
+    if mode == "gzip":
+        tool = shutil.which("gzip")
+        if not tool:
+            result["skipped"] = "needs gzip"
+            return result
+    else:
+        tool = clean_compress_tool()
+        if not tool:
+            result["skipped"] = "needs macOS and afsctool (brew install afsctool)"
+            return result
     result["roots"] = len(roots)
     planned = list(clean_compress_candidates(roots, days, now()))
     if not planned:
@@ -3753,6 +4134,7 @@ def clean_compress(chosen: set, dry_run: bool, policy: dict | None = None) -> di
     if dry_run:
         return result
     before, deadline = clean_free(), time.monotonic() + CLEAN_COMPRESS_SECONDS
+    worker = clean_compress_gzip_one if mode == "gzip" else clean_compress_one
     for start in range(0, len(planned), CLEAN_COMPRESS_BATCH):
         if time.monotonic() >= deadline:
             result["deferred"] = len(planned) - start
@@ -3762,14 +4144,14 @@ def clean_compress(chosen: set, dry_run: bool, policy: dict | None = None) -> di
                 for path, info in planned[start:start + CLEAN_COMPRESS_BATCH]:
                     if time.monotonic() >= deadline:
                         break
-                    reason = clean_compress_one(tool, path, info, deadline)
+                    reason = worker(tool, path, info, deadline)
                     if reason is None:
                         result["files"] += 1
                         result["bytes"] += info.st_size
                     else:
                         key = reason.split(":", 1)[0]
                         result["kept"][key] = result["kept"].get(key, 0) + 1
-                        if key.startswith(("afsctool-exit", "os-error", "bytes-differ")):
+                        if key.startswith(("afsctool-exit", "gzip-exit", "gzip-verify-exit", "os-error", "bytes-differ")):
                             result["errors"].append({"clean": CLEAN_COMPRESS_NAME, "path": clean_tilde(path), "error": reason})
         except ReapRefused as error:  # the reaper is busy: the rest waits for the next pass
             result["skipped"] = str(error)

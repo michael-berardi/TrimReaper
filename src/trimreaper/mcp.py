@@ -69,6 +69,14 @@ TOOLS = [
                     "is true; disposable allows removal, still subject to every other check.",
      "inputSchema": {"type": "object", "required": ["path", "retention"], "additionalProperties": False, "properties": {
          "path": {"type": "string"}, "retention": {"type": "string", "enum": list(core.REAP_RETENTION_CLASSES)}}}},
+    {"name": "audit",
+     "description": "Bounded, read-only, metadata-only top-down disk hog diagnostic: writable volume df, APFS purgeable "
+                    "space, local snapshots, swap, sparse-vs-allocated VM disks, TCC/opaque gap, and why each hog stays.",
+     "annotations": {"readOnlyHint": True},
+     "inputSchema": {"type": "object", "additionalProperties": False, "properties": {
+         "minMB": {"type": "integer", "minimum": 0, "maximum": 1048576, "default": 256},
+         "budgetSeconds": {"type": "integer", "minimum": 5, "maximum": 300, "default": 30},
+         "top": {"type": "integer", "minimum": 1, "maximum": 200, "default": 25}}}},
 ]
 
 
@@ -95,6 +103,8 @@ def check_arguments(schema: dict, args: dict) -> str | None:
             return f"{key} {value!r} does not look like {spec.get('description', spec['pattern'])}"
         if "minimum" in spec and value < spec["minimum"]:
             return f"{key} must be at least {spec['minimum']}"
+        if "maximum" in spec and value > spec["maximum"]:
+            return f"{key} must be at most {spec['maximum']}"
     return None
 
 
@@ -135,6 +145,8 @@ def call(name: str, args: dict) -> dict:
         if args["retention"] not in core.REAP_RETENTION_CLASSES:
             raise host.HostError(f"retention must be one of {', '.join(core.REAP_RETENTION_CLASSES)}")
         return cli.cmd_mark(namespace(path=args["path"], retention=args["retention"]))
+    if name == "audit":
+        return cli.cmd_audit(namespace(min_mb=int(args.get("minMB", 256)), budget=int(args.get("budgetSeconds", 30)), top=int(args.get("top", 25))))
     raise KeyError(name)
 
 

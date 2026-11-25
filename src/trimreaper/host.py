@@ -56,6 +56,9 @@ DEFAULT_POLICY = {
     # to home unless absolute or ~-prefixed); none by default: the operator names their own agent history folders.
     "compressLogsIdleDays": 2,
     "compressLogsRoots": [],
+    # "apfs" (default): transparent lossless APFS compression via afsctool (filenames unchanged).
+    # "gzip": write verified .gz copy and unlink uncompressed original (opt-in for cold archives or when afsctool is absent).
+    "compressLogsMode": "apfs",
     # "archive": save work no remote holds before an expired folder goes; anything else keeps such folders.
     "cloneArchive": "archive",
     # A job whose work is conclusively over (finished, settled, its worker's cleanup record closed after verification, no live
@@ -124,6 +127,7 @@ DEFAULT_POLICY = {
     "cliReleasesKeep": 3,
     "coordinatorRoots": ["~/.cache/ut-coordinator"],
     "coordinatorJobCommand": ["ut-coordinator", "job-get"],
+    "coordinatorJobListCommand": None,
     "releaseScratchRoots": ["~/.cache/agent-scratch"],
     "agentScratchIdleMaxEntries": 200000,
     "agentScratchIdleMaxBytes": 0,
@@ -271,6 +275,8 @@ def check_policy(policy: dict) -> None:
         raise HostError(f"policy autoReap must be true or false, not {json.dumps(merged['autoReap'])}")
     if not isinstance(merged["compressLogsRoots"], list) or not all(isinstance(r, str) and r for r in merged["compressLogsRoots"]):
         raise HostError(f"policy compressLogsRoots must be a list of folder paths, not {json.dumps(merged['compressLogsRoots'])}")
+    if merged["compressLogsMode"] not in ("apfs", "gzip"):
+        raise HostError(f'policy compressLogsMode must be "apfs" or "gzip", not {json.dumps(merged["compressLogsMode"])}')
     for key in ("cloneExpiryDays", "evidenceExpiryDays", "markedEvidenceExpiryDays", "archiveExpiryDays", "cleanWorktreeArchiveExpiryDays",
                 "compressLogsIdleDays", "unsavedArchiveDays", "interruptedExpiryDays"):
         value = merged[key]
@@ -285,6 +291,9 @@ def check_policy(policy: dict) -> None:
     value = merged["coordinatorJobCommand"]
     if not isinstance(value, list) or not value or not all(isinstance(part, str) and part for part in value):
         raise HostError(f"policy coordinatorJobCommand must be a command as a non-empty list of strings, not {json.dumps(value)}")
+    list_cmd = merged["coordinatorJobListCommand"]
+    if list_cmd is not None and (not isinstance(list_cmd, list) or not list_cmd or not all(isinstance(part, str) and part for part in list_cmd)):
+        raise HostError(f"policy coordinatorJobListCommand must be null or a non-empty list of strings, not {json.dumps(list_cmd)}")
     value = merged["agentScratchIdleMaxEntries"]
     if not isinstance(value, int) or isinstance(value, bool) or value < 1:
         raise HostError(f"policy agentScratchIdleMaxEntries must be a whole number of at least 1, not {json.dumps(value)}")

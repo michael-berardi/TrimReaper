@@ -17,7 +17,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from . import __version__, clean, core, host, offload
+from . import __version__, audit as audit_mod, clean, core, host, offload
 
 BEGIN, END = "# >>> trimreaper core >>>\n", "# <<< trimreaper core <<<\n"
 CLEAN_BEGIN, CLEAN_END = "# >>> trimreaper clean >>>\n", "# <<< trimreaper clean <<<\n"
@@ -192,12 +192,18 @@ def cmd_clean(args) -> dict:
 def cmd_offload(args) -> dict:
     if args.action == "status":
         return offload.status()
+    if args.action == "prune-dangling":
+        return offload.prune_dangling(args.dry_run)
     if args.action == "restore":
         if not args.path:
             raise host.HostError("restore needs the original path")
         return offload.restore(args.path)
     limit = None if args.limit_gb is None else int(args.limit_gb * 1024 ** 3)
     return offload.offload_pass(args.dry_run, limit, args.path, args.all)
+
+
+def cmd_audit(args) -> dict:
+    return audit_mod.run_audit(min_mb=args.min_mb, budget_seconds=args.budget, top=args.top)
 
 
 def write_private(path: Path, text: str, mode: int = 0o600) -> None:
@@ -396,12 +402,18 @@ def parser() -> argparse.ArgumentParser:
     tidy.set_defaults(func=cmd_clean)
 
     move = sub.add_parser("offload", help="move cold folders to the external overflow volume (config key `offload`), leaving symlinks")
-    move.add_argument("action", choices=("run", "status", "restore"))
+    move.add_argument("action", choices=("run", "status", "restore", "prune-dangling"))
     move.add_argument("path", nargs="?", help="restore: the original path; run: only this source folder")
     move.add_argument("--dry-run", action="store_true", help="plan and size; copy and remove nothing")
     move.add_argument("--all", action="store_true", help="move everything that qualifies, not only until the disk reaches cleanToPercent")
     move.add_argument("--limit-gb", type=float, help="stop after about this many GB")
     move.set_defaults(func=cmd_offload)
+
+    disk_audit = sub.add_parser("audit", help="bounded, metadata-only top-down disk hog diagnostic (APFS purgeable, snapshots, VM disks, coverage)")
+    disk_audit.add_argument("--min-mb", type=int, default=audit_mod.DEFAULT_MIN_MB, help=f"minimum size in MiB to list in topHogs (default {audit_mod.DEFAULT_MIN_MB})")
+    disk_audit.add_argument("--budget", type=int, default=audit_mod.DEFAULT_BUDGET_SECONDS, help=f"wall-clock seconds budget (default {audit_mod.DEFAULT_BUDGET_SECONDS})")
+    disk_audit.add_argument("--top", type=int, default=audit_mod.DEFAULT_TOP, help=f"maximum topHogs entries (default {audit_mod.DEFAULT_TOP})")
+    disk_audit.set_defaults(func=cmd_audit)
 
     schedule = sub.add_parser("schedule", help="run `tick` on a schedule with launchd (macOS)")
     schedule.add_argument("action", choices=("install", "remove", "status"))

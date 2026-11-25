@@ -476,6 +476,32 @@ def reap_tracked_templates(repo: str) -> frozenset:
     return frozenset(os.path.join(repo, rel) for rel in out.split("\0") if rel and reap_env_template(rel))
 
 
+def reap_repo_templates(path: str, whole_clone: bool = False) -> frozenset:
+    """Tracked env templates for a git repository at `path` (or direct child repositories of a scratch/job folder).
+    For a whole clone, git errors refuse; elsewhere any unreadable or unsafe repository contributes nothing (fail closed)."""
+    if whole_clone:
+        return reap_tracked_templates(path)
+    found = set()
+    candidates = []
+    if os.path.lexists(os.path.join(path, ".git")):
+        candidates.append(path)
+    else:
+        try:
+            with os.scandir(path) as entries:
+                for entry in entries:
+                    if not reap_protected(entry.name) and not entry.is_symlink() and entry.is_dir(follow_symlinks=False):
+                        if os.path.lexists(os.path.join(entry.path, ".git")):
+                            candidates.append(entry.path)
+        except OSError:
+            return frozenset()
+    for repo in candidates:
+        try:
+            found.update(reap_tracked_templates(repo))
+        except (ReapRefused, OSError):
+            continue
+    return frozenset(found)
+
+
 def reap_protected(name: str) -> bool:
     """Names the reaper never enters or deletes: local secrets, the Vercel project link/config and Wrangler state."""
     name = reap_fold(name)
@@ -764,14 +790,49 @@ def reap_path_has_symlink(path: str) -> bool:
     return False
 
 
+def reap_offload_hop(path: str) -> str | None:
+    """Resolve a path crossing one verified, uid-owned TrimReaper offload symlink anywhere under `reap_home()` to its exact
+    mirror path under `reap_overflow_home()`. Any unverified, foreign-owned, or chained symlink returns None so the caller
+    refuses it as `git-error:unsafe-metadata:symlink`."""
+    try:
+        overflow = reap_overflow_home()
+        home = reap_canon(reap_home())
+        if not overflow:
+            return None
+        absolute = os.path.abspath(path)
+        if not (absolute == home or absolute.startswith(home + os.sep)):
+            return None
+        current = "/"
+        for part in Path(absolute).parts[1:]:
+            current = os.path.join(current, part)
+            try:
+                info = os.lstat(current)
+            except OSError:
+                return None
+            if stat.S_ISLNK(info.st_mode):
+                if info.st_uid != os.getuid():
+                    return None
+                mirror = reap_offloaded_mirror(current)
+                if not mirror or os.readlink(current) != mirror:
+                    return None
+                mapped = mirror if absolute == current else os.path.join(mirror, os.path.relpath(absolute, current))
+                return None if reap_path_has_symlink(mapped) else mapped
+        return None
+    except (OSError, ValueError, HostError):
+        return None
+
+
 def reap_offloaded_gitdir(repo: str, pointer: str) -> str | None:
     """The canonical overflow path for a linked-worktree gitdir pointer that crosses this engine's own verified
-    offload link, else None. A worktree's metadata may sit inside the folder TrimReaper moved while its `.git` file
-    still names the home path. Only the exact, one-hop home link this engine proves for THIS worktree can map it;
-    the link's own owner must be ours because an overflow mounted with ignored ownership reports every file as ours.
-    Every other symlink stays for safe_path to refuse."""
+    offload link, else None. A worktree's metadata may sit inside a folder TrimReaper moved while its `.git` file
+    still names the home path. Only the exact, one-hop home link this engine proves can map it; the link's own owner
+    must be ours because an overflow mounted with ignored ownership reports every file as ours. Every other symlink
+    stays for safe_path to refuse."""
     if not reap_path_has_symlink(pointer):
         return None
+    hop = reap_offload_hop(pointer)
+    if hop:
+        return hop
     try:
         overflow = reap_overflow_home()
         home = reap_canon(reap_home())
@@ -863,7 +924,9 @@ def reap_git_metadata_gate(repo: str, allow_alternates: bool = False) -> dict:
         pointer = read_small(owned_path(common)).strip()
         if not pointer or "\n" in pointer:
             raise ReapRefused("git-error:unsafe-metadata:commondir-pointer")
-        roots.append(owned_path(os.path.join(entry, pointer)))
+        common_target = os.path.abspath(os.path.join(entry, pointer))
+        common_target = reap_offload_hop(common_target) or common_target
+        roots.append(owned_path(common_target))
     roots = list(dict.fromkeys(roots))
     listed, deadline, alternates, current_root = 0, time.monotonic() + 120, [], [None]
     for root in roots:
@@ -1018,6 +1081,8 @@ def reap_git_clean_walk(repo: str, protected_ok: bool = False) -> tuple[int, str
             except FileNotFoundError:
                 break  # tracked-only status reports the missing file
             if not stat.S_ISDIR(info.st_mode):
+                if stat.S_ISLNK(info.st_mode) and info.st_uid == os.getuid() and reap_offloaded_mirror(current):
+                    break  # verified TrimReaper offload symlink; tracked-only git status still reports any real changes
                 raise ReapRefused("git-unsafe-index:non-directory-ancestor")
         tracked.add(rel)
         tracked_dirs.update("/".join(parts[:i]) for i in range(1, len(parts)))
@@ -4434,9 +4499,27 @@ def reap_scratch_idle_proof(path: str, policy: dict | None = None, seconds: floa
     started = time.monotonic()
     deadline = started + budget["seconds"]
     newest, seen, completed = [0.0], set(), [False]
+    templates_cache: list[frozenset | None] = [None]
+
+    def lazy_templates() -> frozenset:
+        if templates_cache[0] is not None:
+            return templates_cache[0]
+        if time.monotonic() >= deadline:
+            raise ReapRefused("budget-time-exceeded")
+        prev_ceiling = getattr(REAP_PROBE, "ceiling", None)
+        REAP_PROBE.ceiling = deadline if prev_ceiling is None else min(prev_ceiling, deadline)
+        try:
+            templates_cache[0] = reap_repo_templates(path, False)
+        finally:
+            REAP_PROBE.ceiling = prev_ceiling
+        if time.monotonic() >= deadline:
+            raise ReapRefused("budget-time-exceeded")
+        return templates_cache[0]
 
     def visit(rel, name, info, level, device):
         if info is None:
+            if not scratch and reap_env_template(rel) and os.path.join(path, rel) in lazy_templates():
+                return False  # git-tracked env template: never stat'ed or opened here, and does not keep a clean repository
             raise ReapRefused("protected-leaf")  # a protected name is named, never stat'ed, opened or entered
         if info.st_dev != device:
             raise ReapRefused("mountpoint")
@@ -7364,7 +7447,7 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
             scratch = item["class"] == "agent-scratch" and reap_scratch_protected(item["path"])
             protected_ok = whole_clone and reap_policy().get("cloneProtectedCopies", "remove") == "remove"
             try:
-                templates = reap_tracked_templates(item["path"]) if whole_clone else frozenset()
+                templates = reap_repo_templates(item["path"], whole_clone) if (whole_clone or (allow_git and not expiring_evidence)) else frozenset()
                 reap_protected_scan(item["path"], allow_git=allow_git, markers=True, repos=repos if allow_git else None, nested_disposable=whole_clone,
                                     templates=templates, protected_ok=protected_ok, secrets=secrets if protected_ok or scratch else None,
                                     expiring_evidence=expiring_evidence, scratch=scratch)
@@ -7468,9 +7551,9 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
             if (last.st_dev, last.st_ino) != (fence[-1][1], fence[-1][2]) or not stat.S_ISDIR(last.st_mode):
                 raise ReapRefused("identity-changed")
             again, again_dirs = [], []
-            if whole_clone:
+            if whole_clone or templates:
                 try:
-                    current = reap_tracked_templates(item["path"])
+                    current = reap_repo_templates(item["path"], whole_clone)
                 except ReapRefused:
                     if archive is None:
                         raise

@@ -40,8 +40,10 @@ PYTHONPATH=src python3 -m trimreaper --help
 Preview cleanup without registering jobs:
 
 ```sh
+trimreaper audit              # bounded top-down disk hog diagnostic (APFS purgeable, snapshots, VM disks, coverage)
 trimreaper clean --dry-run
 trimreaper clean --only npm,worktrees --dry-run
+trimreaper offload prune-dangling --dry-run
 ```
 
 Review the kept items and their reasons. Remove `--dry-run` only when ready to delete.
@@ -97,7 +99,7 @@ For other stdio MCP clients:
 {"mcpServers": {"trimreaper": {"command": "trimreaper", "args": ["mcp"]}}}
 ```
 
-Tools: `job_add`, `job_status`, `job_list`, `reap_status`, `reap`, `clean`, `mark`.
+Tools: `job_add`, `job_status`, `job_list`, `reap_status`, `reap`, `clean`, `mark`, `audit`.
 `reap` and `clean` default to dry runs; deletion requires `"dryRun": false`.
 Policy changes, scheduling and owner acknowledgment stay on the CLI.
 
