@@ -2767,7 +2767,7 @@ def reap_job_concluded(conn, job: dict) -> bool:
         source = str(record.get("source") or "")
         if not source.startswith(tuple(allowed)):
             return False
-        if source.startswith("verifier:") and not reap_verifier_accepted(conn, source):
+        if source.startswith("verifier:") and not reap_verifier_accepted(conn, source, job_id=job["id"]):
             return False
     if reap_chain_clock(conn, job) is None:
         return False
@@ -2814,23 +2814,39 @@ def reap_release_output_inside(root: str) -> bool:
 
 
 REAP_VERIFIER_ACCEPTED = re.compile(r"(?i)^\s*(?:verified|accepted)\b")
+REAP_JOB_TOKEN = re.compile(r"\bJ-\d{4,6}\b")
 
 
-def reap_verifier_accepted(conn, source: str) -> bool:
+def reap_verifier_accepted(conn, source: str, job_id: str | None = None) -> bool:
     """A `verifier:<job> ...` cleanup source counts as acceptance only once that verifier job is done and its own summary leads with
     an acceptance (verified:/accepted:). A verifier records before it reports, so a running one, one that later reported a rejection,
-    or one this store does not know proves nothing (0.24.3, review of the UltraTerm integration)."""
+    one bound to a different target job, or one this store does not know proves nothing."""
     parts = source.split(":", 1)[1].split() if ":" in source else []
     if not parts:
         return False
+    verifier_id = parts[0]
     try:
-        verifier = row(conn, "SELECT * FROM jobs WHERE id=?", (parts[0],))
+        verifier = row(conn, "SELECT * FROM jobs WHERE id=?", (verifier_id,))
     except sqlite3.Error:
         return False
     if not verifier or verifier.get("status") != "done":
         return False
     summary = str(verifier.get("summary") or "")
-    return bool(REAP_VERIFIER_ACCEPTED.match(summary)) and not re.search(r"(?i)\brejected\b", summary[:200])
+    if not REAP_VERIFIER_ACCEPTED.match(summary) or re.search(r"(?i)\brejected\b", summary[:200]):
+        return False
+    if job_id:
+        meta = job_meta(verifier)
+        for key in ("targetJob", "target_job", "verifies"):
+            named = meta.get(key)
+            if isinstance(named, str) and named.strip() and named.strip() != job_id:
+                return False
+        mentioned = {
+            tok for tok in REAP_JOB_TOKEN.findall(f"{verifier.get('title') or ''}\n{summary}")
+            if tok != verifier_id
+        }
+        if mentioned and job_id not in mentioned:
+            return False
+    return True
 
 
 def reap_recent_unconcluded(conn, scope: str, ids: list, seconds: float) -> list[str]:
@@ -7655,8 +7671,52 @@ def reap_class_git_needs(item: dict) -> tuple:
     return tuple(spec.get("git") or ())
 
 
-def reap_job_blocker(conn, job: dict, live_ids: set | None, idle: dict | None = None) -> str | None:
+_REAP_BLOCKER_SCOPE = threading.local()
+
+
+@contextmanager
+def reap_blocker_scope(conn):
+    """Attach a precomputed blocker index to the current thread for `conn` so callers (and custom host overrides of
+    `reap_job_blocker` with the original 4-argument signature) get O(1) lookups without breaking call signatures."""
+    prev = getattr(_REAP_BLOCKER_SCOPE, "current", None)
+    _REAP_BLOCKER_SCOPE.current = (id(conn), reap_blocker_index(conn))
+    try:
+        yield _REAP_BLOCKER_SCOPE.current[1]
+    finally:
+        _REAP_BLOCKER_SCOPE.current = prev
+
+
+def reap_blocker_index(conn) -> dict:
+    """Precompute non-terminal jobs and cleanup_records once per pass so reap_job_blocker runs in O(1) per job instead of
+    re-scanning the full jobs table (which is O(N^2) at thousands of jobs)."""
+    cleanup_status: dict[str, str] = {}
+    for rec in rows(conn, "SELECT terminal_id, status FROM cleanup_records"):
+        tid = rec.get("terminal_id")
+        if tid:
+            cleanup_status[tid] = rec.get("status") or ""
+    non_terminal_by_terminal: dict[str, list[tuple[str, str]]] = {}
+    awaited_by: dict[str, tuple[str, str]] = {}
+    for other in rows(conn, "SELECT * FROM jobs WHERE status NOT IN ('done','failed','cancelled')"):
+        tid = other.get("terminal_id")
+        if tid:
+            non_terminal_by_terminal.setdefault(tid, []).append((other["id"], other["status"]))
+        if not reap_pin_released(conn, other):
+            wait = job_wait(other)
+            if wait and wait.get("job") and wait["job"] not in awaited_by:
+                awaited_by[wait["job"]] = (other["id"], other["status"])
+    return {
+        "cleanup_status": cleanup_status,
+        "non_terminal_by_terminal": non_terminal_by_terminal,
+        "awaited_by": awaited_by,
+    }
+
+
+def reap_job_blocker(conn, job: dict, live_ids: set | None, idle: dict | None = None, blocker_index: dict | None = None) -> str | None:
     """Why a job's artifacts may not be touched yet; None when the job is finished, settled and its worker is gone."""
+    if blocker_index is None:
+        scoped = getattr(_REAP_BLOCKER_SCOPE, "current", None)
+        if scoped is not None and scoped[0] == id(conn):
+            blocker_index = scoped[1]
     # An interrupted job whose work a durable continuation took over is finished work: the same windows apply, from the
     # interruption clock. Every other check below still runs for it.
     clock = reap_job_finished_clock(conn, job)
@@ -7666,7 +7726,13 @@ def reap_job_blocker(conn, job: dict, live_ids: set | None, idle: dict | None = 
     if not clock:
         return "settling"
     terminal = job.get("terminal_id")
-    closed = bool(terminal) and bool(row(conn, "SELECT 1 FROM cleanup_records WHERE terminal_id=? AND status='closed'", (terminal,)))
+    if blocker_index is not None:
+        rec_status = blocker_index["cleanup_status"].get(terminal) if terminal else None
+        closed = rec_status == "closed"
+    else:
+        rec_row = row(conn, "SELECT status FROM cleanup_records WHERE terminal_id=?", (terminal,)) if terminal else None
+        rec_status = rec_row["status"] if rec_row else None
+        closed = rec_status == "closed"
     # A continued interrupted job ages from its chain's last finish, which is not this terminal's close: it waits the
     # ordinary settle window, never the shorter one a closed terminal earns.
     settle = REAP_SETTLE_SECONDS if continued else (REAP_CLOSED_SETTLE_SECONDS if closed else REAP_SETTLE_SECONDS)
@@ -7677,17 +7743,25 @@ def reap_job_blocker(conn, job: dict, live_ids: set | None, idle: dict | None = 
             return "terminal-state-unknown"
         if terminal in live_ids and not reap_open_terminal_past_grace(job, idle):
             return "worker-terminal-still-open:" + reap_terminal_cleanup_state(conn, terminal)
-        record = row(conn, "SELECT status FROM cleanup_records WHERE terminal_id=?", (terminal,))
-        if record and record["status"] in ("verified", "closing", "awaiting-final-reply", "unknown"):
-            return f"cleanup-{record['status']}"
-        for sibling in rows(conn, "SELECT id,status FROM jobs WHERE terminal_id=? AND id!=?", (terminal, job["id"])):
-            if sibling["status"] not in REAP_TERMINAL:
+        if rec_status in ("verified", "closing", "awaiting-final-reply", "unknown"):
+            return f"cleanup-{rec_status}"
+        if blocker_index is not None:
+            for sib_id, sib_status in blocker_index["non_terminal_by_terminal"].get(terminal, ()):
+                if sib_id != job["id"]:
+                    return f"terminal-shared-with:{sib_id}({sib_status})"
+        else:
+            for sibling in rows(conn, "SELECT id,status FROM jobs WHERE terminal_id=? AND id!=? AND status NOT IN ('done','failed','cancelled')", (terminal, job["id"])):
                 return f"terminal-shared-with:{sibling['id']}({sibling['status']})"
-    for other in rows(conn, "SELECT * FROM jobs"):
-        if other["status"] not in REAP_TERMINAL and not reap_pin_released(conn, other):
-            wait = job_wait(other)
-            if wait and wait["job"] == job["id"]:
-                return f"awaited-by:{other['id']}({other['status']})"
+    if blocker_index is not None:
+        waiter = blocker_index["awaited_by"].get(job["id"])
+        if waiter:
+            return f"awaited-by:{waiter[0]}({waiter[1]})"
+    else:
+        for other in rows(conn, "SELECT * FROM jobs WHERE status NOT IN ('done','failed','cancelled')"):
+            if not reap_pin_released(conn, other):
+                wait = job_wait(other)
+                if wait and wait["job"] == job["id"]:
+                    return f"awaited-by:{other['id']}({other['status']})"
     return None
 
 
@@ -8270,25 +8344,26 @@ def evidence_expiry_tick(conn, policy: dict, live: list, actions: list, errors: 
     except HostError:
         return  # state moved without a reaper home (tests, a second instance): reaping is off, silently
     live_ids, live_idle, due = {s["id"] for s in live}, reap_idle_map(live), []
-    for job in rows(conn, "SELECT * FROM jobs WHERE status IN ('done','failed','cancelled') AND finished_at IS NOT NULL AND finished_at<=? ORDER BY finished_at",
-                    (now() - scan_days * 86400,)):
-        if len(due) >= EVIDENCE_TICK_SCANS:
-            break
-        key = "evidence-expiry:" + job["id"]
-        stored = row(conn, "SELECT value FROM meta WHERE key=?", (key,))
-        try:
-            saved = json.loads(stored["value"]) if stored else {}
-            next_at = float(saved.get("next", 0)) if saved.get("expiryRule") == [days, marked_evidence_expiry_days(policy)] else 0.0
-        except (ValueError, AttributeError, TypeError):
-            next_at = 0.0
-        if now() < next_at or reap_job_blocker(conn, job, live_ids, live_idle):
-            continue
-        if not os.path.isdir(reap_cache_root() / job["id"]):  # nothing to expire: no lease, no journal line
-            conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",
-                         (key, json.dumps({"at": now(), "next": now() + EVIDENCE_RECHECK_SECONDS, "expired": 0, "reason": "no-job-folder",
-                                          "expiryRule": [days, marked_evidence_expiry_days(policy)]}, sort_keys=True)))
-            continue
-        due.append(job)
+    with reap_blocker_scope(conn):
+        for job in rows(conn, "SELECT * FROM jobs WHERE status IN ('done','failed','cancelled') AND finished_at IS NOT NULL AND finished_at<=? ORDER BY finished_at",
+                        (now() - scan_days * 86400,)):
+            if len(due) >= EVIDENCE_TICK_SCANS:
+                break
+            key = "evidence-expiry:" + job["id"]
+            stored = row(conn, "SELECT value FROM meta WHERE key=?", (key,))
+            try:
+                saved = json.loads(stored["value"]) if stored else {}
+                next_at = float(saved.get("next", 0)) if saved.get("expiryRule") == [days, marked_evidence_expiry_days(policy)] else 0.0
+            except (ValueError, AttributeError, TypeError):
+                next_at = 0.0
+            if now() < next_at or reap_job_blocker(conn, job, live_ids, live_idle):
+                continue
+            if not os.path.isdir(reap_cache_root() / job["id"]):  # nothing to expire: no lease, no journal line
+                conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",
+                             (key, json.dumps({"at": now(), "next": now() + EVIDENCE_RECHECK_SECONDS, "expired": 0, "reason": "no-job-folder",
+                                              "expiryRule": [days, marked_evidence_expiry_days(policy)]}, sort_keys=True)))
+                continue
+            due.append(job)
     if not due:
         return
     try:
@@ -8406,11 +8481,12 @@ def reap_tick(conn, policy: dict, live: list, actions: list, errors: list) -> No
         except (HostError, OSError, ValueError, sqlite3.Error) as error:
             errors.append({"reap": "terminal-handoff", "error": str(error)})
         due = []
-        for job in rows(conn, "SELECT * FROM jobs WHERE status IN ('done','failed','cancelled','interrupted') ORDER BY finished_at"):
-            if reap_state_wait(reap_state(conn, job["id"])):
-                continue
-            if not reap_job_blocker(conn, job, live_ids, live_idle) or not reap_output_terminal_blocker(conn, job, live_ids, live_idle):
-                due.append(job)
+        with reap_blocker_scope(conn):
+            for job in rows(conn, "SELECT * FROM jobs WHERE status IN ('done','failed','cancelled','interrupted') ORDER BY finished_at"):
+                if reap_state_wait(reap_state(conn, job["id"])):
+                    continue
+                if not reap_job_blocker(conn, job, live_ids, live_idle) or not reap_output_terminal_blocker(conn, job, live_ids, live_idle):
+                    due.append(job)
         if not due:
             idle = rows(conn, "SELECT * FROM jobs WHERE status IN ('parked','blocked','interrupted')")
             if not idle or (disk_level(policy, disk_state()) == "ok" and not any(reap_idle_expired(j, policy) for j in idle)):
@@ -8463,33 +8539,34 @@ def reap_pressure_pass(conn, policy: dict, live_ids: set, started: float, action
 def reap_pinned_pressure_pass(conn, live_ids: set, started: float, actions: list, errors: list, clones: list) -> None:
     """Under pressure, a FINISHED job whose only hold is a parked or interrupted job's pin gives up its pure derived output (a Cargo
     target folder, node_modules ...): the pinner rebuilds it. Anything else of the job, and every job another kind of job pins, stays."""
-    for job in rows(conn, "SELECT * FROM jobs WHERE status IN (%s) ORDER BY created_at" % ",".join("?" * len(REAP_TERMINAL)), tuple(REAP_TERMINAL)):
-        if time.monotonic() - started > REAP_TICK_SECONDS:
-            return
-        held = REAP_PIN_HOLDER.match(reap_job_blocker(conn, job, live_ids) or "")
-        if not held or held.group(2) not in ("parked", "interrupted"):
-            continue
-        key = "reap:pressure:" + job["id"]
-        last = row(conn, "SELECT value FROM meta WHERE key=?", (key,))
-        if last and now() - float(last["value"]) < REAP_PRESSURE_RECHECK_SECONDS:
-            continue
-        conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (key, str(now())))
-        REAP_PIN_ITEM.named = held.group(1)   # the pinner the blocker names: the per-item authority asks it too, wait record or not
-        try:
-            outcome = reap_job_owned(conn, job, False, "tick", clones, pressure=True)
-        except (HostError, OSError, ValueError, sqlite3.Error, ReapRefused) as error:
-            errors.append({"reapPressure": job["id"], "error": str(error)})
-            continue
-        finally:
-            REAP_PIN_ITEM.named = None
-        if outcome.get("deleted"):
-            actions.append({"did": "reaped-pinned-under-pressure", "job": job["id"], "items": outcome["deleted"], "bytes": outcome["reclaimedBytes"],
-                            "dfDeltaBytes": outcome["dfDeltaBytes"]})
-        if outcome.get("stopped"):
-            owner = getattr(REAP_CLEANUP_OWNER, "held", None)
-            if owner:
-                owner["stopped"] = outcome["stopped"]
-            return
+    with reap_blocker_scope(conn):
+        for job in rows(conn, "SELECT * FROM jobs WHERE status IN (%s) ORDER BY created_at" % ",".join("?" * len(REAP_TERMINAL)), tuple(REAP_TERMINAL)):
+            if time.monotonic() - started > REAP_TICK_SECONDS:
+                return
+            held = REAP_PIN_HOLDER.match(reap_job_blocker(conn, job, live_ids) or "")
+            if not held or held.group(2) not in ("parked", "interrupted"):
+                continue
+            key = "reap:pressure:" + job["id"]
+            last = row(conn, "SELECT value FROM meta WHERE key=?", (key,))
+            if last and now() - float(last["value"]) < REAP_PRESSURE_RECHECK_SECONDS:
+                continue
+            conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (key, str(now())))
+            REAP_PIN_ITEM.named = held.group(1)   # the pinner the blocker names: the per-item authority asks it too, wait record or not
+            try:
+                outcome = reap_job_owned(conn, job, False, "tick", clones, pressure=True)
+            except (HostError, OSError, ValueError, sqlite3.Error, ReapRefused) as error:
+                errors.append({"reapPressure": job["id"], "error": str(error)})
+                continue
+            finally:
+                REAP_PIN_ITEM.named = None
+            if outcome.get("deleted"):
+                actions.append({"did": "reaped-pinned-under-pressure", "job": job["id"], "items": outcome["deleted"], "bytes": outcome["reclaimedBytes"],
+                                "dfDeltaBytes": outcome["dfDeltaBytes"]})
+            if outcome.get("stopped"):
+                owner = getattr(REAP_CLEANUP_OWNER, "held", None)
+                if owner:
+                    owner["stopped"] = outcome["stopped"]
+                return
 
 
 def reap_tick_owned(conn, policy: dict, live: list, actions: list, errors: list, due: list, clones: list) -> None:
@@ -9564,7 +9641,7 @@ def reap_audit_inner(only: str | None, limit: int, include_items: bool, budget: 
     ctx["hardDeadline"] = ctx_hard
     if not only:  # the job audits keep their reserved share even when scratch ran over its own
         job_deadline = max(job_deadline, min(ctx_hard, time.monotonic() + budget * REAP_AUDIT_JOB_SHARE))
-    with db() as conn:
+    with db() as conn, reap_blocker_scope(conn):
         jobs = rows(conn, "SELECT * FROM jobs WHERE id=?", (only,)) if only else rows(conn, "SELECT * FROM jobs ORDER BY id")
         known = {j["id"] for j in rows(conn, "SELECT id FROM jobs")}
         cursor = {} if only else reap_audit_cursor(conn)

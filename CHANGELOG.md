@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.24.5 (2026-11-24)
+
+- **Linear-time blocker checks across thousands of jobs.** Added `jobs_terminal_id` index in the store schema and a thread-local `reap_blocker_scope(conn)` index (preserving the existing 4-argument `reap_job_blocker` signature for custom host overrides) across `reap_tick`, `reap_pinned_pressure_pass`, `evidence_expiry_tick`, and `reap_audit_inner`. Eliminates the O(N²) full-table scans that exhausted the 60-second tick budget at ~4,700 jobs before deleting a single item.
+- **Stat-cached config reads and per-pass worktree memoization.** `host.config()` caches parsed config keyed on `(st_mtime_ns, st_ctime_ns, st_size, st_ino)` while continuing to validate `diskVolume` on every hit. `clean_linked_worktrees` memoizes per clean pass while skipping the memo on fresh pre-removal safety gates (`table is None`).
+- **Safer offload and verifier checks.** `offload.move_one` re-checks live job status after copying (cleaning `.partial` on errors), rolls back the holding rename and removes the orphaned overflow copy if `os.symlink` fails, and writes an `offload-rollback-failed` receipt if rollback itself fails. `reap_verifier_accepted` rejects verifiers bound to a different target job via explicit meta (`targetJob`, `target_job`, `verifies`) or job IDs mentioned in the title/summary.
+- **Automatic swap reporting.** `clean_auto` and `clean_steady_tick` now run `clean_swap_report` so large swap holders surface automatically without needing a manual `clean` run. Regression tests in `tests/test_perf_and_safety_0245.py`.
+
 ## 0.24.4 (2026-11-24)
 
 - The clean pass's job sweep looks only at jobs that still hold something on disk (a cache folder, a named clone, a declared

@@ -163,12 +163,31 @@ def config_path() -> Path:
     return Path(override).expanduser() if override else Path.home() / ".config" / "trimreaper" / "config.json"
 
 
+_CONFIG_CACHE: dict[str, tuple[tuple | None, dict]] = {}
+
+
+def clear_config_cache() -> None:
+    _CONFIG_CACHE.clear()
+
+
 def config() -> dict:
-    """The effective configuration: defaults, then the config file. Read on every call, so a test or a long-running caller
-    always sees the current file."""
-    merged = json.loads(json.dumps(DEFAULT_CONFIG))
+    """The effective configuration: defaults, then the config file. Stat-checked on every call so a test or long-running
+    caller always sees changes immediately without re-reading and re-parsing an unchanged file."""
     path = config_path()
-    if path.exists():
+    key = str(path)
+    try:
+        st = path.stat()
+        sig: tuple | None = (st.st_mtime_ns, st.st_ctime_ns, st.st_size, st.st_ino)
+    except OSError:
+        sig = None
+    cached = _CONFIG_CACHE.get(key)
+    if cached is not None and cached[0] == sig:
+        merged = cached[1]
+        if merged["diskVolume"] is not None and not os.path.isdir(merged["diskVolume"]):
+            raise HostError(f"{path}: diskVolume {merged['diskVolume']} is not a folder that can be measured", "fix diskVolume or remove it")
+        return json.loads(json.dumps(merged))
+    merged = json.loads(json.dumps(DEFAULT_CONFIG))
+    if sig is not None:
         try:
             stored = json.loads(path.read_text())
         except (OSError, ValueError) as error:
@@ -180,7 +199,8 @@ def config() -> dict:
             raise HostError(f"{path} has unknown keys: {', '.join(unknown)}", "see docs/CONFIGURATION.md for the keys")
         merged.update(stored)
         check_config(merged, path)
-    return merged
+    _CONFIG_CACHE[key] = (sig, merged)
+    return json.loads(json.dumps(merged))
 
 
 def check_config(merged: dict, path: Path) -> None:
@@ -498,6 +518,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, cwd TEXT, created_at REAL NOT NULL,
   started_at REAL, finished_at REAL, terminal_id TEXT, meta TEXT
 );
+CREATE INDEX IF NOT EXISTS jobs_terminal_id ON jobs(terminal_id);
 CREATE TABLE IF NOT EXISTS cleanup_records (terminal_id TEXT PRIMARY KEY, status TEXT NOT NULL, recorded_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, kind TEXT NOT NULL, subject TEXT, actor TEXT, data TEXT

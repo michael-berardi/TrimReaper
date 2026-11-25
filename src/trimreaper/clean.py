@@ -419,8 +419,13 @@ def clean_main_repos(errors: list) -> list[str]:
     return sorted(found)
 
 
-def clean_linked_worktrees(repo: str) -> list[dict]:
-    """`git worktree list --porcelain -z`, without the main checkout."""
+def clean_linked_worktrees(repo: str, *, fresh: bool = False) -> list[dict]:
+    """`git worktree list --porcelain -z`, without the main checkout. Memoized per clean pass unless `fresh=True`."""
+    key = ("linked-worktrees", reap_canon(repo))
+    if not fresh:
+        cached = clean_memo_get(key)
+        if cached is not None:
+            return list(cached)
     code, out = reap_git(repo, "worktree", "list", "--porcelain", "-z")
     if code != 0:
         raise ReapRefused(f"git-error:worktree-list:{code}")
@@ -431,11 +436,14 @@ def clean_linked_worktrees(repo: str) -> list[dict]:
                 records.append(current)
             current = {}
             continue
-        key, _, value = field.partition(" ")
-        current[key] = value
+        key_f, _, value = field.partition(" ")
+        current[key_f] = value
     if current:
         records.append(current)
-    return [r for r in records[1:] if "worktree" in r and "bare" not in r]
+    result = [r for r in records[1:] if "worktree" in r and "bare" not in r]
+    if not fresh:
+        clean_memo_put(key, result)
+    return list(result)
 
 
 def clean_worktree_gitdir(repo: str, path: str) -> str | None:
@@ -1512,7 +1520,7 @@ def clean_repository_output_gates(entry: dict, table: dict | None) -> float:
         limit = min(limit, CLEAN_PROJECT_JOB_IDLE_HOURS)
     # A linked worktree (a job's copy) may symlink its dependency folder to this one, and it lives outside the repository
     # folder, so the path checks above never see it. Refuse while any such worktree still points at the folder.
-    for worktree in clean_linked_worktrees(repo):
+    for worktree in clean_linked_worktrees(repo, fresh=(table is None)):
         if os.path.islink(os.path.join(worktree["worktree"], os.path.basename(path))) and \
                 reap_canon(os.path.realpath(os.path.join(worktree["worktree"], os.path.basename(path)))) == reap_canon(path):
             raise ReapRefused("linked-worktree-symlink:" + os.path.basename(path))
@@ -3834,6 +3842,22 @@ def clean_auto_observe(conn, policy: dict, disk: dict | None, event=None) -> str
     return "pressure"
 
 
+def clean_swap_report(errors: list) -> None:
+    """Surface large macOS swap holders in automatic passes too, not only report-only inventory."""
+    try:
+        swap = clean_swap_inventory()
+    except (OSError, HostError, ReapRefused):
+        return
+    if swap and swap.get("warning") == "swap-large":
+        errors.append({
+            "clean": "swap",
+            "warning": swap["warning"],
+            "bytes": swap["bytes"],
+            "holders": swap.get("holders", []),
+            "error": swap.get("note") or "swap is large",
+        })
+
+
 def clean_auto(conn, policy: dict, actions: list, errors: list, event=None) -> None:
     """One bounded pass, with a pre-pass stamp and post-pass measured goal state: at the high watermark the ladder (until the goal is
     measured), below it the steady pass when one is due."""
@@ -3864,6 +3888,7 @@ def clean_auto(conn, policy: dict, actions: list, errors: list, event=None) -> N
                     "topBlockers": out.get("topBlockers", [])[:5]})
     errors.extend(out["errors"])
     clean_compress_report(out, actions, errors)
+    clean_swap_report(errors)
     if out.get("stopped"):
         errors.append({"clean": "auto", "stopped": out["stopped"]})
 
@@ -3912,6 +3937,7 @@ def clean_steady_tick(conn, policy: dict, actions: list, errors: list) -> None:
                         "freedBytes": after["freeBytes"] - before["freeBytes"] if after and before else None})
     errors.extend(out["errors"])
     clean_compress_report(out, actions, errors)
+    clean_swap_report(errors)
     if out.get("stopped"):
         errors.append({"clean": "steady", "stopped": out["stopped"]})
 # <<< trimreaper clean <<<

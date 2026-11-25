@@ -596,7 +596,7 @@ def signature(path: Path) -> list:
     return rows
 
 
-def move_one(item: dict, dry_run: bool) -> dict:
+def move_one(item: dict, dry_run: bool, cfg: dict | None = None) -> dict:
     path, dest = item["path"], item["dest"]
     if dry_run:
         return {"path": str(path), "to": str(dest), "bytes": item["bytes"], "moved": False, "reads": item.get("reads")}
@@ -609,6 +609,17 @@ def move_one(item: dict, dry_run: bool) -> dict:
     if tree_stats(path)["newest"] > item["stats"]["newest"]:
         shutil.rmtree(partial, ignore_errors=True)
         raise host.HostError(f"{path} changed during the copy; nothing was removed")
+    if cfg is not None and item.get("jobs"):
+        job = job_of(item["owner"])
+        if job:
+            try:
+                fresh_state = job_statuses(cfg).get(job)
+            except Exception:
+                shutil.rmtree(partial, ignore_errors=True)
+                raise
+            if fresh_state is None or fresh_state in LIVE:
+                shutil.rmtree(partial, ignore_errors=True)
+                raise host.HostError(f"{path} was not moved, job {job} became {fresh_state or 'unknown'} during the copy")
     table = core.reap_process_table()
     # The copy can take minutes: a process may have opened the folder since `refusal` checked it, whether or not our own
     # regeneration touched it. Never swap in that case.
@@ -636,7 +647,27 @@ def move_one(item: dict, dry_run: bool) -> dict:
     os.rename(partial, dest)
     holding = path.parent / f".offload-{path.name}.old"
     os.rename(path, holding)
-    os.symlink(dest, path)
+    try:
+        os.symlink(dest, path)
+    except OSError as sym_err:
+        # Roll back immediately so the original folder is never stranded at `.offload-<name>.old`
+        # and no orphaned copy is left behind at `dest` to become `.superseded-*` on the next pass.
+        restored = False
+        try:
+            if not os.path.lexists(path) and os.path.lexists(holding):
+                os.rename(holding, path)
+                restored = True
+        except OSError as rb_err:
+            core.reap_receipt({
+                "kind": "offload-rollback-failed",
+                "path": str(path),
+                "holding": str(holding),
+                "dest": str(dest),
+                "error": f"symlink: {sym_err}; rollback: {rb_err}",
+            })
+        if restored:
+            shutil.rmtree(dest, ignore_errors=True)
+        raise
     shutil.rmtree(holding)
     core.reap_receipt({"kind": "offload-done", "path": str(path), "to": str(dest), "bytes": item["bytes"], "reads": item.get("reads")})
     return {"path": str(path), "to": str(dest), "bytes": item["bytes"], "moved": True, "reads": item.get("reads")}
@@ -777,7 +808,7 @@ def offload_pass(dry_run: bool = False, limit_bytes: int | None = None, only: st
                 kept.append(entry)
             continue
         try:
-            moved.append(move_one(item, dry_run))
+            moved.append(move_one(item, dry_run, cfg=cfg))
             planned_bytes += item["bytes"]
         except (host.HostError, core.ReapRefused, OSError) as error:
             errors.append(f"{item['path']}: {error}")
