@@ -81,6 +81,47 @@ class QuietReason(Home):
         self.assertEqual(called, [])
         self.assertEqual((spent["state"], spent["retention"]), ("blocked", "unmarked"))
 
+    def test_a_stored_reason_never_survives_a_derivation_that_proves_none(self):
+        # quietReason is part of the stored identity, so a reason an earlier pass wrote must not be echoed as current when the
+        # fresh derivation proves nothing, and must be replaced when it proves a different one.
+        stored = {"path": str(self.repo / "dist"), "class": "job-clone-regenerable", "kind": "dist", "owner": "J-0100",
+                  "jobs": ["J-0100"], "root": str(self.repo), "ownership": "name-pattern", "retention": "unmarked",
+                  "state": "blocked", "blocking": "retention-preserved:unmarked", "quietReason": "dist-release-bearing"}
+        with mock.patch.object(core, "reap_item_retention", lambda item: "unmarked"):
+            kept = core.reap_audit_cached_retention(dict(stored))
+        self.assertEqual((kept["state"], kept["blocking"]), ("blocked", "retention-preserved:unmarked"))
+        self.assertNotIn("quietReason", kept)
+        def proves_fence(item):
+            item["quietReason"] = FENCE
+            return "unmarked"
+        with mock.patch.object(core, "reap_item_retention", proves_fence):
+            named = core.reap_audit_cached_retention(dict(stored))
+        self.assertEqual((named["quietReason"], named["blocking"]), (FENCE, "retention-preserved:" + FENCE))
+        self.assertEqual(named["state"], "blocked")
+
+    def test_a_scoped_stored_hold_also_walks_inside_the_listings_slice(self):
+        # Every branch that re-derives a stored hold spends the listing's slice, not only the name-fence branch: a scratch
+        # dist goes through reap_scoped_fence directly.
+        scratch = self.home / "scratch" / "J-0100"
+        (scratch / "dist" / "client").mkdir(parents=True)
+        (scratch / "dist" / "client" / "model.glb").write_bytes(b"g" * 64)  # not web output: the walk has to happen
+        (scratch / "package.json").write_text(json.dumps({"name": "fixture", "scripts": {"build": "vite build"}}))
+        stored = {"path": str(scratch / "dist"), "class": "scratch-regenerable", "kind": "dist", "owner": "J-0100",
+                  "jobs": ["J-0100"], "root": str(scratch), "ownership": "scratch-checkout", "retention": "unmarked",
+                  "state": "blocked", "blocking": "retention-preserved:unmarked", "bytes": 1}
+        seen = {}
+        real_walk = core.reap_dist_keep_reason
+        def walk(path, deadline=None):
+            seen.setdefault("deadline", deadline)
+            seen.setdefault("now", time.monotonic())
+            return real_walk(path, deadline)
+        with mock.patch.object(core, "reap_dist_keep_reason", walk):
+            kept = core.reap_audit_cached_retention(dict(stored))
+        self.assertIn("deadline", seen, "the scoped stored hold never walked its dist, so this test proved nothing")
+        self.assertIsNotNone(seen["deadline"], "a scoped stored hold walked its dist without this listing's budget")
+        self.assertLessEqual(seen["deadline"] - seen["now"], core.REAP_AUDIT_CACHED_PROOF + 0.05)
+        self.assertEqual((kept["state"], kept["retention"]), ("blocked", "unmarked"))
+
     def test_a_cached_hold_states_the_fresh_fence_and_is_never_promoted(self):
         dist = self.repo / "dist"
         first = core.reap_audit(None, 40, True, 60)

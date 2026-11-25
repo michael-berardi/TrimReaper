@@ -2315,7 +2315,7 @@ def reap_item_retention(item: dict, prove: bool = True) -> str:
     if found == REAP_DISPOSABLE and reap_scoped_derived(item):
         # a disposable marker on the dir decides retention, but never lifts the structural fences of a worktree's or checkout's derived dir:
         # Cargo's own mark, placement, and the dist allowlist and pressure rule (0.20.2 R3: the marker used to return before them)
-        fence = reap_scoped_fence(item)
+        fence = reap_scoped_fence(item, deadline=reap_scoped_deadline())
         if fence:
             item["quietReason"] = fence
             return "unmarked"
@@ -2338,7 +2338,7 @@ def reap_item_retention(item: dict, prove: bool = True) -> str:
         return REAP_DISPOSABLE
     if reap_scoped_derived(item) and cls == "job-clone-regenerable":
         item.pop("quietReason", None)
-        fence = reap_scoped_fence(item)
+        fence = reap_scoped_fence(item, deadline=reap_scoped_deadline())
         if fence:
             item["quietReason"] = fence
             return "unmarked"
@@ -2359,7 +2359,7 @@ def reap_item_retention(item: dict, prove: bool = True) -> str:
         item.pop("quietReason", None)
         if found != "unmarked" or item.get("kind") not in REAP_PRESSURE_KINDS or os.path.basename(item["path"]) != item.get("kind"):
             return found
-        fence = reap_scoped_fence(item, pressure=False)
+        fence = reap_scoped_fence(item, pressure=False, deadline=reap_scoped_deadline())
         if fence:
             item["quietReason"] = fence
             return found
@@ -4737,6 +4737,16 @@ def reap_scoped_derived(item: dict) -> bool:
         and ((item.get("class") == "job-clone-regenerable" and item.get("ownership") in REAP_SCOPED_OWNERSHIP) or item.get("class") == "scratch-regenerable")
 
 
+def reap_scoped_deadline() -> float | None:
+    """The time a scoped fence walk may spend: the few seconds a cached listing gives one stored hold, and never more than the
+    audit's own hard ceiling. One place decides that, so a walk cannot spend a budget its caller never agreed to."""
+    slice_ = reap_name_scan_deadline()
+    ceiling = getattr(REAP_PROBE, "ceiling", None)
+    if slice_ is None:
+        return ceiling
+    return slice_ if ceiling is None else min(slice_, ceiling)
+
+
 def reap_scoped_fence(item: dict, pressure: bool = True, deadline: float | None = None) -> str | None:
     """The structural reason a scoped derived dir is NOT reclaimable, else None: a target without Cargo's own marks, a vendored or misplaced
     dir, and for `dist` an allowlist miss (anything but recognisable web output, or a release shape in or beside it) and, with `pressure`, the
@@ -4896,9 +4906,11 @@ def reap_dist_keep_reason(path: str, deadline: float | None = None) -> str | Non
     any format, signed bundle, release folder or channel manifest). A nested git repository (a gh-pages worktree), a link, a file of any other
     type, anything unreadable, over budget or too deep keeps it: "dist-release-bearing" for a release shape, "dist-not-web-output" otherwise.
     0.20.2 R4: no positive build signal beside it (reap_dist_build_signal) keeps it ("dist-no-build-signal"); a versioned subfolder (v1.2.0) is a
-    release shape; .txt is limited to robots.txt and licences; and `deadline` (default: the audit's hard ceiling) keeps it when time runs out."""
+    release shape; .txt is limited to robots.txt and licences; and `deadline` keeps it when time runs out. The default is the
+    tighter of the audit's hard ceiling and the few seconds a cached listing gives one stored hold (`reap_name_scan_deadline`),
+    so no caller can spend a listing's budget on a walk it never agreed to."""
     if deadline is None:
-        deadline = getattr(REAP_PROBE, "ceiling", None)
+        deadline = reap_scoped_deadline()
     if not reap_dist_build_signal(os.path.dirname(path)):
         return "dist-no-build-signal"
     listed = 0
@@ -7205,10 +7217,7 @@ def reap_name_fence(item: dict, deadline: float | None = None) -> None:
     if os.path.basename(item.get("path") or "") != item.get("kind"):
         return
     if deadline is None:
-        deadline = reap_name_scan_deadline()  # a cached listing's few seconds per stored hold
-        ceiling = getattr(REAP_PROBE, "ceiling", None)
-        if ceiling is not None:
-            deadline = ceiling if deadline is None else min(deadline, ceiling)
+        deadline = reap_scoped_deadline()
     try:
         fence = reap_scoped_fence(item, pressure=False, deadline=deadline)
     except (ReapRefused, KeyError, TypeError, OSError):
@@ -9585,13 +9594,27 @@ def reap_audit_cached_retention(entry: dict) -> dict:
         # exact structural reason (a `dist` that is not plain web output). The state stays blocked and the guarded reap
         # re-proves every gate: the text is a label, never an authority.
         fence = item.get("quietReason") if derived == "unmarked" else None
-        label = reap_hold_label(derived, fence)  # only what this derivation proved, never a stored reason shown as current
-        if label == blocking:
-            return entry if fence == entry.get("quietReason") else {**entry, "quietReason": fence}
-        return {**entry, "blocking": label, **({"quietReason": fence} if isinstance(fence, str) and fence else {})}
+        return reap_stored_hold(entry, blocking, reap_hold_label(derived, fence), fence)
     if derived == REAP_DISPOSABLE:
-        return {**entry, "retention": derived, "state": "blocked", "blocking": "audit-retention-changed"}
-    return {**entry, "retention": derived, "state": "blocked", "blocking": reap_hold_label(derived, item.get("quietReason"))}
+        return reap_stored_hold(entry, blocking, "audit-retention-changed", None, retention=derived)
+    return reap_stored_hold(entry, blocking, reap_hold_label(derived, item.get("quietReason")), item.get("quietReason"),
+                            retention=derived)
+
+
+def reap_stored_hold(entry: dict, blocking: str, label: str, fence: str | None, retention: str | None = None) -> dict:
+    """One stored hold as this listing reports it, built only from the derivation just made: the fresh label and a
+    `quietReason` only when this derivation proved one (a reason an earlier pass stored is never shown as current, and
+    `quietReason` is part of the stored identity, so a stale one must not be written back). Identity is kept when nothing
+    changed, and the state stays blocked: a cached entry is a hint and never authorizes a removal."""
+    reason = fence[:60] if isinstance(fence, str) and fence.strip() else None
+    if label == blocking and reason == entry.get("quietReason") and retention in (None, entry.get("retention")):
+        return entry
+    kept = {k: v for k, v in entry.items() if k != "quietReason"}
+    if reason:
+        kept["quietReason"] = reason
+    if retention is not None:
+        kept["retention"] = retention
+    return {**kept, "state": "blocked", "blocking": label}
 
 
 def reap_audit_revalidate(entry: dict) -> dict | None:

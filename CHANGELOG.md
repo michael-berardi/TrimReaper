@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.24.8 (2026-11-24)
+
+- **Every branch of a stored hold spends only the listing's own slice.** 0.24.7 bounded the `dist` walk the name-fence branch starts, but a stored hold re-derived through `reap_item_retention`'s scoped branches (cache worktrees, scratch checkouts) still called `reap_scoped_fence` without a deadline, so `reap_dist_keep_reason` fell back to the whole audit's ceiling. One helper, `reap_scoped_deadline()` — `min(reap_name_scan_deadline(), ceiling)` — now decides that time in one place: `reap_scoped_fence`, `reap_name_fence` and `reap_dist_keep_reason` all default to it, and the three scoped branches pass it explicitly.
+- **A stored `quietReason` is never shown as current and never written back.** `reap_stored_hold` builds the reported hold from the derivation just made: a reason an earlier pass stored is dropped when that derivation proves none, replaced when it proves a different one, and `quietReason` (part of the stored identity) is never carried along from an old entry. The state still stays blocked and a cached entry still never authorizes a removal.
+- Regression tests in `tests/test_quiet_reason.py`: a scoped stored hold walks inside the listing's slice, and a stored reason does not survive a derivation that proves none.
+
 ## 0.24.7 (2026-11-24)
 
 - **The fence derivation spends only the time the caller can afford.** `reap_scoped_fence` now takes a `deadline` and passes it to `reap_dist_keep_reason`, so a cached listing's stored hold walks its `dist` inside the few seconds `reap_audit_cached_retention` gives that hold — `min(nameScan, ceiling)` — instead of the whole audit's ceiling, and a listing with no slice left starts no walk. `reap_name_fence` takes the same deadline. A `dist` walk that runs out of time keeps the folder and says `dist-scan-deadline`, which is the engine's own answer, never a guessed reason.
