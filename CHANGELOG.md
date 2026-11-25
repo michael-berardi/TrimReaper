@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.24.7 (2026-11-24)
+
+- **The fence derivation spends only the time the caller can afford.** `reap_scoped_fence` now takes a `deadline` and passes it to `reap_dist_keep_reason`, so a cached listing's stored hold walks its `dist` inside the few seconds `reap_audit_cached_retention` gives that hold — `min(nameScan, ceiling)` — instead of the whole audit's ceiling, and a listing with no slice left starts no walk. `reap_name_fence` takes the same deadline. A `dist` walk that runs out of time keeps the folder and says `dist-scan-deadline`, which is the engine's own answer, never a guessed reason.
+- **A stored reason is no longer shown as current.** `reap_audit_cached_retention` labels a stored hold only from the derivation it just ran; it no longer falls back to the `quietReason` an earlier pass stored when the fresh derivation proved nothing. The state still stays blocked and a cached entry still never authorizes a removal.
+- Regression tests in `tests/test_quiet_reason.py`: the cached hold's `dist` walk gets no more than the listing's slice, and a spent slice starts no walk at all.
+
 ## 0.24.6 (2026-11-24)
 
 - **A kept folder is named by the fence the engine derives, never only by its bare class.** `reap_item_retention` left a `dist` it keeps for a structural reason (`dist-not-web-output`, `dist-release-shaped`, `not-at-package-root`, `target-without-cargo`, `below-pressure-threshold`) reporting `retention-preserved:unmarked`, so an audit line and a guarded reap refusal said nothing about why the folder stayed. Every guarded refusal for an `unmarked` hold, and every fresh derivation, now names that fence; the fence is a label only, never compared and never an authority. `reap_audit_cached_retention` also states the fresh fence for a stored hold it keeps (a cached entry still never authorizes a removal and a hold the engine now derives as disposable is still shown as `audit-retention-changed`). Regression tests in `tests/test_quiet_reason.py`.

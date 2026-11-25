@@ -4737,17 +4737,18 @@ def reap_scoped_derived(item: dict) -> bool:
         and ((item.get("class") == "job-clone-regenerable" and item.get("ownership") in REAP_SCOPED_OWNERSHIP) or item.get("class") == "scratch-regenerable")
 
 
-def reap_scoped_fence(item: dict, pressure: bool = True) -> str | None:
+def reap_scoped_fence(item: dict, pressure: bool = True, deadline: float | None = None) -> str | None:
     """The structural reason a scoped derived dir is NOT reclaimable, else None: a target without Cargo's own marks, a vendored or misplaced
     dir, and for `dist` an allowlist miss (anything but recognisable web output, or a release shape in or beside it) and, with `pressure`, the
-    disk's own reading (never a verdict an earlier part of the pass took). Applies whatever marker the dir carries."""
+    disk's own reading (never a verdict an earlier part of the pass took). Applies whatever marker the dir carries. `deadline` (default: the
+    audit's hard ceiling) is the time the `dist` walk may spend: a listing that gives a stored hold a few seconds gives that walk the same."""
     if item["kind"] == "target" and not reap_cargo_target_recognised(item["path"]):
         return "target-not-recognised"
     placement = reap_derived_placement(item)
     if placement:
         return placement
     if item["kind"] == "dist":
-        kept = reap_dist_keep_reason(item["path"])
+        kept = reap_dist_keep_reason(item["path"], deadline)
         if kept:
             return kept
         if pressure and not (reap_scratch_pressure_on() if item.get("class") == "scratch-regenerable" else reap_pressure_now()):
@@ -7191,19 +7192,25 @@ def reap_worktree_forget(common: str, gitdir: str | None, removed: str) -> str:
         return "worktree-entry-kept:" + reap_named(error)
 
 
-def reap_name_fence(item: dict) -> None:
+def reap_name_fence(item: dict, deadline: float | None = None) -> None:
     """Name the structural fence that keeps a derived dir held unmarked, when the item carries none yet: a `dist` that is not
     plain web output (or is release-shaped), a `target` without Cargo's own marks, a misplaced derived dir. A fence only ever
     labels a hold, never authorizes a removal, so `pressure=False`: no pressure verdict is taken for a folder the pass did not
-    judge, and no marker the dir carries is considered."""
+    judge, and no marker the dir carries is considered. The walk it may run is bounded by `deadline`: a cached listing gives a
+    stored hold a few seconds and its `dist` walk gets exactly that, never the whole audit's ceiling."""
     if item.get("quietReason") or item.get("kind") not in REAP_PRESSURE_KINDS:
         return
     if item.get("class") not in ("job-clone-regenerable", "scratch-regenerable"):
         return
     if os.path.basename(item.get("path") or "") != item.get("kind"):
         return
+    if deadline is None:
+        deadline = reap_name_scan_deadline()  # a cached listing's few seconds per stored hold
+        ceiling = getattr(REAP_PROBE, "ceiling", None)
+        if ceiling is not None:
+            deadline = ceiling if deadline is None else min(deadline, ceiling)
     try:
-        fence = reap_scoped_fence(item, pressure=False)
+        fence = reap_scoped_fence(item, pressure=False, deadline=deadline)
     except (ReapRefused, KeyError, TypeError, OSError):
         return
     if fence:
@@ -9578,9 +9585,7 @@ def reap_audit_cached_retention(entry: dict) -> dict:
         # exact structural reason (a `dist` that is not plain web output). The state stays blocked and the guarded reap
         # re-proves every gate: the text is a label, never an authority.
         fence = item.get("quietReason") if derived == "unmarked" else None
-        if not (isinstance(fence, str) and fence.strip()):
-            fence = entry.get("quietReason") if derived == "unmarked" else None
-        label = reap_hold_label(derived, fence)
+        label = reap_hold_label(derived, fence)  # only what this derivation proved, never a stored reason shown as current
         if label == blocking:
             return entry if fence == entry.get("quietReason") else {**entry, "quietReason": fence}
         return {**entry, "blocking": label, **({"quietReason": fence} if isinstance(fence, str) and fence else {})}

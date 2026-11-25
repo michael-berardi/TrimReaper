@@ -8,6 +8,7 @@ still a refusal: the fence is a label, and a cached entry still never authorizes
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from unittest import mock
 
@@ -46,6 +47,39 @@ class QuietReason(Home):
         self.assertEqual(result["reason"], "retention-preserved:" + FENCE)
         self.assertEqual(core.reap_item(dict(item))["reason"], "retention-preserved:" + FENCE)
         self.assertTrue((dist / "client" / "model.glb").exists())
+
+    def test_a_cached_hold_gives_its_dist_walk_only_the_listings_own_slice(self):
+        # The cached listing gives each stored hold a few seconds to prove itself; the `dist` walk it starts must spend that
+        # slice and no more, never the whole audit's ceiling.
+        stored = {"path": str(self.repo / "dist"), "class": "job-clone-regenerable", "kind": "dist", "owner": "J-0100",
+                  "jobs": ["J-0100"], "root": str(self.repo), "ownership": "name-pattern", "retention": "unmarked",
+                  "state": "blocked", "blocking": "retention-preserved:unmarked", "bytes": 1}
+        seen = {}
+        original = core.reap_dist_keep_reason
+        def recording(path, deadline=None):
+            seen.setdefault("deadline", deadline)
+            seen.setdefault("now", time.monotonic())
+            return original(path, deadline)
+        with mock.patch.object(core, "reap_dist_keep_reason", recording):
+            kept = core.reap_audit_cached_retention(dict(stored))
+        self.assertIn("deadline", seen, "the dist walk ran without asking this listing what it can afford")
+        self.assertIsNotNone(seen["deadline"], "the dist walk got no deadline at all")
+        self.assertLessEqual(seen["deadline"] - seen["now"], core.REAP_AUDIT_CACHED_PROOF + 0.05)
+        self.assertEqual((kept["state"], kept["blocking"]), ("blocked", "retention-preserved:" + FENCE))
+        # and a listing whose slice is already spent starts no walk at all: the stored hold stands, named or not, never promoted
+        called = []
+        def refuse_to_scan(path, deadline=None):
+            called.append(path)
+            raise AssertionError("a listing with no budget left walked a folder")
+        previous = getattr(core.REAP_PROBE, "cachedProof", None)
+        try:
+            core.REAP_PROBE.cachedProof = time.monotonic() - 1
+            with mock.patch.object(core, "reap_dist_keep_reason", refuse_to_scan):
+                spent = core.reap_audit_cached_retention(dict(stored))
+        finally:
+            core.REAP_PROBE.cachedProof = previous
+        self.assertEqual(called, [])
+        self.assertEqual((spent["state"], spent["retention"]), ("blocked", "unmarked"))
 
     def test_a_cached_hold_states_the_fresh_fence_and_is_never_promoted(self):
         dist = self.repo / "dist"
