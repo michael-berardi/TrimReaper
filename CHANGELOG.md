@@ -1,10 +1,15 @@
 # Changelog
 
+## 0.24.9 (2026-11-24)
+
+- **Documentation only.** The 0.24.8 headline claimed that *every* branch of a stored hold spends only the listing's slice; that was true of the `dist` walk and false of two other walks a cached hold can reach. The 0.24.8 entry now states the claim it can prove and names `reap_scratch_regen_quiet` (its own 60 s idle budget) and `reap_scan_clone` (entry-count bound) as unbounded by `reap_scoped_deadline`. No code, test or behaviour change.
+
 ## 0.24.8 (2026-11-24)
 
-- **Every branch of a stored hold spends only the listing's own slice.** 0.24.7 bounded the `dist` walk the name-fence branch starts, but a stored hold re-derived through `reap_item_retention`'s scoped branches (cache worktrees, scratch checkouts) still called `reap_scoped_fence` without a deadline, so `reap_dist_keep_reason` fell back to the whole audit's ceiling. One helper, `reap_scoped_deadline()` — `min(reap_name_scan_deadline(), ceiling)` — now decides that time in one place: `reap_scoped_fence`, `reap_name_fence` and `reap_dist_keep_reason` all default to it, and the three scoped branches pass it explicitly.
+- **The `dist` walk of every stored hold spends only the listing's own slice.** 0.24.7 bounded the `dist` walk the name-fence branch starts, but a stored hold re-derived through `reap_item_retention`'s scoped branches (cache worktrees, scratch checkouts) still called `reap_scoped_fence` without a deadline, so `reap_dist_keep_reason` fell back to the whole audit's ceiling. One helper, `reap_scoped_deadline()` — `min(reap_name_scan_deadline(), ceiling)` — now decides that time in one place: `reap_scoped_fence`, `reap_name_fence` and `reap_dist_keep_reason` all default to it, and the three scoped branches pass it explicitly.
 - **A stored `quietReason` is never shown as current and never written back.** `reap_stored_hold` builds the reported hold from the derivation just made: a reason an earlier pass stored is dropped when that derivation proves none, replaced when it proves a different one, and `quietReason` (part of the stored identity) is never carried along from an old entry. The state still stays blocked and a cached entry still never authorizes a removal.
 - Regression tests in `tests/test_quiet_reason.py`: a scoped stored hold walks inside the listing's slice, and a stored reason does not survive a derivation that proves none.
+- Two walks a cached hold can still reach are **not** time-bounded by `reap_scoped_deadline`, and this release does not change them: a cached `scratch-regenerable` hold whose `dist` has no fence can reach the scratch idle walk (`reap_scratch_regen_quiet`, its own 60 s budget plus a git probe), and a cached clone `dist` can reach `reap_scan_clone`, which is capped by entry count and depth rather than time. Both predate this release; a cached listing still never authorizes a removal either way.
 
 ## 0.24.7 (2026-11-24)
 
