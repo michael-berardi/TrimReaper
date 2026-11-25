@@ -200,3 +200,75 @@ class ConcludedExpiry(Home):
         self.job("J-0108", finished_ago=4 * 86400, record=None)
         self.assertTrue(core.reap_clone_expired(["J-0108"]))
         self.assertFalse(core.reap_scratch_expired("J-0108"))
+
+
+class JobSweepOrder(Home):
+    """0.24.4: the clean pass's job sweep looks only at jobs that still hold something, newest first, so the time budget is spent
+    where the space is (4,600 finished jobs used to exhaust it before any job holding space was reached)."""
+
+    def test_sweep_skips_empty_jobs_and_starts_with_the_newest(self):
+        from trimreaper import clean
+        for n in range(1, 40):
+            self.add_job(f"J-{n:04d}", finished_ago=(50 - n) * 86400)
+        holder = self.home / ".cache/trimreaper/jobs/J-0039"
+        (holder / "out").mkdir(parents=True)
+        seen = []
+        real = core.reap_job_finished_clock
+        def spy(conn, job):
+            seen.append(job["id"])
+            return real(conn, job)
+        rung = {"job": {"hours": 1, "filter": "all", "pinned": False, "clones": True, "keepUnsaved": True}}
+        with mock.patch.object(clean, "reap_job_finished_clock", side_effect=spy), \
+                mock.patch.object(clean, "reap_live_snapshot", return_value=(set(), {})):
+            clean.clean_job_sweep(rung, True, "run-test")
+        self.assertEqual(seen[:1], ["J-0039"])
+        self.assertNotIn("J-0001", seen)
+
+
+class CacheWorktreeOwner(Home):
+    """0.24.4: a worktree at <cache root>/J-NNNN/<name> is judged by that job, not the 1-day window its own name implies."""
+
+    def test_job_folder_names_the_worktrees_job(self):
+        from trimreaper import clean
+        root = core.reap_cache_root()
+        path = str(root / "J-0201" / "wt")
+        seen = []
+        with mock.patch.object(clean, "clean_jobs_finished", side_effect=lambda ids, p: seen.append(list(ids)) or False), \
+                mock.patch.object(clean, "clean_idle_days", return_value=0.0), \
+                mock.patch.object(clean, "reap_cache_retention", return_value="unmarked"), \
+                mock.patch.object(clean, "reap_vet_root", return_value=None):
+            with self.assertRaises(core.ReapRefused):
+                clean.clean_worktree_gates({"path": path, "gitdir": None, "git": []}, 1.0, {})
+        self.assertEqual(seen, [["J-0201"]])
+        seen.clear()
+        other = str(self.home / "dev" / "J-0202" / "wt")  # any other place: an ancestor's name never names the job
+        with mock.patch.object(clean, "clean_jobs_finished", side_effect=lambda ids, p: seen.append(list(ids)) or False), \
+                mock.patch.object(clean, "clean_idle_days", return_value=0.0), \
+                mock.patch.object(clean, "reap_cache_retention", return_value="unmarked"), \
+                mock.patch.object(clean, "reap_vet_root", return_value=None):
+            with self.assertRaises(core.ReapRefused):
+                clean.clean_worktree_gates({"path": other, "gitdir": None, "git": []}, 1.0, {})
+        self.assertEqual(seen, [])
+
+
+class SwapInventory(Home):
+    """0.24.4: swap is reported with the processes behind it, since no folder rule can free it."""
+
+    def test_large_swap_names_the_holder(self):
+        from trimreaper import clean
+        outputs = {"sysctl": (0, "total = 66560.00M  used = 65893.94M  free = 666.06M  (encrypted)"),
+                   "top": (0, "PID    COMMAND          MEM   CMPRS\n869    fseventsd        78G   74G\n937    WindowServer     1107M 240M\n")}
+        with mock.patch.object(clean, "clean_run", side_effect=lambda cmd, t: outputs[cmd[0]]), \
+                mock.patch.object(clean.os, "uname", return_value=mock.Mock(sysname="Darwin")):
+            entry = clean.clean_swap_inventory()
+        self.assertEqual(entry["warning"], "swap-large")
+        self.assertEqual(entry["holders"][0]["command"], "fseventsd")
+        self.assertIn("fseventsd (pid 869)", entry["note"])
+        self.assertGreater(entry["bytes"], 60 * 1024 ** 3)
+
+    def test_small_swap_is_reported_without_a_warning(self):
+        from trimreaper import clean
+        with mock.patch.object(clean, "clean_run", return_value=(0, "total = 3072.00M  used = 2315.06M  free = 756.94M")), \
+                mock.patch.object(clean.os, "uname", return_value=mock.Mock(sysname="Darwin")):
+            entry = clean.clean_swap_inventory()
+        self.assertNotIn("warning", entry)

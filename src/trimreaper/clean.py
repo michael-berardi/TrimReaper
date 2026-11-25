@@ -689,6 +689,11 @@ def clean_worktree_gates(entry: dict, idle_days: float, table: dict | None, arch
     idle = clean_idle_days(path, entry["gitdir"], fresh=table is None)  # table None: the removal's fresh recheck
     limit = idle_days
     own_ids = reap_job_ids(os.path.basename(path))
+    parent = os.path.dirname(path)
+    if not own_ids and reap_canon(os.path.dirname(parent)) == reap_canon(str(reap_cache_root())) and CLEAN_JOB_FOLDER.fullmatch(os.path.basename(parent)):
+        # <cache root>/J-NNNN/<worktree>: the job folder it sits in names its job (0.24.4: J-4596/wt, 2.9 GB, was judged by the
+        # 1-day window because its own name, "wt", names no job). Only that exact place: never any other ancestor's name.
+        own_ids = [os.path.basename(parent)]
     if own_ids and clean_jobs_finished(own_ids, path):
         limit = min(idle_days, CLEAN_PROJECT_JOB_IDLE_HOURS / 24)
         if clean_jobs_concluded(own_ids):
@@ -2948,6 +2953,40 @@ def clean_archive_then_remove(entry: dict, run_id: str, idle: float) -> None:
 
 # ---- report-only inventory ------------------------------------------------------------------------------------------
 
+CLEAN_SWAP_WARN_BYTES = 16 * 1024 ** 3   # swap this large is disk the clean pass cannot free: name the process behind it
+CLEAN_SWAP_PROCESSES = 5
+
+
+def clean_swap_inventory() -> dict | None:
+    """Swap is disk space too, and no folder rule frees it (0.24.4: a leaking system daemon, fseventsd, held 78 GB of memory, which put
+    66 GB of swap on the system disk while every clean pass removed folders). Read-only: `sysctl vm.swapusage` and `top` (no root).
+    Above CLEAN_SWAP_WARN_BYTES the entry names the processes holding the most compressed memory and what frees it."""
+    if os.uname().sysname != "Darwin":
+        return None
+    code, out = clean_run(["sysctl", "-n", "vm.swapusage"], 10)
+    match = re.search(r"used = ([0-9.]+)M", out or "") if code == 0 else None
+    if not match:
+        return None
+    used = int(float(match[1]) * 1024 * 1024)
+    entry = {"kind": "swap", "name": "swap", "path": "/System/Volumes/VM", "bytes": used, "sizeComplete": True,
+             "note": "memory pushed to disk; it shrinks when the processes holding it free memory or restart"}
+    if used < CLEAN_SWAP_WARN_BYTES:
+        return entry
+    code, out = clean_run(["top", "-l", "1", "-o", "cmprs", "-n", str(CLEAN_SWAP_PROCESSES), "-stats", "pid,command,mem,cmprs"], 30)
+    holders = []
+    for line in (out or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 4 and parts[0].isdigit():
+            holders.append({"pid": int(parts[0]), "command": " ".join(parts[1:-2]), "memory": parts[-2], "compressed": parts[-1]})
+    entry["holders"] = holders
+    entry["warning"] = "swap-large"
+    top = holders[0] if holders else None
+    entry["note"] = ("swap is large; " + (f"{top['command']} (pid {top['pid']}) holds {top['compressed']} of compressed memory: "
+                     "restarting it frees the swap it caused (a system daemon needs an administrator; launchd restarts it)" if top
+                     else "the process holding it could not be read"))
+    return entry
+
+
 def clean_inventory() -> list[dict]:
     """Read-only size report; older browser builds have a separate cleanup target, models and disk images do not."""
     found = []
@@ -2984,6 +3023,9 @@ def clean_inventory() -> list[dict]:
             found.append({"kind": "snapshots", "name": "local snapshots", "count": count, "bytes": None,
                           "note": "macOS frees them when space runs low; `sudo tmutil deletelocalsnapshots /` removes them now"})
     found.extend(clean_vm_inventory())
+    swap = clean_swap_inventory()
+    if swap:
+        found.append(swap)
     for entry in found:
         entry.setdefault("paths", [entry["path"]] if "bytes" not in entry and entry.get("path") else [])
     clean_size_all([e for e in found if e["paths"]])
@@ -3004,6 +3046,10 @@ def clean_shown(entry: dict) -> dict:
     if entry.get("repo"):
         out["repo"] = clean_tilde(entry["repo"])
     return out
+
+
+def clean_numeric(value):
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 
 
 def clean_job_sweep(rung: dict, dry_run: bool, run_id: str, goal_met=None) -> dict:
@@ -3038,6 +3084,18 @@ def clean_job_sweep(rung: dict, dry_run: bool, run_id: str, goal_met=None) -> di
     ctx = {"run": run_id, **({"table": table, "git": {}, "sizeBudget": 20} if dry_run else {})}  # a removal sizes with the engine's own budget
     with db() as conn:
         jobs = rows(conn, "SELECT * FROM jobs WHERE status IN ('done','failed','cancelled','interrupted') ORDER BY finished_at")
+    # Only jobs that still hold something: a cache folder, a named clone, or a declared worktree on disk. Thousands of finished jobs
+    # hold nothing; walking them oldest first spent the whole time budget before reaching the recent jobs that hold the space
+    # (0.24.4: 4,600 jobs, `job-sweep-time-limit` with 0 jobs looked at, 10 GB of concluded jobs' folders kept).
+    holding = {job_id for _, ids in clones for job_id in ids}
+    try:
+        cached = {e.name for e in os.scandir(reap_cache_root()) if e.is_dir(follow_symlinks=False) or e.is_symlink()}
+    except OSError:
+        cached = None  # unreadable: look at every job, as before
+    if cached is not None:
+        jobs = [j for j in jobs if j["id"] in cached or j["id"] in holding
+                or any(os.path.lexists(p) for p in reap_declared_paths(j) if p)]
+    jobs.sort(key=lambda j: -(clean_numeric(j.get("finished_at")) or 0))  # newest first: the recent jobs hold the space
     limit = CLEAN_JOB_SECONDS // 3 if dry_run else CLEAN_JOB_SECONDS   # a dry run only estimates
     for job in jobs:
         if time.monotonic() - started > limit:

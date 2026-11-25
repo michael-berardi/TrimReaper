@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.24.4 (2026-11-24)
+
+- The clean pass's job sweep looks only at jobs that still hold something on disk (a cache folder, a named clone, a declared
+  worktree), newest first. With 4,600 finished jobs it spent its whole time budget on empty old ones (`job-sweep-time-limit`, 0 jobs
+  looked at) and never reached the recent jobs that hold the space.
+- `clean`'s report lists swap (`kind: swap`). Above 16 GB it warns (`swap-large`) and names the processes holding the most compressed
+  memory: a leaking system daemon (fseventsd at 78 GB) had put 66 GB of swap on the disk while every pass removed folders.
+- A worktree at `<cache root>/J-NNNN/<name>` is judged by job J-NNNN (finished and concluded windows apply) instead of the one-day
+  window its own name implies. Only that exact place; no other ancestor's name names a job.
+
 ## 0.24.3 (2026-11-24)
 
 - A `verifier:<job>` cleanup source makes a job concluded only once that verifier job is done and its own summary leads with an
