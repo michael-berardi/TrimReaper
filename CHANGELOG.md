@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.24.10 (2026-11-25)
+
+- **Documentation only.** `reap_scoped_fence`'s docstring called the audit's hard ceiling the default `deadline`, while the default has been `reap_scoped_deadline()` — the listing's own slice, never more than that ceiling — since 0.24.8. The docstring now names the real default and the helper that decides it. No code, test or behaviour change.
+
 ## 0.24.9 (2026-11-24)
 
 - **Documentation only.** The 0.24.8 headline claimed that *every* branch of a stored hold spends only the listing's slice; that was true of the `dist` walk and false of two other walks a cached hold can reach. The 0.24.8 entry now states the claim it can prove and names `reap_scratch_regen_quiet` (its own 60 s idle budget) and `reap_scan_clone` (entry-count bound) as unbounded by `reap_scoped_deadline`. No code, test or behaviour change.

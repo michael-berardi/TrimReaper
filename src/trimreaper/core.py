@@ -4750,8 +4750,9 @@ def reap_scoped_deadline() -> float | None:
 def reap_scoped_fence(item: dict, pressure: bool = True, deadline: float | None = None) -> str | None:
     """The structural reason a scoped derived dir is NOT reclaimable, else None: a target without Cargo's own marks, a vendored or misplaced
     dir, and for `dist` an allowlist miss (anything but recognisable web output, or a release shape in or beside it) and, with `pressure`, the
-    disk's own reading (never a verdict an earlier part of the pass took). Applies whatever marker the dir carries. `deadline` (default: the
-    audit's hard ceiling) is the time the `dist` walk may spend: a listing that gives a stored hold a few seconds gives that walk the same."""
+    disk's own reading (never a verdict an earlier part of the pass took). Applies whatever marker the dir carries. `deadline` (default:
+    `reap_scoped_deadline()`, the listing's own slice and never more than the audit's hard ceiling) is the time the `dist` walk may spend:
+    a listing that gives a stored hold a few seconds gives that walk the same."""
     if item["kind"] == "target" and not reap_cargo_target_recognised(item["path"]):
         return "target-not-recognised"
     placement = reap_derived_placement(item)
