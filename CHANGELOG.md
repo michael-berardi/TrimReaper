@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.24.6 (2026-11-24)
+
+- **A kept folder is named by the fence the engine derives, never only by its bare class.** `reap_item_retention` left a `dist` it keeps for a structural reason (`dist-not-web-output`, `dist-release-shaped`, `not-at-package-root`, `target-without-cargo`, `below-pressure-threshold`) reporting `retention-preserved:unmarked`, so an audit line and a guarded reap refusal said nothing about why the folder stayed. Every guarded refusal for an `unmarked` hold, and every fresh derivation, now names that fence; the fence is a label only, never compared and never an authority. `reap_audit_cached_retention` also states the fresh fence for a stored hold it keeps (a cached entry still never authorizes a removal and a hold the engine now derives as disposable is still shown as `audit-retention-changed`). Regression tests in `tests/test_quiet_reason.py`.
+
 ## 0.24.5 (2026-11-24)
 
 - **Linear-time blocker checks across thousands of jobs.** Added `jobs_terminal_id` index in the store schema and a thread-local `reap_blocker_scope(conn)` index (preserving the existing 4-argument `reap_job_blocker` signature for custom host overrides) across `reap_tick`, `reap_pinned_pressure_pass`, `evidence_expiry_tick`, and `reap_audit_inner`. Eliminates the O(N²) full-table scans that exhausted the 60-second tick budget at ~4,700 jobs before deleting a single item.

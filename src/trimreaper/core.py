@@ -2406,6 +2406,8 @@ def reap_item_retention(item: dict, prove: bool = True) -> str:
         return REAP_DISPOSABLE  # dist can hold a release while its job may still ship; not once every job finished cloneExpiryDays ago
     if cls == "job-archive" and reap_archive_expired(item["path"]):
         return REAP_DISPOSABLE
+    if found == "unmarked":
+        reap_name_fence(item)  # a structural fence that is the reason it stays is named, never only the bare class
     return found
 
 
@@ -7189,6 +7191,33 @@ def reap_worktree_forget(common: str, gitdir: str | None, removed: str) -> str:
         return "worktree-entry-kept:" + reap_named(error)
 
 
+def reap_name_fence(item: dict) -> None:
+    """Name the structural fence that keeps a derived dir held unmarked, when the item carries none yet: a `dist` that is not
+    plain web output (or is release-shaped), a `target` without Cargo's own marks, a misplaced derived dir. A fence only ever
+    labels a hold, never authorizes a removal, so `pressure=False`: no pressure verdict is taken for a folder the pass did not
+    judge, and no marker the dir carries is considered."""
+    if item.get("quietReason") or item.get("kind") not in REAP_PRESSURE_KINDS:
+        return
+    if item.get("class") not in ("job-clone-regenerable", "scratch-regenerable"):
+        return
+    if os.path.basename(item.get("path") or "") != item.get("kind"):
+        return
+    try:
+        fence = reap_scoped_fence(item, pressure=False)
+    except (ReapRefused, KeyError, TypeError, OSError):
+        return
+    if fence:
+        item["quietReason"] = fence
+
+
+def reap_hold_label(retention: str, quiet: str | None = None) -> str:
+    """The refusal text for one kept item: the engine's exact fence when the hold it derives is `unmarked` (a `dist` that is
+    not plain web output, a `target` without Cargo's marks, below the pressure threshold), else its retention class. A fence
+    only ever names why a folder stays: it is never compared, never stored as an authority, and never promotes a kept item."""
+    fence = quiet if retention == "unmarked" and isinstance(quiet, str) and quiet.strip() else None
+    return "retention-preserved:" + (fence[:60] if fence else retention[:40])
+
+
 def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) -> dict:
     """Gate, then (in "delete" mode) remove, one directory. The only function that removes a host's artifacts (the reaper's own
     housekeeping and evidence-file expiry are listed in docs/SAFETY.md).
@@ -7235,9 +7264,10 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
                     raise ReapRefused("retention-changed")
                 raise ReapRefused(reap_item_idle_reason(item))
             if declared != REAP_DISPOSABLE:
-                if item.get("class") in ("scratch-regenerable", "job-clone-regenerable") and declared == "unmarked" and item.get("quietReason"):
-                    raise ReapRefused("retention-preserved:" + str(item["quietReason"])[:60])
-                raise ReapRefused(f"retention-preserved:{declared[:40]}")
+                if declared == "unmarked":
+                    reap_name_fence(item)  # the exact reason it stays is reported, never only the class
+                    raise ReapRefused(reap_hold_label(declared, item.get("quietReason")))
+                raise ReapRefused(reap_hold_label(declared))
             checks.append("retention-owner-class")
             info = os.lstat(item["path"])
             if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
@@ -7274,9 +7304,7 @@ def reap_item_strict(item: dict, mode: str = "delete", ctx: dict | None = None) 
             if retention != REAP_DISPOSABLE:
                 if item.get("class") == "agent-scratch" and retention == "unmarked":
                     raise ReapRefused(reap_item_idle_reason(item))
-                if item.get("class") in ("scratch-regenerable", "job-clone-regenerable") and retention == "unmarked" and item.get("quietReason"):
-                    raise ReapRefused("retention-preserved:" + str(item["quietReason"])[:60])
-                raise ReapRefused(f"retention-preserved:{retention}")
+                raise ReapRefused(reap_hold_label(retention, item.get("quietReason")))
             checks.append("retention-disposable")
             expiring_evidence = reap_marked_evidence_item(item)
             if expiring_evidence:
@@ -9546,10 +9574,19 @@ def reap_audit_cached_retention(entry: dict) -> dict:
     finally:
         REAP_PROBE.nameScan = previous
     if derived == stored:
-        return entry
+        # The stored hold stands; state the fence the engine derives now, so an entry stored with the bare class reports the
+        # exact structural reason (a `dist` that is not plain web output). The state stays blocked and the guarded reap
+        # re-proves every gate: the text is a label, never an authority.
+        fence = item.get("quietReason") if derived == "unmarked" else None
+        if not (isinstance(fence, str) and fence.strip()):
+            fence = entry.get("quietReason") if derived == "unmarked" else None
+        label = reap_hold_label(derived, fence)
+        if label == blocking:
+            return entry if fence == entry.get("quietReason") else {**entry, "quietReason": fence}
+        return {**entry, "blocking": label, **({"quietReason": fence} if isinstance(fence, str) and fence else {})}
     if derived == REAP_DISPOSABLE:
         return {**entry, "retention": derived, "state": "blocked", "blocking": "audit-retention-changed"}
-    return {**entry, "retention": derived, "state": "blocked", "blocking": "retention-preserved:" + derived}
+    return {**entry, "retention": derived, "state": "blocked", "blocking": reap_hold_label(derived, item.get("quietReason"))}
 
 
 def reap_audit_revalidate(entry: dict) -> dict | None:
