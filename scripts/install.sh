@@ -4,7 +4,8 @@
 # system this script refuses with one sentence and installs nothing.
 # On macOS it downloads the release wheel, checks its SHA-256 before anything is installed, installs it into a
 # private venv inside ~/.trimreaper, and puts `trimreaper` in ~/.local/bin. No sudo, no shell profile edits.
-# Re-running upgrades in place.
+# Re-running upgrades in place and keeps the replaced venv as the one rollback copy (venv.previous), which
+# `trimreaper update --rollback` restores and the new version removes after its first successful run.
 # Environment: TRIMREAPER_HOME (install folder, default ~/.trimreaper), TRIMREAPER_BIN_DIR (default ~/.local/bin),
 # TRIMREAPER_VERSION (pin a release, e.g. 0.20.0), TRIMREAPER_RELEASE_BASE (override the download base, used by tests).
 set -eu
@@ -42,7 +43,15 @@ else die "needs sha256sum or shasum"; fi
 
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/trimreaper-install.XXXXXX") || die "cannot create a temporary folder"
 NEW=""; OLD=""
-trap 'rm -rf "$TMP" "$NEW" "$OLD"' EXIT
+# A failed swap puts the old venv back; a successful one keeps it as the single rollback copy.
+cleanup() {
+  rm -rf "$TMP" "$NEW"
+  if [ -n "$OLD" ] && [ -d "$OLD" ]; then
+    if [ -d "$HOME_DIR/venv" ]; then rm -rf "$OLD"
+    else mv "$OLD" "$HOME_DIR/venv" || say "install: could not restore the previous venv from $OLD" >&2; fi
+  fi
+}
+trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
@@ -66,14 +75,20 @@ python3 -m venv "$NEW" || die "cannot create the private venv (python3 -m venv f
 # The venv is moved into place below, so the check runs it the way the shim will: bin/python -m trimreaper.
 got=$("$NEW/bin/python" -m trimreaper --version 2>&1 </dev/null) || { rm -rf "$NEW"; die "the installed tool does not run: $got"; }
 [ "$got" = "trimreaper $VERSION" ] || { rm -rf "$NEW"; die "the installed tool reports '$got', not 'trimreaper $VERSION'; nothing was changed"; }
+# Marks the venv as this installer's, so `trimreaper update` re-runs the installer for it (with the same command folder).
+printf '%s\n' "$BIN_DIR" > "$NEW/.trimreaper-installer" || { rm -rf "$NEW"; die "cannot write $NEW/.trimreaper-installer"; }
 OLD="$HOME_DIR/venv.old.$$"
 rm -rf "$OLD"
 if [ -d "$HOME_DIR/venv" ]; then mv "$HOME_DIR/venv" "$OLD" || die "cannot move the old venv aside; nothing was changed"; fi
 if ! mv "$NEW" "$HOME_DIR/venv"; then
-  [ ! -d "$OLD" ] || mv "$OLD" "$HOME_DIR/venv"
   die "cannot move the new venv into place; the previous install was kept"
 fi
-rm -rf "$OLD"
+if [ -d "$OLD" ]; then
+  rm -rf "$HOME_DIR/venv.previous"
+  if mv "$OLD" "$HOME_DIR/venv.previous"; then touch "$HOME_DIR/venv.previous"  # its 7-day limit starts now
+  else rm -rf "$OLD"; say "install: the previous venv could not be kept for rollback" >&2; fi
+fi
+OLD=""
 
 # The shim calls the venv's python directly (no console-script shebang), so the moved venv keeps working.
 # A `trimreaper` this installer did not write is never overwritten. Ours carries the marker line; a shim written by

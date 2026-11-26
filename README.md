@@ -25,7 +25,8 @@ installer process to pin a release. Linux and Windows are not supported.
 Installer overrides: `TRIMREAPER_HOME` (install directory) and `TRIMREAPER_BIN_DIR`
 (command directory). Set them only for installation: at runtime, `TRIMREAPER_HOME`
 means the home folder TrimReaper may clean. Remove the default installation by deleting
-`~/.trimreaper` and `~/.local/bin/trimreaper`.
+`~/.trimreaper` and `~/.local/bin/trimreaper`, then its update cache `~/Library/Caches/trimreaper`
+and state folder `~/.local/state/trimreaper`.
 
 ### From source
 
@@ -34,6 +35,12 @@ From a checkout, no installation or runtime dependencies are needed:
 ```sh
 PYTHONPATH=src python3 -m trimreaper --help
 ```
+
+## Updates
+
+At a terminal, TrimReaper says on stderr when a newer stable release exists. `trimreaper update` installs it,
+verified against the release's `SHA256SUMS`, and keeps one rollback (`trimreaper update --rollback`). Automatic
+installation is opt-in: `trimreaper update --auto on`. See [Updates](docs/updates.md).
 
 ## First use
 
@@ -103,8 +110,15 @@ Tools: `job_add`, `job_status`, `job_list`, `reap_status`, `reap`, `clean`, `mar
 `reap` and `clean` default to dry runs; deletion requires `"dryRun": false`.
 Policy changes, scheduling and owner acknowledgment stay on the CLI.
 
+## Privacy
+
+TrimReaper works on your machine and sends no telemetry. Its one network request is an anonymous check of the public
+GitHub release record, at most daily and only from runs at a terminal (never in CI, agents or scripts). Turn it off
+with `TRIMREAPER_NO_UPDATE_CHECK=1`. Details: [PRIVACY.md](PRIVACY.md).
+
 ## Reference
 
+- [Updates, release checks and opt-in auto-update](docs/updates.md)
 - [Cleanup rules, escalation and archive restoration](docs/USAGE.md)
 - [Configuration keys and defaults](docs/CONFIGURATION.md)
 - [Safety gates and limitations](docs/SAFETY.md)

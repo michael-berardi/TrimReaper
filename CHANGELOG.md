@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.26.0 (2026-11-26)
+
+- **Update notice.** A command run at a terminal ends with `trimreaper <new> available (you have <current>) · run: trimreaper update` on stderr, after its JSON, at most once a day per version. A detached background process checks the public latest-release record once a day: one anonymous GET with a fixed User-Agent, a 4-second timeout, its result or failure cause cached in one `0600` file. Nothing is checked or printed in redirected output, CI, agent sessions or the MCP server, or with `TRIMREAPER_NO_UPDATE_CHECK=1` or `updates.checkAutomatically: false`.
+- **`trimreaper update`** shows current → new and the release notes, asks `Install <new> now? [Y/n]` at a terminal (no questions without one), and once afterwards asks about automatic installs. `--check` (exit 0 current, 10 available, 1 failed), `--skip`, `--auto on|off|status` (off by default, kept in the config file) and `--rollback`.
+- **Verified installs.** Every downloaded file is checked against the release's `SHA256SUMS` before use, in a temporary folder removed on success and failure. Installer copies run the release's verified `install.sh`; pip, uv tool and pipx copies get the verified wheel through their own command, never a package name from an index. A failed install keeps the current version and names its cause.
+- **Installer.** `install.sh` keeps the replaced venv as the single `venv.previous`, restores it if the swap fails, and marks its venv so `update` knows the copy. The new version removes `venv.previous` after its first successful command, or after seven days; interrupted-install leftovers go after an hour. The automatic-install log is one file of at most 256 KB.
+- Documentation: `docs/updates.md`, `PRIVACY.md`, short README Updates and Privacy sections, the `updates` config key.
+
 ## 0.25.0 (2026-11-25)
 
 - **Batch coordinator job status (`coordinatorJobListCommand`) eliminating N+1 hangs.** `coordinator-outputs` now supports a single-call batch command (`policy.coordinatorJobListCommand`, accepting the same JSON shapes as `offload.jobStatusCommand`) during planning, falling back to `coordinatorJobCommand` only for bounded misses and fresh pre-removal verification. `clean_coord_gates` also verifies regenerable folder shape before querying job status, avoiding unnecessary subprocesses across thousands of directories.

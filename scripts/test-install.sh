@@ -60,7 +60,11 @@ got=$(HOME="$TH" "$TH/.local/bin/trimreaper" --version) || fail "the command doe
 for leftover in "$TH/.trimreaper"/venv.new.* "$TH/.trimreaper"/venv.old.*; do
   [ ! -e "$leftover" ] || fail "staging leftover: $leftover"
 done
-say "ok: macOS re-run upgrades in place"
+[ -d "$TH/.trimreaper/venv.previous" ] || fail "the re-run kept no rollback copy"
+[ "$(cat "$TH/.trimreaper/venv/.trimreaper-installer")" = "$TH/.local/bin" ] || fail "the venv carries no installer mark"
+HOME="$TH" "$TH/.local/bin/trimreaper" config >/dev/null || fail "the upgraded command does not run a command"
+[ ! -e "$TH/.trimreaper/venv.previous" ] || fail "the rollback copy outlived the new version's first successful run"
+say "ok: macOS re-run upgrades in place, keeps one rollback copy until the first successful run"
 
 # --- macOS: a corrupted wheel is refused with the checksum error, nothing installed ---
 TH="$WORK/home2"; mkdir -p "$TH"

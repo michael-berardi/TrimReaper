@@ -17,7 +17,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from . import __version__, audit as audit_mod, clean, core, host, offload
+from . import __version__, audit as audit_mod, clean, core, host, offload, update
 
 BEGIN, END = "# >>> trimreaper core >>>\n", "# <<< trimreaper core <<<\n"
 CLEAN_BEGIN, CLEAN_END = "# >>> trimreaper clean >>>\n", "# <<< trimreaper clean <<<\n"
@@ -336,6 +336,19 @@ def cmd_config(args) -> dict:
             "worktreeHomes": clean.clean_worktree_homes()}
 
 
+def cmd_update(args) -> dict:
+    """Check now and install a newer release, or: report only, skip it, roll back, or set automatic installation."""
+    if args.check:
+        return update.cmd_check(args)
+    if args.skip:
+        return update.cmd_skip(args)
+    if args.rollback:
+        return update.rollback()
+    if args.auto:
+        return update.cmd_auto(args)
+    return update.cmd_update(args)
+
+
 def cmd_core_digest(args) -> dict:
     body = clean_body()
     return {"version": __version__, "sha256": core_digest(), "lines": core_body().count("\n"),
@@ -441,6 +454,16 @@ def parser() -> argparse.ArgumentParser:
     policy.add_argument("pairs", nargs="+", metavar="KEY=VALUE")
     policy.set_defaults(func=cmd_policy_set)
 
+    updater = sub.add_parser("update", help="check for, install, skip or opt into a newer release")
+    action = updater.add_mutually_exclusive_group()
+    action.add_argument("--check", action="store_true", help="report only: exit 0 current, 10 available, 1 check failed")
+    action.add_argument("--skip", action="store_true", help="hide this version's notice until a newer one appears")
+    action.add_argument("--rollback", action="store_true", help="restore the previous installer-managed version")
+    action.add_argument("--auto", choices=("on", "off", "status"), metavar="on|off|status",
+                        help="turn automatic installation on/off, or report the setting")
+    updater.add_argument("--background", action="store_true", help=argparse.SUPPRESS)
+    updater.set_defaults(func=cmd_update)
+
     sub.add_parser("mcp", help="serve these commands as MCP tools over stdio (for agent clients)").set_defaults(func=None)
     sub.add_parser("config", help="the effective configuration and folder layout").set_defaults(func=cmd_config)
     sub.add_parser("core-digest", help="SHA-256 of the engine (and of the clean pass) an embedding host must vendor byte for byte").set_defaults(func=cmd_core_digest)
@@ -474,4 +497,13 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, sqlite3.Error, ValueError, TypeError, KeyError) as error:
         return fail(f"{error.__class__.__name__}: {error}", "nothing further was attempted; the receipts say what ran")
     print(json.dumps(out, indent=2, sort_keys=True, default=str))
-    return 3 if out.get("errors") or out.get("stopped") else 0
+    sys.stdout.flush()
+    if args.command == "update":
+        return update.check_exit(out) if args.check else 0
+    code = 3 if out.get("errors") or out.get("stopped") else 0
+    try:
+        update.prune(code == 0)  # the rollback copy goes after the new version's first successful run
+        update.after_command()  # after the command's own JSON: the notice on stderr, then a detached daily check
+    except (host.HostError, OSError, ValueError):
+        pass  # an update check or notice is never a reason to fail the user's command
+    return code

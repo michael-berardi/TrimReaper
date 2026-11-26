@@ -148,6 +148,8 @@ DEFAULT_CONFIG = {
     "diskVolume": None,               # volume measured for disk pressure; default: /System/Volumes/Data, else /
     "worktreeHomes": None,            # where agent tools keep worktrees; default: the known homes (docs/CONFIGURATION.md)
     "offload": None,                  # overflow to an external volume: {"root", "minFreeGB", "sources"} (off until set)
+    # Release checks are anonymous and at most daily; automatic installation is an opt-in (docs/updates.md).
+    "updates": {"checkAutomatically": True, "installAutomatically": False, "autoPrompted": False},
     "policy": {},
 }
 
@@ -237,6 +239,10 @@ def check_config(merged: dict, path: Path) -> None:
     if merged["offload"] is not None:
         from . import offload
         offload.check(merged["offload"], path)
+    updates = merged["updates"]
+    if not isinstance(updates, dict) or set(updates) - set(DEFAULT_CONFIG["updates"]) \
+            or not all(isinstance(value, bool) for value in updates.values()):
+        bad("updates", "an object of true/false switches (checkAutomatically, installAutomatically, autoPrompted)")
     if not isinstance(merged["policy"], dict):
         bad("policy", "an object")
     check_policy(merged["policy"])
