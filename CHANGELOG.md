@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.26.0 (2026-11-26)
+
+- **Privacy defaults.** `clean` passes `HOMEBREW_NO_ANALYTICS=1`, `DO_NOT_TRACK=1`, `HF_HUB_DISABLE_TELEMETRY=1`, `NPM_CONFIG_UPDATE_NOTIFIER=false` and `PIP_DISABLE_PIP_VERSION_CHECK=1` to every tool cleaner it starts. The install and release-build scripts also set `DO_NOT_TRACK=1`, `HOMEBREW_NO_ANALYTICS=1` and `PIP_DISABLE_PIP_VERSION_CHECK=1`; nothing in the tool reports usage anywhere.
+- **Private, bounded local state.** The launchd error log is created 0600 and truncated above 1 MiB on scheduled ticks and schedule status checks. Scheduled ticks now remove dated receipts older than 30 days, but only when the cleanup owner journal is settled; an unfinished run keeps its receipts for review.
+- README `## Privacy` states exactly what the installer downloads, that ordinary runs make no network request, what is stored locally and for how long, which user-chosen commands can reach the network, and how to delete it all. `tests/test_privacy.py` fails if a telemetry/analytics package or endpoint is reintroduced, if the no-network defaults change, or if the private-permission and retention guarantees regress.
+
 ## 0.25.0 (2026-11-25)
 
 - **Batch coordinator job status (`coordinatorJobListCommand`) eliminating N+1 hangs.** `coordinator-outputs` now supports a single-call batch command (`policy.coordinatorJobListCommand`, accepting the same JSON shapes as `offload.jobStatusCommand`) during planning, falling back to `coordinatorJobCommand` only for bounded misses and fresh pre-removal verification. `clean_coord_gates` also verifies regenerable folder shape before querying job status, avoiding unnecessary subprocesses across thousands of directories.

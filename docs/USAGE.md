@@ -19,7 +19,7 @@ trimreaper clean --trim-vm       # also shrink a stopped Colima VM's disk file (
 
 | What | How |
 |---|---|
-| npm, pnpm, yarn (1.x), bun, uv, pip, Go build, Homebrew caches | The tool's own cleaner (`npm cache clean --force`, `uv cache prune`, `brew cleanup --prune=all` ...), run from your home folder and skipped while that tool runs. Homebrew also drops old versions of installed formulae; it never uninstalls one (`HOMEBREW_NO_AUTOREMOVE`) |
+| npm, pnpm, yarn (1.x), bun, uv, pip, Go build, Homebrew caches | The tool's own cleaner (`npm cache clean --force`, `uv cache prune`, `brew cleanup --prune=all` ...), run from your home folder and skipped while that tool runs. Every cleaner gets `HOMEBREW_NO_ANALYTICS=1`, `DO_NOT_TRACK=1`, `HF_HUB_DISABLE_TELEMETRY=1`, `NPM_CONFIG_UPDATE_NOTIFIER=false` and `PIP_DISABLE_PIP_VERSION_CHECK=1`. Homebrew also drops old versions of installed formulae; it never uninstalls one (`HOMEBREW_NO_AUTOREMOVE`) |
 | Docker build cache | `docker builder prune -af`, only when Docker is already running on a local socket (never a remote `DOCKER_HOST` or context, never volumes) |
 | Cargo's registry & git cache, Xcode's DerivedData, SwiftPM cache, CoreSimulator caches | Folder by folder through the same guarded removal as job folders, skipped while Cargo, rust-analyzer, Swift, Simulator or Xcode runs (`~/Library/org.swift.swiftpm` security/configuration/SDKs, Xcode Archives and Simulator Devices are never touched) |
 | Developer tool & macOS per-user caches (`dev-tool-caches`, `darwin-user-caches`) | Recognized idle regenerable caches under `~/.cache` / `~/Library/Caches` (Puppeteer, Cypress, Electron, Ruff, Mypy, node-gyp, TypeScript) and macOS `_CS_DARWIN_USER_CACHE_DIR` (`clang`, `com.google.chrome.for.testing.helper`, `org.swift.swiftpm`, `node-compile-cache`), skipped while their tool runs or within the idle window |
@@ -244,7 +244,9 @@ for the details and [docs/CONFIGURATION.md](CONFIGURATION.md) for `releaseArtifa
 ## Receipts and one owner at a time
 
 Each removal writes a plan record before it starts and a result record after it ends, to
-`stateDir/reaper/receipts-YYYYMMDD.jsonl` (private, append-only). Only one TrimReaper process removes things at a time.
+`stateDir/reaper/receipts-YYYYMMDD.jsonl` (private, append-only). Scheduled ticks (`tick --record`) remove receipt files
+older than 30 days once the cleanup owner journal is settled, and keep the launchd error log owner-only and at most
+1 MiB. Only one TrimReaper process removes things at a time.
 If a run stops part-way (a crash, a full disk, a folder that changed during removal), every later run refuses until
 someone reviews the receipts and acknowledges them: `trimreaper owner status`, then `trimreaper owner acknowledge`
 ([docs/SAFETY.md](SAFETY.md#acknowledging-a-stopped-run)).

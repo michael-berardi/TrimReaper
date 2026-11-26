@@ -15,6 +15,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from . import __version__, audit as audit_mod, clean, core, host, offload
@@ -23,6 +24,9 @@ BEGIN, END = "# >>> trimreaper core >>>\n", "# <<< trimreaper core <<<\n"
 CLEAN_BEGIN, CLEAN_END = "# >>> trimreaper clean >>>\n", "# <<< trimreaper clean <<<\n"
 # lsof lives in /usr/sbin, which cron and launchd leave off PATH; without it every item is kept as probe-unavailable.
 SYSTEM_PATH = ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
+# Local state only: the launchd error log is capped, and dated receipts age out after settled runs.
+SCHEDULE_LOG_BYTES = 1024 * 1024
+RECEIPT_RETENTION_DAYS = 30
 
 
 class Parser(argparse.ArgumentParser):
@@ -167,6 +171,8 @@ def cmd_tick(args) -> dict:
         errors.append(f"offload: {error}")
     out = {"at": host.iso(), "actions": actions, "errors": errors}
     if args.record:
+        private_schedule_log()
+        out["receiptsPruned"] = prune_old_receipts()
         write_private(host.state_dir() / "last-tick.json", json.dumps(out, indent=2, sort_keys=True, default=str) + "\n")
     return out
 
@@ -216,6 +222,62 @@ def write_private(path: Path, text: str, mode: int = 0o600) -> None:
     os.replace(temporary, path)
 
 
+def private_schedule_log() -> None:
+    """launchd opens StandardErrorPath itself. Create it owner-only before it does, and cap what it can grow to."""
+    path = host.state_dir() / "schedule-errors.log"
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    except OSError:
+        return
+    try:
+        info = os.fstat(fd)
+        if info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) != 0o600:
+            os.fchmod(fd, 0o600)
+        if info.st_size > SCHEDULE_LOG_BYTES:
+            os.ftruncate(fd, 0)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def prune_old_receipts(days: int = RECEIPT_RETENTION_DAYS) -> int:
+    """Age out dated receipts only after the owner journal is settled: an unfinished run still needs its receipts."""
+    if days < 1:
+        return 0
+    try:
+        owner = core.tool_reap_owner_status({})
+    except (core.ReapRefused, host.HostError, OSError):
+        return 0
+    if owner.get("phase") not in ("none", "finished", "acknowledged"):
+        return 0
+    cutoff = time.time() - days * 86400
+    directory = host.reap_receipt_dir()
+    try:
+        entries = list(os.scandir(directory))
+    except OSError:
+        return 0
+    pruned = 0
+    for entry in entries:
+        if not (entry.name.startswith("receipts-") and entry.name.endswith(".jsonl")):
+            continue
+        try:
+            info = entry.stat(follow_symlinks=False)
+        except OSError:
+            continue
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
+            continue
+        if info.st_mtime >= cutoff:
+            continue
+        try:
+            os.unlink(entry.path)
+            pruned += 1
+        except OSError:
+            pass
+    return pruned
+
+
 SCHEDULE_LABEL = "io.github.trimreaper.tick"
 
 
@@ -239,6 +301,7 @@ def cmd_schedule(args) -> dict:
                 "ProcessType": "Background", "LowPriorityIO": True, "Nice": 10, "EnvironmentVariables": env,
                 "StandardOutPath": os.devnull, "StandardErrorPath": str(host.state_dir() / "schedule-errors.log")}
         host.state_dir().mkdir(parents=True, exist_ok=True, mode=0o700)  # launchd does not create the error log's folder
+        private_schedule_log()  # launchd writes its own stderr, so create the file 0600 before it does
         write_private(plist, plistlib.dumps(spec).decode(), 0o644)
         launchctl("bootout", f"{domain}/{SCHEDULE_LABEL}")  # an older copy, if any; absent is fine
         code, text = launchctl("bootstrap", domain, str(plist))
@@ -248,6 +311,7 @@ def cmd_schedule(args) -> dict:
         code, text = launchctl("bootout", f"{domain}/{SCHEDULE_LABEL}")
         if plist.exists():
             plist.unlink()
+    private_schedule_log()
     loaded = launchctl("print", f"{domain}/{SCHEDULE_LABEL}")[0] == 0
     last = host.state_dir() / "last-tick.json"
     try:

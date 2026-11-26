@@ -17,7 +17,7 @@ commit=$(git rev-parse HEAD)
 rm -rf "$OUT"; mkdir -p "$OUT"
 stage=$(mktemp -d "${TMPDIR:-/tmp}/trimreaper-build.XXXXXX"); trap 'rm -rf "$stage"' EXIT
 # Deterministic: fixed zip timestamps (SOURCE_DATE_EPOCH) and a fixed hash seed.
-SOURCE_DATE_EPOCH=315532800 PYTHONHASHSEED=0 python3 -m pip wheel --no-deps --quiet --wheel-dir "$stage" . \
+DO_NOT_TRACK=1 PIP_DISABLE_PIP_VERSION_CHECK=1 SOURCE_DATE_EPOCH=315532800 PYTHONHASHSEED=0 python3 -m pip wheel --no-deps --quiet --wheel-dir "$stage" . \
   || die "the wheel build failed (python3 -m pip wheel)"
 set -- "$stage"/trimreaper-*-py3-none-any.whl
 [ -f "$1" ] || die "no wheel was built"

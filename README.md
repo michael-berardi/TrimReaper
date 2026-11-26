@@ -8,6 +8,30 @@ Each guarded removal writes a receipt so you can see what happened and why.
 Use it when agent jobs leave more cleanup than you want to handle by hand. Preview a pass
 before deleting anything. Read the [safety model and its limits](docs/SAFETY.md) before scheduling it.
 
+## Privacy
+
+TrimReaper makes no network requests during normal use. It has no telemetry, analytics, crash reporting, update checks,
+accounts or install IDs, and no cloud service. TrimReaper itself sends no prompts, file contents, paths or identifiers
+anywhere: it reads local folders, Git metadata and local tool caches.
+
+Installing is the one network step you start: the installer downloads the release wheel and its SHA-256 list from
+GitHub, checks the checksum and installs offline. The tools `clean` starts (Homebrew, npm, uv, pip and the rest) run
+locally with analytics, update notices and version checks turned off. Git and Docker probes use local data and a local
+socket; TrimReaper never fetches, pushes or checks for updates. If you configure `coordinatorJobCommand`,
+`coordinatorJobListCommand` or `offload.jobStatusCommand`, TrimReaper runs those commands you chose; whatever they send
+over a network is up to that command.
+
+Local state: `~/.config/trimreaper/config.json` (folders and policy),
+`~/.local/state/trimreaper/` (job titles and paths in `state.sqlite3`, `reaper/receipts-YYYYMMDD.jsonl` with removal
+paths and outcomes, `last-tick.json` and `schedule-errors.log`), and `~/.cache/trimreaper/` (archives of unsaved work
+and per-job scratch). State files are created 0600 in 0700 folders. Scheduled ticks remove receipts older than 30 days
+once no cleanup run is awaiting review and truncate the error log above 1 MiB. Archives hold copies of your files until
+their retention window removes them; keep any copy you still need.
+
+To delete everything: run `trimreaper schedule remove`, then delete `~/.config/trimreaper`,
+`~/.local/state/trimreaper`, `~/.cache/trimreaper`, `~/.trimreaper` and `~/.local/bin/trimreaper`. If you configured
+offload, also delete the mirrored folders under its configured `root`.
+
 ## Install
 
 Requires macOS, Python 3.10 or newer, `git`, `lsof` and `ps`. If needed, install Python
