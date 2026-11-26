@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased (dedupe of dependency trees; version set at release)
+
+- **dedupe-clones reaches dependency trees in worktrees and checkouts.** On a busy machine 17 GB of byte-identical files sat in the `node_modules` of agent worktrees, coordinator job folders and live checkouts, and the pass planned 0: it walked only TrimReaper's own job folders and agent scratch, kept a 256 KB size floor and a six-hour quiet window. It now also walks every `node_modules` found by name in the clone bases (bounded in depth and time) and the coordinator job folders the batch list command reports idle. Inside a dependency tree the floor is 16 KB and the quiet window 30 minutes; a repository's own files keep the strict rules. Protected leaves (`.wrangler`, `.vercel`, `.env*`, `.dev.vars*`) are never entered, nested roots are walked once, and an unreadable job list adds nothing and is named. Clones go through `clonefile(2)` directly instead of one `cp -c` per file. First run on the operator machine: 72 111 files, 6.2 GB freed (filesystem delta), nothing deleted.
+
 ## 0.25.0 (2026-11-25)
 
 - **Batch coordinator job status (`coordinatorJobListCommand`) eliminating N+1 hangs.** `coordinator-outputs` now supports a single-call batch command (`policy.coordinatorJobListCommand`, accepting the same JSON shapes as `offload.jobStatusCommand`) during planning, falling back to `coordinatorJobCommand` only for bounded misses and fresh pre-removal verification. `clean_coord_gates` also verifies regenerable folder shape before querying job status, avoiding unnecessary subprocesses across thousands of directories.

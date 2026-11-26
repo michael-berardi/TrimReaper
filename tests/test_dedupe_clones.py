@@ -121,5 +121,64 @@ class Elsewhere(Base):
         self.assertIn("dedupe-clones", clean.CLEAN_STEADY_NAMES)
 
 
+class DependencyTrees(Base):
+    """2026-11-26: 17 GB of byte-identical files sat in the node_modules of agent worktrees and live checkouts; the pass planned 0,
+    because the roots were only trimreaper's own job folders, the size floor was 256 KB and the quiet window six hours."""
+
+    def test_small_dependency_files_qualify_after_the_short_quiet_window(self):
+        dep = write(self.tmp / "repo" / "node_modules" / "pkg" / "index.js", os.urandom(20 * 1024), age=time.time() - 3600)
+        own = write(self.tmp / "repo" / "src" / "index.js", os.urandom(20 * 1024), age=time.time() - 3600)
+        at = time.time() + clean.CLEAN_DEDUPE_DEP_MIN_AGE_SECONDS + 60   # ctime cannot be backdated
+        self.assertIsNotNone(clean.clean_dedupe_candidate(str(dep), at))
+        self.assertIsNone(clean.clean_dedupe_candidate(str(own), at))  # a repository's own file keeps the strict floor
+        fresh = write(self.tmp / "repo" / "node_modules" / "pkg" / "new.js", os.urandom(20 * 1024), age=time.time())
+        self.assertIsNone(clean.clean_dedupe_candidate(str(fresh), time.time()))  # an install still writing is left alone
+        tiny = write(self.tmp / "repo" / "node_modules" / "pkg" / "tiny.js", b"x" * 1024, age=time.time() - 3600)
+        self.assertIsNone(clean.clean_dedupe_candidate(str(tiny), at))
+
+    def test_dependency_roots_are_found_in_clone_bases_but_never_inside_protected_or_git(self):
+        base = self.tmp / "dev"
+        (base / "a" / "node_modules").mkdir(parents=True)
+        (base / ".seowt-b" / "site" / "node_modules").mkdir(parents=True)
+        (base / "c" / ".wrangler" / "node_modules").mkdir(parents=True)
+        (base / "d" / ".git" / "node_modules").mkdir(parents=True)
+        with unittest.mock.patch.object(clean, "reap_clone_bases", return_value=[(base, None)]):
+            found = sorted(clean.clean_dedupe_dep_roots([]))
+        self.assertEqual(found, sorted([str(base / "a" / "node_modules"), str(base / ".seowt-b" / "site" / "node_modules")]))
+
+    def test_walk_never_enters_protected_leaves(self):
+        write(self.tmp / "nm" / ".wrangler" / "state.bin")
+        write(self.tmp / "nm" / ".vercel" / "out.bin")
+        self.assertEqual([p for p, _ in clean.clean_dedupe_walk([str(self.tmp / "nm")], self.now)], [])
+
+    def test_coordinator_roots_take_only_idle_jobs_the_list_names(self):
+        coord = self.tmp / "coord"
+        for name in ("J-0001", "J-0002", "J-0003", "notes"):
+            (coord / name).mkdir(parents=True)
+        policy = {"coordinatorRoots": [str(coord)], "coordinatorJobListCommand": ["x"]}
+        with unittest.mock.patch.object(clean, "clean_coord_batch", return_value={"J-0001": ("done", None), "J-0002": ("running", None)}):
+            roots = clean.clean_dedupe_coord_roots(policy, [])
+        self.assertEqual([Path(r).name for r in roots], ["J-0001"])
+        errors = []
+        with unittest.mock.patch.object(clean, "clean_coord_batch", return_value=None):
+            self.assertEqual(clean.clean_dedupe_coord_roots(policy, errors), [])
+        self.assertTrue(errors)  # an unreadable job list is named, never guessed
+
+    def test_nested_roots_are_walked_once(self):
+        a = str(self.tmp / "x")
+        self.assertEqual(clean.clean_dedupe_unnested([a + "/y/node_modules", a, a]), [a])
+
+    @unittest.skipUnless(os.uname().sysname == "Darwin", "APFS clones need macOS")
+    def test_duplicate_dependency_files_across_worktrees_become_clones(self):
+        data = os.urandom(40 * 1024)
+        a = write(self.tmp / "wt1" / "node_modules" / "p" / "lib.js", data, age=time.time() - 3600)
+        b = write(self.tmp / "wt2" / "node_modules" / "p" / "lib.js", data, age=time.time() - 3600)
+        done = clean.clean_dedupe_run([str(self.tmp / "wt1"), str(self.tmp / "wt2")], dry_run=False,
+                                     at=time.time() + clean.CLEAN_DEDUPE_DEP_MIN_AGE_SECONDS + 60)
+        self.assertEqual((done["files"], done["errors"]), (1, []))
+        self.assertEqual(clean.clean_dedupe_private_bytes(str(b)), 0)
+        self.assertEqual((a.read_bytes(), b.read_bytes()), (data, data))
+
+
 if __name__ == "__main__":
     unittest.main()
