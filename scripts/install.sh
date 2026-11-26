@@ -9,6 +9,8 @@
 # Environment: TRIMREAPER_HOME (install folder, default ~/.trimreaper), TRIMREAPER_BIN_DIR (default ~/.local/bin),
 # TRIMREAPER_VERSION (pin a release, e.g. 0.20.0), TRIMREAPER_RELEASE_BASE (override the download base, used by tests).
 set -eu
+# Nothing this installer starts reports usage anywhere: Homebrew analytics, pip version checks and DNT-aware tools stay off.
+export DO_NOT_TRACK=1 HOMEBREW_NO_ANALYTICS=1 PIP_DISABLE_PIP_VERSION_CHECK=1
 
 REPO="michael-berardi/TrimReaper"
 HOME_DIR="${TRIMREAPER_HOME:-$HOME/.trimreaper}"

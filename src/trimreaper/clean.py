@@ -45,7 +45,10 @@ CLEAN_AUTO_QUIET_SECONDS = 3600  # ... and after a pass that removed nothing, on
 CLEAN_AUTO_RUNNING_SECONDS = 1800  # a climbing pass can take minutes: no second pass starts while one stamped itself running this recently
 CLEAN_AUTO_KEY = "clean:auto"
 CLEAN_STEADY_KEY = "clean:steady"
-CLEAN_TOOL_ENV = {"HOMEBREW_NO_AUTO_UPDATE": "1", "HOMEBREW_NO_ENV_HINTS": "1", "HOMEBREW_NO_AUTOREMOVE": "1"}  # cleanup never uninstalls a formula
+# Every tool this pass starts is local cleanup: no analytics, version-check, update-notice or model-hub telemetry.
+CLEAN_TOOL_ENV = {"HOMEBREW_NO_AUTO_UPDATE": "1", "HOMEBREW_NO_ENV_HINTS": "1", "HOMEBREW_NO_AUTOREMOVE": "1",
+                  "HOMEBREW_NO_ANALYTICS": "1", "DO_NOT_TRACK": "1", "HF_HUB_DISABLE_TELEMETRY": "1",
+                  "NPM_CONFIG_UPDATE_NOTIFIER": "false", "PIP_DISABLE_PIP_VERSION_CHECK": "1"}  # cleanup never uninstalls a formula
 # Tools run from the home folder, so a project's own config (.npmrc, a pinned yarn) never changes which cache they clean.
 
 

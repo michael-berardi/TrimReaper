@@ -114,7 +114,8 @@ Policy changes, scheduling and owner acknowledgment stay on the CLI.
 
 TrimReaper works on your machine and sends no telemetry. Its one network request is an anonymous check of the public
 GitHub release record, at most daily and only from runs at a terminal (never in CI, agents or scripts). Turn it off
-with `TRIMREAPER_NO_UPDATE_CHECK=1`. Details: [PRIVACY.md](PRIVACY.md).
+with `TRIMREAPER_NO_UPDATE_CHECK=1`. Its config, job state, receipts (kept 30 days) and archives of unsaved work stay
+on this machine. [PRIVACY.md](PRIVACY.md) lists every file, how long it stays and how to remove it all.
 
 ## Reference
 
