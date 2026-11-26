@@ -35,12 +35,15 @@ class Goals(unittest.TestCase):
             mock.patch.object(clean, "reap_metadata_size", side_effect=self.size),
             mock.patch.object(clean, "reap_cleanup_owner", side_effect=lambda *a: contextlib.nullcontext()),
             mock.patch.object(clean, "clean_act", side_effect=self.act),
+            # Dedupe and compress walk the configured cache roots; keep these fixtures synthetic.
+            mock.patch.object(clean, "clean_dedupe", return_value=None),
+            mock.patch.object(clean, "clean_compress", return_value=None),
         ]
         for patch in patches:
             patch.start()
             self.addCleanup(patch.stop)
 
-    def size(self, path, seconds):
+    def size(self, path, seconds, templates=frozenset()):
         entry = next(e for e in self.entries if path in e["paths"])
         return {"bytes": entry["fixtureSize"], "complete": True, "reason": None}
 
@@ -144,7 +147,7 @@ class Goals(unittest.TestCase):
 
     def test_size_error_skips_one_candidate_and_continues(self):
         ordinary_size = self.size
-        def transient_size(path, seconds):
+        def transient_size(path, seconds, templates=frozenset()):
             if path.endswith("large"):
                 raise PermissionError(errno.EACCES, "synthetic unreadability")
             return ordinary_size(path, seconds)
