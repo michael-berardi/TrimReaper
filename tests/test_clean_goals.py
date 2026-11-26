@@ -40,7 +40,7 @@ class Goals(unittest.TestCase):
             patch.start()
             self.addCleanup(patch.stop)
 
-    def size(self, path, seconds):
+    def size(self, path, seconds, templates=frozenset()):  # the real call passes the job's env templates
         entry = next(e for e in self.entries if path in e["paths"])
         return {"bytes": entry["fixtureSize"], "complete": True, "reason": None}
 
@@ -144,7 +144,7 @@ class Goals(unittest.TestCase):
 
     def test_size_error_skips_one_candidate_and_continues(self):
         ordinary_size = self.size
-        def transient_size(path, seconds):
+        def transient_size(path, seconds, templates=frozenset()):
             if path.endswith("large"):
                 raise PermissionError(errno.EACCES, "synthetic unreadability")
             return ordinary_size(path, seconds)
