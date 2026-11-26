@@ -3627,7 +3627,7 @@ def clean_pass_run(dry_run: bool, deep: bool, only: list | None, report: bool, p
         clean_size_all(sized)  # the blockers by bytes: only when the goal is still unmet, and only for the last rung's view
         for entry in sized:
             entry["paths"] = []
-    dedupe_out = clean_dedupe(chosen, dry_run) if CLEAN_DEDUPE_NAME in chosen and (dry_run or steady or initial["goalMet"] is not True) else None
+    dedupe_out = clean_dedupe(chosen, dry_run, policy) if CLEAN_DEDUPE_NAME in chosen and (dry_run or steady or initial["goalMet"] is not True) else None
     compress_out = clean_compress(chosen, dry_run, policy) if CLEAN_COMPRESS_NAME in chosen and not stopped else None
     if not dry_run:
         clean_forget_refusals()
@@ -3680,10 +3680,37 @@ CLEAN_DEDUPE_MACHO = frozenset({b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe", b"\xca
                                 b"\xfe\xed\xfa\xcf", b"\xfe\xed\xfa\xce", b"\xbe\xba\xfe\xca"})
 
 
+CLEAN_DEDUPE_DEP_NAMES = frozenset({"node_modules", ".pnpm-store"})
+CLEAN_DEDUPE_DEP_MIN_BYTES = 16 * 1024          # dependency trees are mostly small files: 7 of 17 GB of duplicates were under 256 KB (2026-11-26)
+CLEAN_DEDUPE_DEP_MIN_AGE_SECONDS = 30 * 60      # an installer finishes writing long before this; the swap re-checks inode, size, mtime and hash
+CLEAN_DEDUPE_COORD_IDLE = ("done", "failed", "cancelled", "interrupted", "parked", "blocked")
+CLEAN_DEDUPE_DEP_SECONDS = 60
+
+
+def clean_dedupe_in_deps(path: str) -> bool:
+    """True when the file sits inside a package-manager dependency tree (`node_modules`)."""
+    return any(part in CLEAN_DEDUPE_DEP_NAMES for part in Path(path).parts[:-1])
+
+
+def clean_dedupe_clonefile(source: str, target: str) -> bool:
+    """clonefile(2) through libc, no subprocess per file (300 000 small files took minutes with `cp -c`). False when unavailable."""
+    try:
+        libc = ctypes.CDLL("libc.dylib", use_errno=True)
+        fn = libc.clonefile
+    except (OSError, AttributeError):
+        return False
+    if fn(source.encode(), target.encode(), 0x0001) != 0:   # CLONE_NOFOLLOW
+        error = ctypes.get_errno()
+        raise OSError(error, f"clonefile failed: {os.strerror(error)}")
+    return True
+
+
 def clean_dedupe_clone(source: str, target: str) -> None:
     """APFS clone of `source` at `target` (a new path). Raises OSError with the cause."""
     if os.uname().sysname != "Darwin":
         raise OSError("APFS clones need macOS")
+    if clean_dedupe_clonefile(source, target):
+        return
     done = subprocess.run(["/bin/cp", "-c", source, target], capture_output=True, text=True, errors="replace", timeout=300)
     if done.returncode != 0:
         raise OSError(f"cp -c failed: {(done.stderr or '').strip()[:200]}")
@@ -3695,8 +3722,11 @@ def clean_dedupe_candidate(path: str, at: float):
         info = os.lstat(path)
     except OSError:
         return None
-    if (not stat.S_ISREG(info.st_mode) or info.st_size < CLEAN_DEDUPE_MIN_BYTES or info.st_nlink != 1 or info.st_mode & 0o111
-            or at - max(info.st_mtime, info.st_ctime) < CLEAN_DEDUPE_MIN_AGE_SECONDS or path.endswith(CLEAN_DEDUPE_TEMP)):
+    deps = clean_dedupe_in_deps(path)
+    floor = CLEAN_DEDUPE_DEP_MIN_BYTES if deps else CLEAN_DEDUPE_MIN_BYTES
+    quiet = CLEAN_DEDUPE_DEP_MIN_AGE_SECONDS if deps else CLEAN_DEDUPE_MIN_AGE_SECONDS
+    if (not stat.S_ISREG(info.st_mode) or info.st_size < floor or info.st_nlink != 1 or info.st_mode & 0o111
+            or at - max(info.st_mtime, info.st_ctime) < quiet or path.endswith(CLEAN_DEDUPE_TEMP)):
         return None
     try:
         with open(path, "rb") as handle:
@@ -3740,7 +3770,7 @@ def clean_dedupe_walk(roots: list, at: float):
                     info = os.lstat(os.path.join(folder, name))
                 except OSError:
                     continue
-                if name != ".git" and stat.S_ISDIR(info.st_mode) and info.st_dev == device:
+                if name != ".git" and not reap_protected(name) and stat.S_ISDIR(info.st_mode) and info.st_dev == device:
                     kept.append(name)
             dirs[:] = kept
             for name in files:
@@ -3770,6 +3800,55 @@ def clean_dedupe_roots(cache_root, scratch_root, statuses: dict) -> list:
     if scratch_root and os.path.isdir(scratch_root) and not os.path.islink(scratch_root):
         roots.append(scratch_root)
     return roots
+
+
+def clean_dedupe_coord_roots(policy: dict | None, errors: list) -> list:
+    """Coordinator job folders (policy coordinatorRoots, `J-NNNN`) whose job the batch list command reports idle. A folder the list
+    does not name, or an unreadable list, adds nothing: a live job's folder is never guessed at."""
+    settings = clean_reclaim_settings(policy)
+    command = settings.get("coordinatorJobListCommand")
+    if not command:
+        return []
+    statuses = clean_coord_batch(list(command), True)
+    if statuses is None:
+        errors.append({"clean": CLEAN_DEDUPE_NAME, "error": "coordinator-job-list-unreadable"})
+        return []
+    roots = []
+    for configured in settings["coordinatorRoots"]:
+        base = clean_expand(configured)
+        if not os.path.isdir(base) or os.path.islink(base):
+            continue
+        for entry in clean_scan(reap_canon(base), CLEAN_DEDUPE_NAME, errors):
+            hit = statuses.get(entry.name.upper())
+            if CLEAN_JOB_FOLDER.fullmatch(entry.name) and hit and hit[0] in CLEAN_DEDUPE_COORD_IDLE \
+                    and entry.is_dir(follow_symlinks=False) and not entry.is_symlink():
+                roots.append(entry.path)
+    return roots
+
+
+def clean_dedupe_dep_roots(errors: list) -> list:
+    """Every `node_modules` in the clone bases (checkouts and the agent worktrees beside them), found by name only, bounded
+    in depth and time. Only dependency trees: a repository's own files there are never cloned over."""
+    found, deadline = [], time.monotonic() + CLEAN_DEDUPE_DEP_SECONDS
+    for base, _ in reap_clone_bases():
+        stack = [(str(base), 0)]
+        while stack:
+            if time.monotonic() > deadline:
+                errors.append({"clean": CLEAN_DEDUPE_NAME, "error": f"discovery-incomplete: {clean_tilde(str(base))}"})
+                return found
+            folder, depth = stack.pop()
+            try:
+                entries = list(os.scandir(folder))
+            except OSError:
+                continue
+            for entry in entries:
+                if reap_protected(entry.name) or reap_is_git(entry.name) or entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+                    continue
+                if entry.name in CLEAN_DEDUPE_DEP_NAMES:
+                    found.append(entry.path)
+                elif depth < 4 and entry.name not in ("target", "dist", ".next", ".open-next", "build"):
+                    stack.append((entry.path, depth + 1))
+    return found
 
 
 def clean_dedupe_run(roots: list, dry_run: bool, at: float | None = None, clone=None) -> dict:
@@ -3831,7 +3910,7 @@ def clean_dedupe_run(roots: list, dry_run: bool, at: float | None = None, clone=
     return result
 
 
-def clean_dedupe(chosen: set, dry_run: bool) -> dict:
+def clean_dedupe(chosen: set, dry_run: bool, policy: dict | None = None) -> dict:
     """Clone byte-identical data files in job folders whose job is not running, and in agent scratch (dedupe.py). Removes nothing;
     the receipt says how many files and bytes were shared and how much the volume gained."""
     try:
@@ -3843,19 +3922,34 @@ def clean_dedupe(chosen: set, dry_run: bool) -> dict:
         except Exception:
             scratch = None
         roots = clean_dedupe_roots(cache, scratch, statuses)
+        extra_errors: list = []
+        roots += clean_dedupe_coord_roots(policy, extra_errors) + clean_dedupe_dep_roots(extra_errors)
+        roots = clean_dedupe_unnested(roots)
     except Exception as error:  # an unreadable job table plans nothing: a live job's folder is never guessed at
         return {"name": CLEAN_DEDUPE_NAME, "dryRun": dry_run, "skipped": f"job states unreadable: {error}", "files": 0, "bytes": 0, "errors": []}
     before = clean_free()
     if dry_run:
-        return clean_dedupe_run(roots, True)
+        result = clean_dedupe_run(roots, True)
+        result["errors"] = extra_errors + result["errors"]
+        return result
     try:
         with reap_cleanup_owner("clean"):
             result = clean_dedupe_run(roots, False)
     except ReapRefused as error:  # a busy or stopped owner defers dedupe; it never takes the whole pass down
         return {"name": CLEAN_DEDUPE_NAME, "dryRun": dry_run, "skipped": str(error), "files": 0, "bytes": 0, "errors": []}
     after = clean_free()
+    result["errors"] = extra_errors + result["errors"]
     result["freedBytes"] = None if None in (before, after) else after - before
     return result
+
+
+def clean_dedupe_unnested(roots: list) -> list:
+    """Each root once, and none inside another (a file walked twice would be compared with itself)."""
+    kept = []
+    for root in sorted({reap_canon(r) for r in roots}):
+        if not any(root == k or root.startswith(k.rstrip(os.sep) + os.sep) for k in kept):
+            kept.append(root)
+    return kept
 
 
 # ---- compress-logs --------------------------------------------------------------------------------------------------------------
