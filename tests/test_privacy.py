@@ -31,7 +31,7 @@ FORBIDDEN_ENDPOINT = re.compile(
 
 class Privacy(unittest.TestCase):
     def test_version_matches_the_release_entry(self):
-        self.assertEqual(__version__, "0.26.0")
+        self.assertEqual(__version__, "0.26.1")
         self.assertIn("## 0.26.0 (2026-11-26)", (ROOT / "CHANGELOG.md").read_text())
 
     def test_no_telemetry_package_or_endpoint_in_shipped_code(self):

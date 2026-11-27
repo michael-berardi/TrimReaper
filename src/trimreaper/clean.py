@@ -1667,6 +1667,11 @@ def clean_project_gates(entry: dict, table: dict | None) -> None:
         raise ReapRefused(f"recent:{idle:.0f}h-of-{limit}h")
 
 
+CLEAN_REGEN_SCOPED = ("rust-build-output", "project-dependencies")
+CLEAN_REGEN_QUIET_HOURS = 2        # regenerable output in a job or scratch folder: its own quiet window, not the folder's evidence window
+CLEAN_REGEN_EMERGENCY_HOURS = 0.5  # at or above cleanEmergencyPercent
+
+
 def clean_scratch_debris_gates(entry: dict, table: dict | None) -> None:
     """Debris in a job inherits the enclosing job's full evidence-window idle proof."""
     path = reap_canon(entry["path"])
@@ -1689,6 +1694,14 @@ def clean_scratch_debris_gates(entry: dict, table: dict | None) -> None:
         if str(refusal).startswith("in-use:"):
             raise ReapRefused("in-use:worktree-process")
         raise
+    if entry["name"] in CLEAN_REGEN_SCOPED:
+        # Regenerable output (a Cargo debug/incremental tree, node_modules and the like) is not evidence: the job folder's evidence
+        # window does not apply to it. 2026-11-26: 25 GB of idle debug builds and dependencies sat in agent scratch and finished job
+        # folders because one note elsewhere in the folder had changed that day. It needs only that no live job claims the folder,
+        # nothing holds it (above), and the output itself has been quiet CLEAN_REGEN_QUIET_HOURS; the git proofs still run after.
+        clean_tagged_live_job(scope)
+        clean_stale_tree(path, entry.get("regenQuietHours", CLEAN_REGEN_QUIET_HOURS), fresh=table is None, strict=True)
+        return
     proof = reap_scratch_idle_proof(scope)
     if not proof["idle"]:
         raise ReapRefused("idle-" + proof["reason"])
@@ -1732,6 +1745,17 @@ def clean_scratch_debris_gates(entry: dict, table: dict | None) -> None:
         raise ReapRefused("idle-unreadable")
 
 
+def clean_rust_busy_gate(entry: dict) -> None:
+    """Routine pass: any running Cargo/rustc keeps every target. From the first rung up (`perTargetLocks`), a compiler running somewhere
+    else no longer keeps this one: the target's own Cargo locks (held through removal by the caller, never created) and the open-handle,
+    cwd and command-line probe (reap_holders, run last) decide. 2026-11-26: builds in other jobs kept 13-28 GB of idle targets all day."""
+    if entry.get("perTargetLocks"):
+        return
+    busy = sorted(set(CLEAN_RUST_BUSY) & clean_running())
+    if busy:
+        raise ReapRefused("in-use:" + ",".join(busy))
+
+
 def clean_extra_gates(entry: dict, table: dict | None = None) -> None:
     path, kind = entry["path"], entry["name"]
     if kind == "tagged-caches":  # its own window: a job folder's evidence window (clean_scratch_debris_gates) does not apply to a cache
@@ -1752,9 +1776,7 @@ def clean_extra_gates(entry: dict, table: dict | None = None) -> None:
             if not reap_cachedir_tagged(target) or not clean_tagged_cargo_target(target):
                 raise ReapRefused("not-a-cargo-target")
             clean_tagged_live_job(target)
-            busy = sorted(set(CLEAN_RUST_BUSY) & clean_running())
-            if busy:
-                raise ReapRefused("in-use:" + ",".join(busy))
+            clean_rust_busy_gate(entry)
             clean_stale_tree(path, entry.get("idleHours", CLEAN_POLICY["taggedCacheIdleHours"]), fresh=table is None, strict=True)
             clean_once(("folder", path), lambda: clean_folder_gates(path), table is None)
             clean_once(("folder", target), lambda: clean_folder_gates(target), table is None)
@@ -1764,9 +1786,7 @@ def clean_extra_gates(entry: dict, table: dict | None = None) -> None:
                 idle = clean_repo_idle_hours(entry["repo"], table is None)
                 if idle < entry["idleHours"]:
                     raise ReapRefused(f"recent:{idle:.0f}h-of-{entry['idleHours']}h")
-            busy = sorted(set(CLEAN_RUST_BUSY) & clean_running())
-            if busy:
-                raise ReapRefused("in-use:" + ",".join(busy))
+            clean_rust_busy_gate(entry)
             clean_once(("folder", entry["target"]), lambda: clean_folder_gates(entry["target"]), table is None)
     elif kind in ("dev-tool-caches", "darwin-user-caches"):
         info = os.lstat(path)
@@ -1802,7 +1822,12 @@ def clean_extra_entries(only: set, errors: list, idle_hours: int = 48, rung: dic
     proof = tuple(rung["outputProof"]) if rung else CLEAN_OUTPUT_PROOF
     wide = bool(rung and rung["wide"])
     temp_hours = rung["temp"]["user"] if rung and rung["rung"] != 0 and rung["name"] != CLEAN_STEADY else None
+    quiet = CLEAN_REGEN_EMERGENCY_HOURS if rung and rung.get("emergency") else CLEAN_REGEN_QUIET_HOURS
     def add(name, path, root, **extra):
+        if name in CLEAN_REGEN_SCOPED:
+            extra.setdefault("regenQuietHours", quiet)
+        if name == "rust-build-output" and rung and rung["rung"] not in (0, CLEAN_STEADY):
+            extra.setdefault("perTargetLocks", True)
         entries.append({"name": name, "kind": "debris", "path": path, "root": root, "paths": [path], "tier": "safe", **extra})
     if "rust-build-output" in only:
         relaxed = {"proof": proof, "idleHours": idle_hours} if proof != CLEAN_OUTPUT_PROOF else {}

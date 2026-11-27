@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.26.1 (2026-11-26)
+
+- **Regenerable output in agent scratch and job folders has its own quiet window.** `rust-build-output` and `project-dependencies` inside an agent-scratch or job folder waited for the whole folder's evidence window, so one note changed that day kept every Cargo debug tree and `node_modules` in it; a manual pass on the operator machine removed 25 GB TrimReaper had kept that way. They now need only that no live job claims the folder, nothing holds it, the git proofs pass, and the output itself has been quiet 2 hours (30 minutes at or above `cleanEmergencyPercent`). Evidence, reports and other job files keep the full window.
+- **One build no longer keeps every Rust target.** From the first escalation rung up, a `cargo` or `rustc` running anywhere no longer keeps every target on the machine; each target's own Cargo locks (held through removal) and the open-handle, cwd and command-line probe decide. The routine pass keeps the global check.
+
 ## 0.26.0 (2026-11-26)
 
 - **Update notice.** A command run at a terminal ends with `trimreaper <new> available (you have <current>) · run: trimreaper update` on stderr, after its JSON, at most once a day per version. A detached background process checks the public latest-release record once a day: one anonymous GET with a fixed User-Agent, a 4-second timeout, its result or failure cause cached in one `0600` file. Nothing is checked or printed in redirected output, CI, agent sessions or the MCP server, or with `TRIMREAPER_NO_UPDATE_CHECK=1` or `updates.checkAutomatically: false`.
