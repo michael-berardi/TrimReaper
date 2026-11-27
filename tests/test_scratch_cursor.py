@@ -53,6 +53,14 @@ class ScratchCursor(ScratchHome):
             self.addCleanup(patch.stop)
         return walked
 
+    def no_open_files(self):
+        """The audit snapshots every process's open files before its scratch share starts. On a busy host the real `lsof`
+        takes seconds and spends a 5 s audit's 2 s scratch share before the listing begins, so nothing is proved and the
+        cursor never moves. An empty table keeps these audits about the cursor, not about the machine running the tests."""
+        patch = mock.patch.object(core, "reap_process_table", return_value={"files": [], "commands": []})
+        patch.start()
+        self.addCleanup(patch.stop)
+
     def listing(self) -> list:
         with core.db() as conn:
             return core.reap_agent_scratch_listing(conn)
@@ -149,6 +157,7 @@ class ScratchCursor(ScratchHome):
             pass  # the store exists, empty
         before = (self.meta("reaper:agent-scratch-cursor"), self.meta("reaper:agent-scratch-proofs"))
         self.cli("reap", "--scratch", "--dry-run")
+        self.no_open_files()  # so the audit below does prove folders, and the assertion is that it stores none of it
         core.reap_audit(None, 10, False, 5)
         self.assertEqual((self.meta("reaper:agent-scratch-cursor"), self.meta("reaper:agent-scratch-proofs")), before)
 
@@ -231,6 +240,7 @@ class ScratchCursor(ScratchHome):
 
     def test_the_audit_with_persist_advances_the_cursor(self):
         self.make(("a-task", "b-task"))
+        self.no_open_files()
 
         core.reap_audit(None, 10, False, 5, persist=True)
 
